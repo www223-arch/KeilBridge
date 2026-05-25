@@ -350,6 +350,44 @@ debug --backend openocd-gdb
 debug-only --elf "<firmware.axf>"
 ```
 
+## 12. 当前实现进度：GCC / ArmClang 后端选择入口
+
+本阶段先把“第一次建 `.keilbridge` 工作区前必须扫描整个项目并推荐后端”做成正式能力。
+
+已实现命令：
+
+```powershell
+python -m keiltool.cli doctor backend --project "<project.uvprojx>" --target "<target>"
+python -m keiltool.cli configure --project "<project.uvprojx>" --target "<target>" --backend auto
+python -m keiltool.cli configure --project "<project.uvprojx>" --target "<target>" --backend gcc
+python -m keiltool.cli doctor elf --project "<project.uvprojx>" --target "<target>"
+```
+
+行为边界：
+
+- `doctor backend` 只做项目事实扫描和后端推荐，不生成 CMake，不接触硬件。
+- `configure --backend auto` 只写入后端推荐报告，让用户选择 `gcc` 或 `armclang`，不默认替用户迁移。
+- `configure --backend gcc` 继续走当前已经验证过的 GCC/CMake/OpenOCD 路线。
+- `configure --backend armclang` 现在只接受选择并输出明确边界：ArmClang 完整 CMake/ArmLink 生成仍在后续实现，不伪装成已完成。
+- `doctor elf` 在 build 后检查启动和链接语义，重点覆盖 `.init_array`、`.CCM/.ccmram`、RAM orphan section、FreeRTOS handler 等曾经导致“能烧录但运行 HardFault”的问题。
+
+生成报告：
+
+```text
+<keil-project-root>\.keilbridge\generated\reports\backend_recommendation.md
+<keil-project-root>\.keilbridge\generated\reports\backend_recommendation.json
+<keil-project-root>\.keilbridge\generated\reports\elf_doctor_report.md
+<keil-project-root>\.keilbridge\generated\reports\elf_doctor_result.json
+```
+
+后续 ArmClang 开发必须按以下顺序推进：
+
+1. 完成 ArmClang 工具链探测和版本报告：`armclang/armlink/armasm/fromelf`。
+2. 生成 ArmClang 专属工作区，构建产物目录使用 `.keilbridge/build/armclang-debug`，避免和 GCC 产物互相覆盖。
+3. 优先复用或生成 `.sct`，使用 `armlink` 保持接近 Keil 的链接语义。
+4. 保留 Debug Backend 解耦：ArmClang 构建出的 ELF/AXF 仍然可以走 OpenOCD/J-Link GDB Server 调试。
+5. 每个 ArmClang 工程先跑 `doctor backend`、`build`、`doctor elf`，再进入 flash/debug。
+
 ### 6.2 工作区生成
 
 必须生成：

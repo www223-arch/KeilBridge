@@ -8,8 +8,10 @@ from dataclasses import asdict
 from pathlib import Path
 from time import strftime
 
+from .core.backend_recommender import recommend_backends, render_backend_recommendation_markdown
 from .core.diagnostics import diagnose_target
 from .core.doctor import classify_openocd_log, render_flash_doctor_markdown, run_flash_doctor
+from .core.elf_doctor import render_elf_doctor_markdown, run_elf_doctor
 from .core.keil_parser import parse_uvprojx
 from .core.scatter import generate_gnu_ld, parse_scatter_memory
 from .core.tool_finder import find_arm_gcc_root, find_cmake, find_ninja, find_openocd, find_openocd_scripts
@@ -156,6 +158,17 @@ def cmd_configure(args: argparse.Namespace) -> int:
     model = parse_uvprojx(args.project)
     target = _pick_target(model, args.target)
     workspace_root = Path(args.workspace_root).resolve() if args.workspace_root else Path(model.inferred_project_root)
+    recommendation = _write_backend_report(workspace_root, target, args.armclang_root, None)
+    _print_backend_summary(recommendation)
+
+    if args.backend == "auto":
+        print("Auto mode only writes the backend diagnosis. Re-run configure with --backend gcc or --backend armclang after choosing.")
+        return 0
+    if args.backend == "armclang":
+        print("ArmClang backend selected, but full ArmClang CMake/ArmLink generation is not enabled yet.")
+        print("The backend diagnosis has been written; GCC remains the verified build backend for this project today.")
+        return 2
+
     generated_dir = configure_workspace(workspace_root, target, probe=args.probe)
     print(f"Generated workspace: {generated_dir}")
     print("Next:")
@@ -303,6 +316,74 @@ def cmd_doctor_flash(args: argparse.Namespace) -> int:
     return 1 if any(item.severity in {"fail", "fatal"} for item in result.findings) else 0
 
 
+def cmd_doctor_backend(args: argparse.Namespace) -> int:
+    """诊断当前 Keil target 适合走哪条后端路线。"""
+
+    model = parse_uvprojx(args.project)
+    target = _pick_target(model, args.target)
+    workspace_root = Path(args.workspace_root).resolve() if args.workspace_root else Path(model.inferred_project_root)
+    result = _write_backend_report(workspace_root, target, args.armclang_root, args.arm_gcc_root)
+    print(f"Backend Doctor report: {workspace_root / '.keilbridge' / 'generated' / 'reports' / 'backend_recommendation.md'}")
+    _print_backend_summary(result)
+    return 1 if any(item.status == "blocked" for item in result.options if item.backend == result.recommended) else 0
+
+
+def cmd_doctor_elf(args: argparse.Namespace) -> int:
+    """诊断已经构建出来的 ELF 是否存在启动/链接语义风险。"""
+
+    model = parse_uvprojx(args.project)
+    target = _pick_target(model, args.target)
+    workspace_root = Path(args.workspace_root).resolve() if args.workspace_root else Path(model.inferred_project_root)
+    result = run_elf_doctor(
+        target=target,
+        workspace_root=workspace_root,
+        elf=Path(args.elf).resolve() if args.elf else None,
+        arm_gcc_root=args.arm_gcc_root,
+    )
+    report_dir = workspace_root / ".keilbridge" / "generated" / "reports"
+    report_dir.mkdir(parents=True, exist_ok=True)
+    json_path = report_dir / "elf_doctor_result.json"
+    md_path = report_dir / "elf_doctor_report.md"
+    json_path.write_text(json.dumps(result.to_dict(), ensure_ascii=False, indent=2), encoding="utf-8", newline="\n")
+    md_path.write_text(render_elf_doctor_markdown(result), encoding="utf-8", newline="\n")
+
+    print(f"ELF Doctor report: {md_path}")
+    for finding in result.findings:
+        print(f"[{finding.severity}] {finding.code}: {finding.title}")
+        if finding.evidence:
+            print(f"  evidence: {finding.evidence}")
+        if finding.suggestion:
+            print(f"  suggestion: {finding.suggestion}")
+    return 1 if any(item.severity in {"fail", "fatal"} for item in result.findings) else 0
+
+
+def _write_backend_report(workspace_root: Path, target, armclang_root: str | None, arm_gcc_root: str | None):
+    """写入后端推荐报告，供首次配置和独立 Doctor 共用。"""
+
+    result = recommend_backends(target, armclang_root=armclang_root, arm_gcc_root=arm_gcc_root)
+    report_dir = workspace_root / ".keilbridge" / "generated" / "reports"
+    report_dir.mkdir(parents=True, exist_ok=True)
+    (report_dir / "backend_recommendation.json").write_text(
+        json.dumps(result.to_dict(), ensure_ascii=False, indent=2),
+        encoding="utf-8",
+        newline="\n",
+    )
+    (report_dir / "backend_recommendation.md").write_text(
+        render_backend_recommendation_markdown(result, target),
+        encoding="utf-8",
+        newline="\n",
+    )
+    return result
+
+
+def _print_backend_summary(result) -> None:
+    print(f"Recommended backend: {result.recommended}")
+    for option in result.options:
+        print(f"  [{option.status}] {option.backend}: {option.title}")
+        if option.blockers:
+            print(f"    blockers: {'; '.join(option.blockers)}")
+
+
 def _run(command: list[str], cwd: Path, env: dict[str, str] | None = None) -> None:
     try:
         subprocess.run(command, cwd=cwd, env=env, check=True)
@@ -359,6 +440,8 @@ def build_parser() -> argparse.ArgumentParser:
     configure_parser.add_argument("--target", help="Keil target name")
     configure_parser.add_argument("--probe", default="stlink", help="Probe profile: stlink, cmsis-dap, daplink")
     configure_parser.add_argument("--workspace-root", help="Override .keilbridge location; defaults to inferred Keil project root")
+    configure_parser.add_argument("--backend", choices=["auto", "gcc", "armclang"], default="auto", help="Build backend. Default auto writes recommendation only.")
+    configure_parser.add_argument("--armclang-root", help="Path to ArmClang/Keil ARMCLANG root or bin directory")
     configure_parser.set_defaults(func=cmd_configure)
 
     build_cmd = subparsers.add_parser("build", help="Build generated CMake workspace")
@@ -400,6 +483,22 @@ def build_parser() -> argparse.ArgumentParser:
     doctor_flash.add_argument("--openocd", help="Path to openocd executable")
     doctor_flash.add_argument("--run", action="store_true", help="Run a minimal OpenOCD connect/reset/vector read test")
     doctor_flash.set_defaults(func=cmd_doctor_flash)
+
+    doctor_backend = doctor_subparsers.add_parser("backend", help="Recommend GCC, ArmClang, Debug-only, or Keil CLI backend")
+    doctor_backend.add_argument("--project", required=True, type=Path, help="Path to .uvprojx")
+    doctor_backend.add_argument("--target", help="Keil target name")
+    doctor_backend.add_argument("--workspace-root", help="Override .keilbridge location; defaults to inferred Keil project root")
+    doctor_backend.add_argument("--armclang-root", help="Path to ArmClang/Keil ARMCLANG root or bin directory")
+    doctor_backend.add_argument("--arm-gcc-root", help="Path to Arm GNU Toolchain root")
+    doctor_backend.set_defaults(func=cmd_doctor_backend)
+
+    doctor_elf = doctor_subparsers.add_parser("elf", help="Diagnose generated ELF startup/linker semantics")
+    doctor_elf.add_argument("--project", required=True, type=Path, help="Path to .uvprojx")
+    doctor_elf.add_argument("--target", help="Keil target name")
+    doctor_elf.add_argument("--workspace-root", help="Override .keilbridge location; defaults to inferred Keil project root")
+    doctor_elf.add_argument("--elf", help="Override ELF path; defaults to .keilbridge/build/gcc-debug/<target>.elf")
+    doctor_elf.add_argument("--arm-gcc-root", help="Path to Arm GNU Toolchain root")
+    doctor_elf.set_defaults(func=cmd_doctor_elf)
 
     return parser
 

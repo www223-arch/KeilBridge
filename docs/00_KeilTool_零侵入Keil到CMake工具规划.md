@@ -1038,3 +1038,30 @@ blx r3
 - Fault 状态寄存器恢复为 `CFSR=0x00000000`、`HFSR=0x00000000`。
 
 这条修复属于 KeilBridge 启动/链接层通用能力，不是 24Sentry 单工程特例。凡是 CubeMX + C++ + 全局对象/虚函数/默认成员初始化的工程，都依赖这条链路。
+
+## 当前阶段补充：GCC / ArmClang 双后端路线
+
+KeilBridge 后续不再把“Keil 转 CMake”简单理解成“全部强行转 GCC”。第一次创建工作区时，工具必须先扫描整个工程，再给用户推荐后端：
+
+```powershell
+python -m keiltool.cli doctor backend --project "<project.uvprojx>" --target "<target>"
+```
+
+当前后端边界：
+
+- `gcc`：已经是当前可用主路线，负责 CMake、GNU ld、GCC startup、OpenOCD/VS Code 工作区。
+- `armclang`：作为兼容迁移路线优先实现入口和诊断，完整 ArmLink/CMake 生成后续推进。
+- `debug-only`：构建暂时无法迁移时，用已有 ELF/AXF 做调试和故障采集。
+- `keil-cli`：保留 Keil 原构建语义的兜底路线。
+
+新增配置语义：
+
+```powershell
+python -m keiltool.cli configure --project "<project.uvprojx>" --target "<target>" --backend auto
+python -m keiltool.cli configure --project "<project.uvprojx>" --target "<target>" --backend gcc
+python -m keiltool.cli configure --project "<project.uvprojx>" --target "<target>" --backend armclang
+```
+
+- `--backend auto`：只输出推荐报告，不生成工作区，让用户明确选择。
+- `--backend gcc`：生成当前已验证的 GCC 工作区。
+- `--backend armclang`：当前只保留选择入口和工具链诊断，完整生成器未启用前必须明确提示。

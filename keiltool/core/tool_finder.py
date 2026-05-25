@@ -19,6 +19,12 @@ ARM_GCC_ROOTS = [
     Path(r"C:\Program Files\Arm GNU Toolchain arm-none-eabi\14.2 rel1"),
     Path(r"C:\Program Files\Arm GNU Toolchain arm-none-eabi\12.2 mpacbti-rel1"),
 ]
+ARMCLANG_ROOTS = [
+    Path(r"C:\Keil_v5\ARM\ARMCLANG"),
+    Path(r"C:\Keil_v5\ARM\ARMCLANG\bin"),
+    Path(r"C:\Program Files\Arm\Development Studio 2024.1\bin"),
+    Path(r"C:\Program Files\Arm\Development Studio 2023.1\bin"),
+]
 
 
 def find_cmake(explicit: str | None = None) -> str:
@@ -54,6 +60,27 @@ def find_arm_gcc_root(explicit: str | None = None) -> str:
         if (root / "bin" / "arm-none-eabi-gcc.exe").exists():
             return str(root)
     return ""
+
+
+def find_armclang_tools(explicit_root: str | None = None) -> dict[str, str]:
+    """查找 ArmClang/ArmLink 工具链。
+
+    ArmClang 后端和 GCC 后端的技术边界不同：它更适合承接 Keil/AC6 工程里的
+    scatter、ARMCC/ArmClang 库和 ARMASM 启动文件。因此这里不只找 `armclang.exe`，
+    还同时检查 `armlink.exe`、`armasm.exe`、`fromelf.exe`。Backend Doctor 会根据
+    这些结果告诉用户“适合用 ArmClang”和“本机是否已经具备 ArmClang 环境”是两回事。
+    """
+
+    root = _normalize_tool_root(explicit_root)
+    candidates = [root] if root else []
+    candidates.extend(ARMCLANG_ROOTS)
+    tools = {
+        "armclang": _find_tool_in_roots("armclang.exe", candidates),
+        "armlink": _find_tool_in_roots("armlink.exe", candidates),
+        "armasm": _find_tool_in_roots("armasm.exe", candidates),
+        "fromelf": _find_tool_in_roots("fromelf.exe", candidates),
+    }
+    return tools
 
 
 def find_openocd(explicit: str | None = None) -> str:
@@ -94,3 +121,28 @@ def _find_executable(explicit: str | None, name: str, candidates: list[Path]) ->
         if candidate.exists():
             return str(candidate)
     return name
+
+
+def _normalize_tool_root(explicit_root: str | None) -> Path | None:
+    if not explicit_root:
+        env_root = os.environ.get("ARMCLANG_ROOT") or os.environ.get("ARM_TOOLCHAIN_ROOT")
+        if not env_root:
+            return None
+        explicit_root = env_root
+    root = Path(explicit_root)
+    if root.name.lower() == "bin":
+        return root
+    return root / "bin"
+
+
+def _find_tool_in_roots(tool: str, roots: list[Path]) -> str:
+    found = shutil.which(tool)
+    if found:
+        return found
+    for root in roots:
+        if not root:
+            continue
+        candidate = root / tool
+        if candidate.exists():
+            return str(candidate)
+    return ""

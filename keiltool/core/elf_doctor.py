@@ -200,8 +200,14 @@ def _parse_symbols(text: str) -> dict[str, str]:
     symbols: dict[str, str] = {}
     for line in text.splitlines():
         parts = line.split(maxsplit=3)
-        if len(parts) >= 3:
-            name = parts[-1]
+        if len(parts) >= 4:
+            # `nm -C` 反解 C++ 符号后，名称里会出现空格，例如
+            # `vtable for Foo`。这里必须保留第 4 列完整内容，否则 C++ 构造
+            # 检查会漏掉真实工程里最容易导致 HardFault 的虚函数表问题。
+            name = parts[3]
+            symbols[name] = parts[0]
+        elif len(parts) >= 3:
+            name = parts[2]
             symbols[name] = parts[0]
     return symbols
 

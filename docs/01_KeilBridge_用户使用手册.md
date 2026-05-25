@@ -575,3 +575,59 @@ python -m keiltool.cli build --project $project --target $target
 python -m keiltool.cli doctor flash --project $project --target $target --probe $probe --run
 python -m keiltool.cli flash --project $project --target $target --probe $probe
 ```
+
+## 新增：后端诊断与选择流程
+
+首次给一个 Keil 工程创建 `.keilbridge` 前，建议先运行 Backend Doctor：
+
+```powershell
+python -m keiltool.cli doctor backend --project "C:\Path\To\YourProject\MDK-ARM\App.uvprojx" --target App
+```
+
+它会同时评估：
+
+- `gcc`：开放构建、CI、跨平台和 CMake 主路线。
+- `armclang`：更接近 Keil/AC6 语义的兼容迁移路线。
+- `debug-only`：只调试已有 ELF/AXF，不负责重建固件的保底路线。
+- `keil-cli`：保留 Keil 构建语义的兜底路线。
+
+报告位置：
+
+```text
+<keil-project-root>\.keilbridge\generated\reports\backend_recommendation.md
+<keil-project-root>\.keilbridge\generated\reports\backend_recommendation.json
+```
+
+只生成诊断报告、不生成 CMake 工作区：
+
+```powershell
+python -m keiltool.cli configure --project "C:\Path\To\YourProject\MDK-ARM\App.uvprojx" --target App --probe cmsis-dap --backend auto
+```
+
+确认使用当前已验证的 GCC 路线：
+
+```powershell
+python -m keiltool.cli configure --project "C:\Path\To\YourProject\MDK-ARM\App.uvprojx" --target App --probe cmsis-dap --backend gcc
+```
+
+`--backend armclang` 已作为明确选择入口保留，但完整 ArmClang CMake/ArmLink 生成仍在开发中。当前它会输出边界说明，不会假装已经完成。
+
+build 成功后建议立刻运行 ELF Doctor，确认“能烧录”之外的启动/链接语义也没有明显风险：
+
+```powershell
+python -m keiltool.cli doctor elf --project "C:\Path\To\YourProject\MDK-ARM\App.uvprojx" --target App
+```
+
+它会检查：
+
+- C++ 全局构造相关的 `.init_array` / `__libc_init_array`。
+- `.data/.bss/.ccmram` 是否覆盖应初始化的 RAM 数据。
+- 是否存在可能没有被 startup 复制或清零的 RAM orphan section。
+- FreeRTOS 的 `SVC/PendSV/SysTick` 入口是否存在。
+
+报告位置：
+
+```text
+<keil-project-root>\.keilbridge\generated\reports\elf_doctor_report.md
+<keil-project-root>\.keilbridge\generated\reports\elf_doctor_result.json
+```

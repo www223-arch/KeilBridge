@@ -581,3 +581,460 @@ GD32F303CB 验证工程在初次生成的 GCC 固件中先进入 `MemManage_Hand
 - OpenOCD 通过 DAPLink/CMSIS-DAP 连接 `GD32F303CB`，下载和 verify 通过。
 - 板子 reset run 运行 2 秒后 halt，PC 位于 `Freertos/Source/tasks.c` 的 `prvIdleTask`，没有立即进入 HardFault。
 - GDB 可连接 OpenOCD，`monitor reset halt` 后硬件断点命中原始源码 `Template/main.c:25`。
+
+## 20. 需求收敛与技术路线再定义
+
+结合新增的需求分析、Doctor 设计、已有工具链分析和工具化开发 SOP，KeilBridge 的定位需要从“Keil 转 CMake 小工具”升级为：
+
+> 面向 Keil 遗留工程的零侵入桥接、诊断和调试可观测工具。
+
+这意味着 CMake/GCC 只是一个重要后端，不是最终目的。真正要解决的痛点是：Keil 工程中的构建、烧录、调试、变量、寄存器、调用栈、Fault 现场等信息过去只能靠用户手动转述，现在要变成脚本可执行、结果可保存、AI 可读取、问题可诊断的结构化流程。
+
+### 20.1 真实需求
+
+一句话真实需求：
+
+> 把 Keil 工程的构建、下载、复位、断点、变量、寄存器、内存、调用栈和 Fault 现场采集，变成零侵入、可重复、可结构化输出的自动化流程，减少用户在 IDE、硬件和 AI 之间手工搬运信息的成本。
+
+因此，KeilBridge 不承诺“任何 Keil 工程都 0 成本转 GCC”。更准确的承诺是：
+
+- 能自动桥接的工程，自动生成 CMake/GCC/OpenOCD/VS Code 工作区。
+- 能诊断的问题，输出 KeilBridge 诊断结论，而不是只甩出 GCC/OpenOCD 原始报错。
+- 能安全兼容的问题，生成 compat header、generated support 或 overlay 副本，原工程不动。
+- 需要人工确认的问题，生成 patch/report/override 模板，不擅自修改用户源码。
+- GCC 后端遇到硬边界时，明确推荐 ArmClang、Keil CLI 或用户提供 GCC `.a`/源码重编译路线。
+
+### 20.2 不照抄参考文档的边界
+
+新增文档中的原则作为路线参考，但不逐字照做。当前项目按真实验证结果推进：
+
+- 已经跑通的 STM32G4、GD32F303、STM32F405 + FreeRTOS 经验优先进入实现。
+- 先保证一个工程从 `inspect -> configure -> build -> flash -> debug` 闭环稳定，再扩展芯片数量。
+- 先输出报告和诊断，再做自动修复。
+- 先复用 CMake、Ninja、GDB、OpenOCD、J-Link、pyOCD、Cortex-Debug、Keil CLI 等成熟工具，再自研桥接层和诊断层。
+- 不把“通用”写成大量硬编码 `if device contains ...`，芯片、探针、RTOS、库兼容进入数据库、adapter 和 doctor 规则。
+
+### 20.3 技术路线
+
+KeilBridge 的主流程调整为：
+
+```text
+Keil 工程
+  ↓
+Project Scanner：读取 .uvprojx/.uvoptx/.sct/.ioc/源码线索
+  ↓
+Project IR：生成 project_ir.json，保留事实和证据
+  ↓
+Adapter Registry：解释 STM32/GD32/CubeMX/StdPeriph/RTOS/裸机差异
+  ↓
+Doctor Engine：scan/build/elf/flash/debug/compat/lib 分阶段诊断
+  ↓
+Generator：生成 CMake、linker、startup、OpenOCD、VS Code、报告
+  ↓
+Backend：GCC / ArmClang / Keil CLI / OpenOCD / J-Link / pyOCD / GDB
+  ↓
+Structured Result：doctor_result.json、debug_result.json、fault_dump.md
+```
+
+职责边界：
+
+- Scanner 只发现事实，不做主观修复。
+- Adapter 负责解释事实，例如 CubeMX、GD 标准库、FreeRTOS port、CMSIS-DSP。
+- Doctor 负责判断风险、阻塞点和下一步建议。
+- Generator 只根据 IR 和 adapter 结果生成外部工作区。
+- Backend 负责调用已有工具，不自研编译器、调试协议或烧录器。
+
+### 20.4 Doctor 系统成为一等功能
+
+后续命令不只围绕 `configure/build/flash/debug`，还要增加 Doctor 子命令：
+
+```powershell
+python -m keiltool.cli doctor scan  --project <uvprojx> --target <target>
+python -m keiltool.cli doctor build --project <uvprojx> --target <target>
+python -m keiltool.cli doctor elf   --project <uvprojx> --target <target>
+python -m keiltool.cli doctor flash --project <uvprojx> --target <target> --probe cmsis-dap
+python -m keiltool.cli doctor debug --project <uvprojx> --target <target> --probe cmsis-dap
+python -m keiltool.cli doctor all   --project <uvprojx> --target <target>
+```
+
+Doctor 优先级：
+
+1. Build Doctor：把 include 缺失、宏缺失、ARMASM startup、RTOS port、`.lib`、FPU ABI 等构建失败分类。
+2. ELF Doctor：检查 `.isr_vector`、`Reset_Handler`、`_estack`、Flash/RAM 段地址、map/size 和 bootloader offset。
+3. Flash Doctor：检查 OpenOCD/J-Link 路径、interface/target cfg、探针占用、芯片 ID、program/verify 结果。
+4. Debug Doctor：先 `reset halt`、读寄存器和向量表，确认 MSP/PC 合法后再断到 `main`，失败时输出 `fault_dump.md`。
+5. Compat Doctor：扫描 ARMCC 专用语法，分为兼容头可处理、生成 patch、必须人工处理三类。
+6. Lib Doctor：识别 ARMCC `.lib`、GCC `.a`、源码替代和 C++ ABI 风险，输出后端兼容矩阵。
+
+### 20.5 后端策略
+
+GCC 后端继续作为第一条主线，因为它开放、适合 CMake/Ninja/CI/GDB 自动化。但 KeilBridge 不能把 GCC 当成唯一答案。
+
+后端分层：
+
+- `gcc`：默认后端，生成 CMake + arm-none-eabi-gcc。
+- `armclang`：未来后端，用于降低 Keil/ARMCC 迁移成本，尤其是复杂 scatter、ARM 生态库和编译器扩展。
+- `keil`：保底后端，通过 Keil CLI 构建/下载，用于闭源 `.lib` 或短期无法迁移工程。
+- `debug-only`：输入已有 ELF/AXF，不做 CMake 转换，只做 flash/debug/doctor/fault dump。
+
+这条 `debug-only` 路线很重要。它可以先解决“AI 看不到调试现场”的真实痛点，即使某个工程暂时不能 GCC 化，也仍然能让 KeilBridge 采集寄存器、变量、调用栈和 Fault 现场。
+
+### 20.6 用户覆盖与换电脑
+
+自动识别永远会有边界，因此必须支持用户覆盖文件：
+
+```text
+<project-root>/.keilbridge/keilbridge.yaml
+<project-root>/.keilbridge/board.override.yaml
+<project-root>/.keilbridge/generated/board.override.template.yaml
+```
+
+覆盖项包括：
+
+- device/vendor/family/part/core/fpu/float ABI
+- flash/ram/ccmram/app offset/vector table origin
+- startup/linker 优先项
+- probe/backend/openocd/jlink/pyocd 配置
+- 工具链路径、OpenOCD 路径、脚本路径
+- `.lib` 替代 `.a`、源码替代目录、CMSIS-DSP 根目录
+
+换电脑时的原则：
+
+- `.keilbridge/generated` 和 `.keilbridge/build` 可以删除并重新生成。
+- 原工程和 Keil 配置不依赖 KeilBridge。
+- 用户只需要保留可编辑 override 和必要的工具链路径配置。
+- `configure` 必须重新探测当前电脑上的 CMake、Ninja、Arm GNU Toolchain、OpenOCD/J-Link 路径，并刷新 VS Code workspace。
+
+### 20.7 近期开发顺序调整
+
+下一阶段不再单纯追求“多支持几个芯片型号”，而是围绕已经暴露的真实问题补齐可观测闭环：
+
+1. 把当前 `inspect/configure/build/flash/debug` 的关键结果写入 `.keilbridge/report/project_ir.json`、`conversion_report.md`。
+2. 实现 Build Doctor 规则库，优先覆盖当前遇到的 `.lib`、startup、FreeRTOS port、include、FPU ABI、undefined reference。
+3. 实现 ELF Doctor，自动检查向量表、Reset_Handler、_estack、Flash/RAM 段地址，避免再次出现“编译过了但复位进 Fault”。
+4. 实现 Flash Doctor，识别 ESP-IDF OpenOCD 用于 STM/GD 的风险、DAPLink/CMSIS-DAP 占用、program/verify 失败原因。
+5. 实现 Debug Doctor 最小闭环：连接、halt、reset halt、读 MSP/PC/VTOR、断 main、读寄存器、输出 `debug_result.json`。
+6. 再扩展 GD32/STM32 设备数据库和 OpenOCD/J-Link 映射。
+7. 最后推进 ArmClang/Keil CLI 后端，让闭源 `.lib` 工程也能进入脚本化流程。
+
+### 20.8 成功标准
+
+一个工程真正“适配成功”不只看是否生成 CMake，而要同时满足：
+
+- 原工程 0 修改，`.uvprojx/.uvoptx/.sct/.ioc/.c/.h` 不被改动。
+- `.keilbridge` 内生成物可删除、可重建、可跨电脑重新配置。
+- `build` 能生成 elf/hex/bin/map，或 Doctor 明确说明阻塞原因。
+- `flash` 能 program/verify/reset，或 Doctor 明确定位到探针、OpenOCD、target cfg、芯片连接问题。
+- `debug` 能断到原始源码 `main`，或 Debug Doctor 输出 PC/MSP/VTOR/Fault 现场。
+- 用户能在 VS Code 中看到完整原始源码并下断点，不被 generated 目录困住。
+- 对 `.lib`、RTOS、ARMCC 语法、CubeMX 中间件等硬边界，报告说清楚“为什么不行、下一步怎么办”。
+
+## 21. 架构与 ArmClang 后端规划
+
+新增文档里关于架构的核心判断是正确的：KeilBridge 不能继续把复杂度堆进 CMake 生成器，而要形成 `IR + Adapter + Doctor + Backend` 的平台结构。
+
+### 21.1 架构判断
+
+当前最需要避免的写法是：
+
+```text
+cmake_generator.py:
+  if STM32G4 ...
+  if GD32F30x ...
+  if FreeRTOS ...
+  if ARMCC .lib ...
+  if startup is ARMASM ...
+```
+
+这会让短期样例能跑，但后续每加一个芯片、RTOS、烧录器、库类型都会污染 CMake generator。正确边界应该是：
+
+- Parser：只解析 Keil 工程事实，不解释业务含义。
+- Project IR：保存 source/include/define/library/startup/scatter/device/feature/evidence。
+- Adapter：解释 STM32/GD32/CubeMX/StdPeriph/RTOS/CMSIS-DSP 等工程差异。
+- Doctor：判断风险、失败原因和下一步建议。
+- Generator：只根据 IR 和 Adapter 结果生成 CMake、linker、startup、VS Code、OpenOCD。
+- Backend：调用 GCC、ArmClang、Keil CLI、OpenOCD、J-Link、pyOCD、GDB。
+
+### 21.2 后端能力矩阵
+
+KeilBridge 后续要给每个工程输出后端兼容矩阵，而不是只说“转换失败”：
+
+```text
+Backend       Build       Flash/Debug       适用场景
+------------------------------------------------------------
+gcc           preferred   preferred         开放构建、CI、GDB 自动化
+armclang      planned     possible          降低 Keil/ARMCC 工程迁移成本
+keil          fallback    limited/scripted  闭源 .lib 或短期不能迁移的工程
+debug-only    none        preferred         已有 ELF/AXF，只采集调试现场
+```
+
+这套矩阵必须由 Doctor 和 Lib Resolver 共同生成。例如检测到 ARMCC `.lib` 时，GCC 后端应标记 `blocked`，ArmClang 标记 `maybe` 或 `unknown`，Keil 后端标记 `supported`。
+
+### 21.3 ArmClang 的定位
+
+ArmClang 非常值得适配，但它不是 GCC 的替代主线，也不是万能兼容层。它的定位是：
+
+> 面向 Keil 遗留工程的兼容后端，用来降低 ARMCC 语法、scatter、ARM 生态库和 Keil 工程习惯带来的迁移成本。
+
+适合优先尝试 ArmClang 的场景：
+
+- 工程依赖 ARMCC/ArmClang 风格 section、pragma、attribute。
+- scatter 文件复杂，直接转换 GNU ld 风险高。
+- 有 ARM 生态库或厂商提供的 ArmClang 兼容库。
+- 用户想脱离 Keil GUI，但不急着切到 GCC。
+- CMake/GDB/OpenOCD 脚本化比编译器替换更重要。
+
+必须明确的边界：
+
+- ARMCC5 `.lib` 不保证能被 ArmClang 无痛链接。
+- C++ ABI、异常、运行库、microlib/newlib/semihosting 差异要单独诊断。
+- ArmClang 安装、授权、Keil 环境变量、Pack 依赖比 GCC 更复杂。
+- ArmClang 生成的 ELF/AXF 是否适合 GDB/OpenOCD 调试，需要真实工程 Spike 验证。
+
+### 21.4 ArmClang 实施顺序
+
+ArmClang 不立即进入大规模开发，先按 Spike 推进：
+
+1. 增加 Backend capability 数据结构，先让报告能表达 `gcc/armclang/keil/debug-only` 的状态。
+2. 增加 Lib Doctor，遇到 `.lib` 时输出后端兼容矩阵。
+3. 增加 `debug-only`，允许用户输入 Keil 已生成的 AXF/ELF，先做 OpenOCD/J-Link/GDB 调试采集。
+4. 做 ArmClang 最小 Spike：一个 STM32 工程、一个 GD 工程，只验证编译、链接、生成 ELF/AXF。
+5. 再实现正式 `--backend armclang`，生成对应 CMake toolchain、compile flags、link flags 和 scatter 使用策略。
+
+短期实现仍以 GCC + Doctor 闭环为主。ArmClang 的价值要通过 Doctor 推荐出来，而不是用口号承诺所有 Keil 工程都能自动迁移。
+
+### 21.5 当前 Sentry_gimbal 调试失败复盘入口
+
+`Sentry_gimbal` 当前 VS Code/Cortex-Debug 失败时，生成配置已满足：
+
+- `configFiles` 使用绝对路径。
+- `executable` 使用 `.keilbridge/build/gcc-debug/Sentry_gimbal.elf`。
+- `loadFiles: []` 已阻止 Cortex-Debug 通过 GDB 再次下载 ELF。
+- 工作区已经同时包含原始源码和 generated 目录。
+
+本地 OpenOCD 日志显示的失败点是：
+
+```text
+Error: error writing data: hid_write/WaitForSingleObject: (0x000003E5)
+Error: CMSIS-DAP command CMD_INFO failed.
+```
+
+这类问题应归入 Flash/Debug Doctor，而不是继续让用户猜。Doctor 需要给出：
+
+- 当前使用的是 ESP-IDF OpenOCD，目标却是 STM32F405，存在版本/打包风险。
+- CMSIS-DAP/DAPLink HID 访问失败，优先检查 VS Code 旧 OpenOCD 进程、串口监视器、其他调试器、驱动状态和重新插拔。
+- 如果复现失败，保存 OpenOCD stdout/stderr 到 `.keilbridge/logs/`，并输出可复制的重试命令。
+
+### 21.6 Sentry_gimbal `.CCM` 段复盘
+
+`Sentry_gimbal` 修复烧录和 reset vector 后，程序进入 `SRML/Drivers/Components/drv_can.c` 的静态 `Error_Handler`。GDB 调用栈显示：
+
+```text
+Error_Handler()
+CAN_Init(hcan=&hcan1, pFunc=User_CAN1_RxCpltCallback)
+System_Device_Init()
+main()
+```
+
+失败点位于 `CAN_Init()` 末尾：`hcan1.Instance` 没有匹配 `CAN_Instances[]`。根因不是业务 CAN 配置，而是 KeilBridge 生成层漏处理了 Keil scatter 中的 `RW_CCM` / `.CCM` 段。
+
+原工程中存在：
+
+```text
+RW_CCM 0x10000000 0x00010000
+  *(.CCM)
+```
+
+SRML 又把若干外设实例表放进 `.CCM`：
+
+```c
+__CCM const CAN_TypeDef* CAN_Instances[CAN_NUM] = {CAN1, CAN2};
+```
+
+早期 GNU ld 脚本没有生成 `CCMRAM` 区域，也没有把 `*(.CCM*)` 放入可初始化段；startup 也只复制 `.data`，没有复制 `.CCM`。结果是 `.CCM` 中的初始化数据没有按 Keil 语义搬运，运行时 `CAN_Instances[]` 内容不可信，导致 `CAN_Init()` 误判并进入 `Error_Handler`。
+
+修复原则：
+
+- scatter parser 必须把 `RW_CCM` 识别为独立 `CCMRAM`。
+- GNU ld 脚本必须生成 `.ccmram`，收集 `*(.CCM)` 和 `*(.CCM*)`，并设置 `AT> FLASH`。
+- startup 必须在复制 `.data` 后复制 `.CCM` 初始化数据。
+- 没有 CCMRAM 的工程仍定义空的 `_sccm/_eccm/_siccm`，保持 startup 模板通用。
+
+当前验证结果：
+
+- `Sentry_gimbal` 重新构建后链接报告显示 `CCMRAM: 432 B`。
+- OpenOCD program/verify 成功。
+- GDB 已能断到 `main()`。
+- 对所有 `Error_Handler` 下断点后运行，未再命中原来的 `CAN_Init()` 错误路径。
+
+### 21.7 Sentry 24 C++ 兼容性复盘
+
+`24-Sentry-Gimbal` 工程验证时，GCC C++ 编译在 `board_com.h` 阻塞：
+
+```text
+declaration of 'sentry_type BoardCom_Classdef::sentry_type' changes meaning of 'sentry_type'
+```
+
+源码里先定义了 typedef：
+
+```c
+typedef enum sentry_type { ... } sentry_type;
+```
+
+随后在 C++ class 中又定义了同名成员：
+
+```cpp
+sentry_type sentry_type;
+```
+
+Keil/ArmClang 遗留工程里常见这种较宽松的 C++ 写法。G++ 默认把它视为错误，但 `-fpermissive` 可以降级为 warning。KeilBridge 的处理原则：
+
+- 不修改用户源码。
+- 不生成源码 patch。
+- 仅对 C++ 编译单元增加 `-fpermissive`。
+- 把这类问题归入 Compat/Build Doctor 的“编译器严格性差异”，后续报告中提示。
+
+当前验证结果：
+
+- `24-Sentry-Gimbal` 已完成 configure/build。
+- 构建生成 `Template.elf/hex/bin/map`。
+- 链接报告显示 `FLASH 8.26%`、`RAM 82.87%`、`CCMRAM 0.56%`。
+- `.CCM` 段支持在 24/25 两个 Sentry 工程中均已验证。
+
+### 21.8 `flash` 子命令闭环验证
+
+`doctor flash --run` 的职责是诊断 OpenOCD/探针/复位向量，不负责真正下载固件。为避免用户误以为 Doctor 已经完成烧录，KeilBridge 新增独立命令：
+
+```powershell
+python -m keiltool.cli flash --project "<project.uvprojx>" --target "<target>" --probe cmsis-dap
+```
+
+实现边界：
+
+- `flash` 默认查找 `.keilbridge/build/gcc-debug/<target>.elf`。
+- `flash` 默认使用 `.keilbridge/generated/openocd/<target>_<probe>.cfg`。
+- 命令内部调用 OpenOCD `program <elf> verify reset exit`，成功标准是 OpenOCD 返回 0 且出现 `Programming Finished`、`Verified OK`。
+- 该命令会真实覆盖芯片 Flash，因此应与 Doctor 明确分离。
+
+本次修复记录：
+
+- 首次执行 `flash` 暴露 CLI 内部 bug：`NameError: name '_sanitize_name' is not defined`。
+- 根因是 `configure/build` 生成层已有 Target 名规范化函数，但 `flash` 子命令查找产物时没有同规则函数。
+- 已在 CLI 层补齐 `_sanitize_name()`，并用中文注释说明它必须与 generator/workspace 层保持一致。
+- `24-Sentry-Gimbal` / `Template` / `cmsis-dap` 已完成实机下载验证，OpenOCD 输出 `Programming Finished` 和 `Verified OK`。
+
+### 21.9 CMSIS-DAP 烧录中途命令错位
+
+`24-Sentry-Gimbal` 后续再次执行 `flash` 时，OpenOCD 已识别 STM32F405 并进入 program 阶段，但烧录中途失败：
+
+```text
+Error: CMSIS-DAP command mismatch. Sent 0x11 received 0x5
+Error: CMSIS-DAP command CMD_DAP_SWJ_CLOCK failed.
+Error: Failed to write memory at 0x20001a58
+Error: error writing to flash at address 0x08000000 at offset 0x00000000
+** Programming Failed **
+```
+
+这类错误应归入 Flash Doctor 的探针/OpenOCD 通信层，而不是归咎于 CMake、ELF 或用户源码。关键判断依据：
+
+- OpenOCD 能读到 SWD DPIDR。
+- OpenOCD 能识别 Cortex-M4 和 STM32F405 flash size。
+- 失败发生在 program 阶段的 CMSIS-DAP 命令响应。
+- 当前 OpenOCD 仍来自 ESP-IDF 打包版本，存在用于 STM32/GD32 的兼容性风险。
+
+已纳入工具规则：
+
+- 新增 `CMSIS_DAP_COMMAND_MISMATCH` 诊断。
+- 新增 `OPENOCD_FLASH_WRITE_FAILED` 诊断。
+- `flash` 命令失败时保存 stdout/stderr 到 `.keilbridge/logs/`。
+- `flash` 命令失败时直接调用 Doctor 分类规则并打印可读建议。
+
+建议动作顺序：
+
+1. 结束残留 `openocd.exe`、`arm-none-eabi-gdb.exe`、VS Code gdb-server。
+2. 关闭串口监视器和其他占用 DAPLink 的软件。
+3. 重新插拔 DAPLink。
+4. 重新执行 `doctor flash --run`。
+5. 再执行 `flash`。
+6. 若仍复现，优先切换到 xPack OpenOCD、STM32CubeCLT OpenOCD 或系统独立 OpenOCD。
+
+### 21.10 VS Code preLaunchTask 不应依赖 PATH
+
+`24-Sentry-Gimbal` 调试时出现 VS Code 弹窗：
+
+```text
+preLaunchTask "CMake: build" 已终止，退出代码为 1
+cmake: 无法将 "cmake" 项识别为 cmdlet、函数、脚本文件或可运行程序的名称
+```
+
+根因不是工程编译失败，而是 generated 目录里的 legacy `.vscode/tasks.json` 仍使用：
+
+```text
+cmake --preset gcc-debug
+cmake --build --preset gcc-debug
+```
+
+VS Code task 的 PowerShell 环境不一定继承命令行 PATH，因此找不到 `cmake.exe`。虽然 `.code-workspace` 已使用绝对路径任务，但用户如果从 generated 配置启动调试，仍会触发旧 `CMake: build`。
+
+修复原则：
+
+- generated `.vscode/launch.json` 和 `.code-workspace` 均使用 `preLaunchTask: KeilBridge: build`。
+- generated `.vscode/tasks.json` 和 `.code-workspace` 均使用同一套 `process` task。
+- task 的 `command` 使用 KeilBridge 探测到的绝对 `cmake.exe`。
+- Ninja 通过 `-DCMAKE_MAKE_PROGRAM=<absolute ninja.exe>` 固定。
+- `ARM_GCC_ROOT` 写入 task env，避免 VS Code task 环境找不到交叉编译器。
+
+验证结果：
+
+- 重新 `configure` 后，`24-Sentry-Gimbal` 的 generated 和 code-workspace 均不再包含旧 `CMake: build`。
+- `preLaunchTask` 已更新为 `KeilBridge: build`。
+- 命令行重新 `build` 通过。
+
+### 21.11 C++ 全局对象构造缺失导致 HardFault
+
+`24-Sentry-Gimbal` 进入 FreeRTOS 后卡在 `HardFault_Handler`。通过 OpenOCD telnet 读取现场：
+
+```text
+CFSR = 0x00000100
+HFSR = 0x40000000
+PC   = 0x08007de6  // HardFault_Handler
+LR   = 0xffffffed
+PSP  = 0x20009668
+```
+
+解析 PSP 栈帧后，异常前 PC 为 `0x20020000`，LR 反查到：
+
+```text
+AttitudeAlgorithm_Classdef::update_deg(...)
+USP/Middlewares/attitudeAlgorithm.cpp:58
+```
+
+反汇编显示 `update_deg()` 通过虚表调用 `update_rad()`：
+
+```text
+ldr r3, [r0, #0]
+ldr r3, [r3, #0]
+blx r3
+```
+
+`r0(this)` 指向全局对象 `attitudeAlgorithm`。读取对象内存发现其虚表指针为 `0x00000000`，说明该全局 C++ 对象只被 BSS 清零，构造函数没有执行。根因是：
+
+- startup 已调用 `__libc_init_array()`。
+- 但 GNU ld 脚本没有保留 `.preinit_array/.init_array/.fini_array/.ctors/.dtors`。
+- 因此 `__libc_init_array()` 没有构造函数表可遍历。
+- 带虚函数、默认成员初始化的全局 C++ 对象不会被正确构造。
+
+修复：
+
+- GNU ld 脚本新增 `.preinit_array`、`.init_array`、`.fini_array`、`.ctors`、`.dtors`。
+- 使用 `KEEP(*(SORT(.init_array.*)))` 和 `KEEP(*(.init_array*))` 防止构造入口被 gc-sections 丢弃。
+- 添加测试 `tests/test_linker_generation.py`，确保链接脚本持续保留 C++ 构造段。
+
+验证：
+
+- 重新 `configure/build/flash` 后，ELF 出现 `__init_array_start/end` 和多个 `_GLOBAL__sub_I_...`。
+- 到达 `main` 时读取 `attitudeAlgorithm`，首字为 `0x08019d64`，对应 `vtable for AttitudeAlgorithm_Classdef` 附近地址。
+- 下 `HardFault_Handler` 断点运行 5 秒未命中。
+- Fault 状态寄存器恢复为 `CFSR=0x00000000`、`HFSR=0x00000000`。
+
+这条修复属于 KeilBridge 启动/链接层通用能力，不是 24Sentry 单工程特例。凡是 CubeMX + C++ + 全局对象/虚函数/默认成员初始化的工程，都依赖这条链路。

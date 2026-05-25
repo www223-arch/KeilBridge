@@ -6,11 +6,13 @@ import os
 import subprocess
 from dataclasses import asdict
 from pathlib import Path
+from time import strftime
 
 from .core.diagnostics import diagnose_target
+from .core.doctor import classify_openocd_log, render_flash_doctor_markdown, run_flash_doctor
 from .core.keil_parser import parse_uvprojx
 from .core.scatter import generate_gnu_ld, parse_scatter_memory
-from .core.tool_finder import find_arm_gcc_root, find_cmake, find_ninja, find_openocd
+from .core.tool_finder import find_arm_gcc_root, find_cmake, find_ninja, find_openocd, find_openocd_scripts
 from .core.workspace import configure_workspace
 
 
@@ -30,6 +32,17 @@ def _pick_target(model, target_name: str | None):
             return target
     names = ", ".join(target.name for target in model.targets)
     raise SystemExit(f"Target not found: {target_name}. Available targets: {names}")
+
+
+def _sanitize_name(name: str) -> str:
+    """把 Keil Target 名转换成可作为文件名/CMake 目标名的稳定名称。
+
+    Keil Target 允许空格、横杠等字符，但 KeilBridge 生成的 ELF、OpenOCD 配置和
+    linker/startup 文件都使用同一个规范化名称。这里必须和 generator/workspace 层
+    保持一致，否则 `configure` 生成的文件名与 `flash` 查找的文件名会对不上。
+    """
+
+    return "".join(ch if ch.isalnum() or ch == "_" else "_" for ch in name)
 
 
 def cmd_inspect(args: argparse.Namespace) -> int:
@@ -197,6 +210,99 @@ def cmd_openocd(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_flash(args: argparse.Namespace) -> int:
+    """把当前构建出的 ELF 下载到芯片。
+
+    `doctor flash` 只做连接/复位/向量表诊断，不应该承担真正下载职责。
+    这里提供明确的 flash 命令，内部调用 OpenOCD `program <elf> verify reset exit`，
+    成功标准就是 OpenOCD 返回 0 且输出 program/verify 通过。
+    """
+
+    model = parse_uvprojx(args.project)
+    target = _pick_target(model, args.target)
+    workspace_root = Path(args.workspace_root).resolve() if args.workspace_root else Path(model.inferred_project_root)
+    project_name = _sanitize_name(target.name)
+    generated_dir = workspace_root / ".keilbridge" / "generated"
+    build_dir = workspace_root / ".keilbridge" / "build" / "gcc-debug"
+    cfg = generated_dir / "openocd" / f"{project_name}_{args.probe}.cfg"
+    elf = Path(args.elf).resolve() if args.elf else build_dir / f"{project_name}.elf"
+    if not cfg.exists():
+        raise SystemExit(f"OpenOCD config not found: {cfg}. Run configure first.")
+    if not elf.exists():
+        raise SystemExit(f"ELF not found: {elf}. Run build first.")
+
+    openocd = find_openocd(args.openocd)
+    scripts = find_openocd_scripts(openocd)
+    command = [openocd]
+    if scripts:
+        command.extend(["-s", scripts])
+    command.extend(["-f", str(cfg), "-c", f"program {elf.as_posix()} verify reset exit"])
+    print(" ".join(f'"{item}"' if " " in item else item for item in command))
+    # flash 是最容易受探针、OpenOCD 版本、USB/HID 占用影响的阶段。这里不再直接把
+    # subprocess 输出丢给终端就结束，而是同时保存日志，并在失败时立即调用 Doctor
+    # 分类规则，给用户一个可读结论。
+    logs_dir = workspace_root / ".keilbridge" / "logs"
+    logs_dir.mkdir(parents=True, exist_ok=True)
+    stamp = strftime("%Y%m%d-%H%M%S")
+    stdout_path = logs_dir / f"flash_{project_name}_{args.probe}_{stamp}.out.log"
+    stderr_path = logs_dir / f"flash_{project_name}_{args.probe}_{stamp}.err.log"
+    completed = subprocess.run(command, cwd=generated_dir, text=True, capture_output=True)
+    stdout_path.write_text(completed.stdout, encoding="utf-8", newline="\n")
+    stderr_path.write_text(completed.stderr, encoding="utf-8", newline="\n")
+    if completed.stdout:
+        print(completed.stdout, end="")
+    if completed.stderr:
+        print(completed.stderr, end="")
+    print(f"Flash logs: {stdout_path} ; {stderr_path}")
+    if completed.returncode != 0:
+        findings = classify_openocd_log(completed.stdout + "\n" + completed.stderr, openocd, target, args.probe)
+        if findings:
+            print("KeilBridge Flash Doctor:")
+            for finding in findings:
+                print(f"[{finding.severity}] {finding.code}: {finding.title}")
+                if finding.evidence:
+                    print(f"  evidence: {finding.evidence}")
+                if finding.suggestion:
+                    print(f"  suggestion: {finding.suggestion}")
+        return completed.returncode
+    return 0
+
+
+def cmd_doctor_flash(args: argparse.Namespace) -> int:
+    """诊断 OpenOCD/探针/烧录链路。
+
+    第一版 Flash Doctor 专门解决用户最常见的“VS Code 只弹 GDB Server Quit
+    Unexpectedly，但不知道 OpenOCD 真正哪里坏了”的问题。默认分析已有日志；
+    `--run` 才主动启动 OpenOCD，避免无意中占用或复位用户硬件。
+    """
+
+    model = parse_uvprojx(args.project)
+    target = _pick_target(model, args.target)
+    workspace_root = Path(args.workspace_root).resolve() if args.workspace_root else Path(model.inferred_project_root)
+    result = run_flash_doctor(
+        target=target,
+        workspace_root=workspace_root,
+        probe=args.probe,
+        openocd_path=args.openocd,
+        run_probe=args.run,
+    )
+    report_dir = workspace_root / ".keilbridge" / "generated" / "reports"
+    report_dir.mkdir(parents=True, exist_ok=True)
+    json_path = report_dir / "flash_doctor_result.json"
+    md_path = report_dir / "flash_doctor_report.md"
+    json_path.write_text(json.dumps(result.to_dict(), ensure_ascii=False, indent=2), encoding="utf-8", newline="\n")
+    md_path.write_text(render_flash_doctor_markdown(result, target, args.probe), encoding="utf-8", newline="\n")
+
+    print(f"Flash Doctor report: {md_path}")
+    for finding in result.findings:
+        print(f"[{finding.severity}] {finding.code}: {finding.title}")
+        if finding.evidence:
+            print(f"  evidence: {finding.evidence}")
+        if finding.suggestion:
+            print(f"  suggestion: {finding.suggestion}")
+    return 1 if any(item.severity in {"fail", "fatal"} for item in result.findings) else 0
+
+
 def _run(command: list[str], cwd: Path, env: dict[str, str] | None = None) -> None:
     try:
         subprocess.run(command, cwd=cwd, env=env, check=True)
@@ -273,6 +379,27 @@ def build_parser() -> argparse.ArgumentParser:
     openocd_cmd.add_argument("--openocd", help="Path to openocd executable")
     openocd_cmd.add_argument("--run", action="store_true", help="Run OpenOCD instead of only printing the command")
     openocd_cmd.set_defaults(func=cmd_openocd)
+
+    flash_cmd = subparsers.add_parser("flash", help="Program the generated ELF with OpenOCD")
+    flash_cmd.add_argument("--project", required=True, type=Path, help="Path to .uvprojx")
+    flash_cmd.add_argument("--target", help="Keil target name")
+    flash_cmd.add_argument("--probe", default="stlink", help="Probe profile: stlink, cmsis-dap, daplink")
+    flash_cmd.add_argument("--workspace-root", help="Override .keilbridge location; defaults to inferred Keil project root")
+    flash_cmd.add_argument("--openocd", help="Path to openocd executable")
+    flash_cmd.add_argument("--elf", help="Override ELF path; defaults to .keilbridge/build/gcc-debug/<target>.elf")
+    flash_cmd.set_defaults(func=cmd_flash)
+
+    doctor_parser = subparsers.add_parser("doctor", help="Run KeilBridge staged diagnostics")
+    doctor_subparsers = doctor_parser.add_subparsers(dest="doctor_command", required=True)
+
+    doctor_flash = doctor_subparsers.add_parser("flash", help="Diagnose OpenOCD/probe/flash connection")
+    doctor_flash.add_argument("--project", required=True, type=Path, help="Path to .uvprojx")
+    doctor_flash.add_argument("--target", help="Keil target name")
+    doctor_flash.add_argument("--probe", default="stlink", help="Probe profile: stlink, cmsis-dap, daplink")
+    doctor_flash.add_argument("--workspace-root", help="Override .keilbridge location; defaults to inferred Keil project root")
+    doctor_flash.add_argument("--openocd", help="Path to openocd executable")
+    doctor_flash.add_argument("--run", action="store_true", help="Run a minimal OpenOCD connect/reset/vector read test")
+    doctor_flash.set_defaults(func=cmd_doctor_flash)
 
     return parser
 

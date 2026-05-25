@@ -68,7 +68,7 @@ def configure_workspace(workspace_root: Path, target: KeilTargetModel, probe: st
         generated_dir / ".vscode" / "launch.json",
         generate_launch_json(target, probe, openocd_path=openocd, openocd_scripts=openocd_scripts, openocd_config=openocd_config),
     )
-    _write(generated_dir / ".vscode" / "tasks.json", generate_tasks_json())
+    _write(generated_dir / ".vscode" / "tasks.json", generate_tasks_json(cmake, ninja, generated_dir, build_dir, arm_gcc_root))
     _write(generated_dir / ".vscode" / "settings.json", generate_vscode_settings())
     _write(
         workspace_root / ".keilbridge" / f"KeilBridge_{project_name}.code-workspace",

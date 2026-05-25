@@ -26,7 +26,7 @@ def generate_launch_json(
         openocd_path=openocd_path,
         openocd_scripts=openocd_scripts,
         openocd_config=openocd_config,
-        pre_launch_task="CMake: build",
+        pre_launch_task="KeilBridge: build",
     )
     return json.dumps({"version": "0.2.0", "configurations": [configuration]}, ensure_ascii=False, indent=2) + "\n"
 
@@ -191,28 +191,22 @@ source [find {target_cfg}]
 """
 
 
-def generate_tasks_json() -> str:
-    """生成 VS Code 构建任务。"""
+def generate_tasks_json(cmake: str, ninja: str, generated_dir: Path, build_dir: Path, arm_gcc_root: str) -> str:
+    """生成 VS Code 构建任务。
 
-    return """{
-  "version": "2.0.0",
-  "tasks": [
-    {
-      "label": "CMake: configure",
-      "type": "shell",
-      "command": "cmake --preset gcc-debug",
-      "problemMatcher": []
-    },
-    {
-      "label": "CMake: build",
-      "type": "shell",
-      "command": "cmake --build --preset gcc-debug",
-      "dependsOn": "CMake: configure",
-      "problemMatcher": "$gcc"
+    不能依赖 VS Code 任务环境里的 PATH。很多 Windows 机器上命令行能找到 CMake，
+    但 VS Code task 的 PowerShell 找不到 `cmake.exe`，于是调试前反复弹
+    “preLaunchTask 已终止”。这里和 `.code-workspace` 使用同一套绝对路径任务。
+    """
+
+    payload = {
+        "version": "2.0.0",
+        "tasks": [
+            _configure_task(cmake, ninja, generated_dir, build_dir, arm_gcc_root),
+            _build_task(cmake, build_dir),
+        ],
     }
-  ]
-}
-"""
+    return json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
 
 
 def _configure_task(cmake: str, ninja: str, generated_dir: Path, build_dir: Path, arm_gcc_root: str) -> dict:

@@ -91,6 +91,10 @@ target_compile_options(${{TARGET_NAME}} PRIVATE
   -Wextra
   -Wno-unused-parameter
   -Wno-missing-field-initializers
+  # Keil/ArmClang 老工程里常有一些 G++ 默认视为错误、但迁移期可以降级为
+  # warning 的 C++ 写法，例如成员变量名和 typedef 同名。这里仅对 C++ 源启用
+  # -fpermissive，不影响 C 源，也不修改用户源码。
+  $<$<COMPILE_LANGUAGE:CXX>:-fpermissive>
   -g3
   -Og
 )

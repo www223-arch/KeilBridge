@@ -76,12 +76,28 @@ CopyData:
   adds r4, r0, r3
   cmp r4, r1
   bcc CopyDataWord
-  b ZeroBss
+  b CopyCcmData
 CopyDataWord:
   ldr r5, [r2, r3]
   str r5, [r4]
   adds r3, r3, #4
   b CopyData
+
+CopyCcmData:
+  ldr r0, =_sccm
+  ldr r1, =_eccm
+  ldr r2, =_siccm
+  movs r3, #0
+CopyCcmDataLoop:
+  adds r4, r0, r3
+  cmp r4, r1
+  bcc CopyCcmDataWord
+  b ZeroBss
+CopyCcmDataWord:
+  ldr r5, [r2, r3]
+  str r5, [r4]
+  adds r3, r3, #4
+  b CopyCcmDataLoop
 
 ZeroBss:
   ldr r0, =_sbss

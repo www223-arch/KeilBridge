@@ -1,0 +1,22 @@
+{
+  "GD32F303CB": {
+    "vendor": "gd",
+    "family": "gd32f3",
+    "core": "cortex-m4",
+    "fpu": "",
+    "float_abi": "soft",
+    "openocd_target": "",
+    "memory": [
+      {
+        "name": "FLASH",
+        "origin": "0x08000000",
+        "length": "128K"
+      },
+      {
+        "name": "RAM",
+        "origin": "0x20000000",
+        "length": "32K"
+      }
+    ]
+  }
+}

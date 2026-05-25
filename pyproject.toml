@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "keiltool"
+version = "0.1.0"
+description = "Zero-intrusion external GCC/CMake adapter for Keil MDK projects."
+requires-python = ">=3.10"
+authors = [
+  { name = "KeilTool contributors" }
+]
+
+[project.scripts]
+k2c = "keiltool.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["keiltool*"]
+

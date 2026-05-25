@@ -1,0 +1,96 @@
+from __future__ import annotations
+
+import os
+import shutil
+from pathlib import Path
+
+
+VS_CMAKE = Path(r"C:\Program Files\Microsoft Visual Studio\2022\Community\Common7\IDE\CommonExtensions\Microsoft\CMake\CMake\bin\cmake.exe")
+VS_NINJA = Path(r"C:\Program Files\Microsoft Visual Studio\2022\Community\Common7\IDE\CommonExtensions\Microsoft\CMake\Ninja\ninja.exe")
+OPENOCD_CANDIDATES = [
+    Path(r"C:\OpenOCD\bin\openocd.exe"),
+    Path(r"C:\Program Files\OpenOCD\bin\openocd.exe"),
+    Path(r"C:\Program Files (x86)\OpenOCD\bin\openocd.exe"),
+    Path(r"D:\ESP32\Esp_idf\Espressif\tools\openocd-esp32\v0.12.0-esp32-20250422\openocd-esp32\bin\openocd.exe"),
+]
+ARM_GCC_ROOTS = [
+    Path(r"C:\Program Files (x86)\Arm GNU Toolchain arm-none-eabi\14.2 rel1"),
+    Path(r"C:\Program Files (x86)\Arm GNU Toolchain arm-none-eabi\12.2 mpacbti-rel1"),
+    Path(r"C:\Program Files\Arm GNU Toolchain arm-none-eabi\14.2 rel1"),
+    Path(r"C:\Program Files\Arm GNU Toolchain arm-none-eabi\12.2 mpacbti-rel1"),
+]
+
+
+def find_cmake(explicit: str | None = None) -> str:
+    """寻找 CMake。
+
+    Windows 上 VS 会自带 CMake，但通常没进 PATH。这里优先尊重用户显式传入，
+    其次查 PATH，最后查 VS 常见路径。
+    """
+
+    return _find_executable(explicit, "cmake", [VS_CMAKE])
+
+
+def find_ninja(explicit: str | None = None) -> str:
+    """寻找 Ninja，规则同 CMake。"""
+
+    return _find_executable(explicit, "ninja", [VS_NINJA])
+
+
+def find_arm_gcc_root(explicit: str | None = None) -> str:
+    """寻找 Arm GNU Toolchain 根目录。
+
+    生成的 toolchain 文件读取 `ARM_GCC_ROOT`，所以 build 命令只需要把这个环境
+    变量临时补进去，不污染用户系统环境。
+    """
+
+    if explicit:
+        return explicit
+    if os.environ.get("ARM_GCC_ROOT"):
+        return os.environ["ARM_GCC_ROOT"]
+    if shutil.which("arm-none-eabi-gcc"):
+        return ""
+    for root in ARM_GCC_ROOTS:
+        if (root / "bin" / "arm-none-eabi-gcc.exe").exists():
+            return str(root)
+    return ""
+
+
+def find_openocd(explicit: str | None = None) -> str:
+    """寻找 OpenOCD。
+
+    调试服务可能来自独立 OpenOCD、xPack OpenOCD、STM32CubeIDE 或用户自定义路径。
+    MVP 先查显式参数、PATH 和常见独立安装路径。
+    """
+
+    return _find_executable(explicit, "openocd", OPENOCD_CANDIDATES)
+
+
+def find_openocd_scripts(openocd_path: str) -> str:
+    """根据 openocd.exe 位置推导 scripts 目录。
+
+    Cortex-Debug 的 `searchDir` 和命令行 OpenOCD 的 `-s` 都需要这个目录。
+    独立 OpenOCD、xPack 和 ESP-IDF 打包版目录层级略有差异，所以从 exe 位置向上查找
+    `share/openocd/scripts`，找不到时返回空字符串，让 OpenOCD 使用自身默认搜索路径。
+    """
+
+    exe = Path(openocd_path)
+    if not exe.exists():
+        return ""
+    for parent in [exe.parent, *exe.parents]:
+        candidate = parent / "share" / "openocd" / "scripts"
+        if candidate.exists():
+            return str(candidate)
+    return ""
+
+
+def _find_executable(explicit: str | None, name: str, candidates: list[Path]) -> str:
+    if explicit:
+        return explicit
+    found = shutil.which(name)
+    if found:
+        return found
+    for candidate in candidates:
+        if candidate.exists():
+            return str(candidate)
+    return name

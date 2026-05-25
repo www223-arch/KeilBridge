@@ -7,6 +7,7 @@ from pathlib import Path
 from .device_database import lookup_device
 from .device_inference import infer_core, infer_family, infer_fpu, infer_vendor, parse_memory_regions
 from .path_resolver import infer_project_root, normalize_path, resolve_keil_path
+from .project_classifier import classify_project
 from .project_model import KeilFile, KeilProjectModel, KeilTargetModel
 from .scatter import discover_scatter_files
 
@@ -55,7 +56,22 @@ def _target_option_text(target: ET.Element, tag: str) -> str:
     return values[-1] if values else ""
 
 
-def _parse_files(target: ET.Element, base_dir: Path) -> tuple[list[KeilFile], list[str], list[str]]:
+def _compiler_option_text(target: ET.Element, tag: str) -> str:
+    """读取当前 target 的 C/C++ 编译器选项。
+
+    Keil 的同名字段会同时出现在 C 编译器 `Cads`、汇编器 `Aads` 以及单文件覆盖配置里。
+    例如 `IncludePath` 在 CubeMX 工程中常见为：Cads 里是完整 C include，Aads 里只有
+    `Core/Inc`。如果简单取最后一个同名字段，就会把完整 include 覆盖成汇编 include，
+    进而导致 `stm32f4xx_hal.h`、`FreeRTOS.h` 等头文件找不到。
+    """
+
+    compiler_value = _text(target.find(f"./TargetOption/TargetArmAds/Cads/VariousControls/{tag}"))
+    if compiler_value:
+        return compiler_value
+    return _target_option_text(target, tag)
+
+
+def _parse_files(target: ET.Element, base_dir: Path, project_root: Path) -> tuple[list[KeilFile], list[str], list[str]]:
     """解析 Keil 文件分组。
 
     Keil 的 FileType 并不总是可靠，跨版本也可能变化。因此这里以路径后缀和
@@ -73,7 +89,7 @@ def _parse_files(target: ET.Element, base_dir: Path) -> tuple[list[KeilFile], li
             if not raw_path:
                 continue
             kind = _file_kind(raw_path)
-            resolved = resolve_keil_path(base_dir, raw_path)
+            resolved = resolve_keil_path(base_dir, raw_path, project_root)
             suffix = Path(raw_path).suffix
 
             if suffix in SOURCE_SUFFIXES:
@@ -99,10 +115,11 @@ def parse_uvprojx(uvprojx_path: str | Path) -> KeilProjectModel:
     tree = ET.parse(project_path)
     root = tree.getroot()
 
+    project_root = infer_project_root(project_path)
     model = KeilProjectModel(
         project_file=normalize_path(str(project_path)),
         keil_project_dir=normalize_path(str(base_dir)),
-        inferred_project_root=normalize_path(str(infer_project_root(project_path))),
+        inferred_project_root=normalize_path(str(project_root)),
     )
 
     for target in root.findall(".//Target"):
@@ -112,15 +129,15 @@ def parse_uvprojx(uvprojx_path: str | Path) -> KeilProjectModel:
 
         cpu = _target_option_text(target, "Cpu")
         device = _target_option_text(target, "Device")
-        define_text = _target_option_text(target, "Define")
-        include_text = _target_option_text(target, "IncludePath")
+        define_text = _compiler_option_text(target, "Define")
+        include_text = _compiler_option_text(target, "IncludePath")
         scatter_text = _target_option_text(target, "ScatterFile")
         c99_mode = _target_option_text(target, "C99Mode")
         optimization = _target_option_text(target, "Optimization")
         if not optimization:
             optimization = _target_option_text(target, "OptimizationLevel")
 
-        sources, libraries, startup_files = _parse_files(target, base_dir)
+        sources, libraries, startup_files = _parse_files(target, base_dir, project_root)
 
         # 设备数据库是长期维护 STM/GD 全系列的基础；Keil Cpu 字段只作为兜底。
         device_info = lookup_device(device)
@@ -128,17 +145,20 @@ def parse_uvprojx(uvprojx_path: str | Path) -> KeilProjectModel:
         family = device_info.family or infer_family(device)
         core = device_info.core or infer_core(cpu, device)
         inferred_fpu, inferred_float_abi = infer_fpu(cpu, core)
-        fpu = device_info.fpu or inferred_fpu
-        float_abi = device_info.float_abi or inferred_float_abi
+        # Keil 的 Cpu 字段来自当前 target，通常比 seed 设备库更贴近实际工程配置。
+        # 如果 Cpu 明确写了 FPU，而设备库条目还没有完善 FPU 信息，则优先采用 Cpu 推导结果。
+        fpu = inferred_fpu or device_info.fpu
+        float_abi = inferred_float_abi if inferred_fpu else (device_info.float_abi or inferred_float_abi)
         memory = device_info.memory or parse_memory_regions(cpu)
 
-        scatter_file = resolve_keil_path(base_dir, scatter_text) if scatter_text else ""
+        scatter_file = resolve_keil_path(base_dir, scatter_text, project_root) if scatter_text else ""
         scatter_candidates = [] if scatter_file else discover_scatter_files(base_dir, target_name)
 
         includes = [
-            resolve_keil_path(base_dir, item)
+            resolve_keil_path(base_dir, item, project_root)
             for item in _split_semicolon(include_text)
         ]
+        features = classify_project(str(project_root), sources, includes, _split_defines(define_text))
 
         model.targets.append(
             KeilTargetModel(
@@ -159,6 +179,7 @@ def parse_uvprojx(uvprojx_path: str | Path) -> KeilProjectModel:
                 scatter_file=scatter_file,
                 scatter_candidates=scatter_candidates,
                 device_info=device_info,
+                features=features,
                 c_standard="c99" if c99_mode == "1" else "c11",
                 optimization=optimization,
             )

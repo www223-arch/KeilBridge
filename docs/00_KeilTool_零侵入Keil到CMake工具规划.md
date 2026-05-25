@@ -1,8 +1,14 @@
-# KeilTool 零侵入 Keil 到 CMake 工具规划
+# KeilBridge 零侵入 Keil 到 CMake 工具规划
+
+## 0. 英文命名
+
+工具英文名：**KeilBridge**。
+
+Bridge 表达“桥接”而不是“改造”。KeilBridge 的职责是在 Keil MDK 工程和 CMake/GCC/OpenOCD/VS Code/自动化流程之间建立外部适配层，强调 0 侵入、并行构建、调试桥接和工程自动化。CLI 短命令可以继续使用 `k2c`，作为 Keil to CMake 的开发者入口。
 
 ## 1. 项目定位
 
-KeilTool 是一个面向嵌入式工程的外部构建适配器。
+KeilBridge 是一个面向嵌入式工程的外部构建适配器。
 
 它不把 Keil 工程“改造成” CMake 工程，而是在 Keil 工程外部生成一层现代构建、烧录、调试入口。
 
@@ -10,7 +16,7 @@ KeilTool 是一个面向嵌入式工程的外部构建适配器。
 
 - 原 Keil 工程是唯一事实源。
 - 不移动源码，不改目录结构，不修改 `.uvprojx/.uvoptx/.sct/.ioc`。
-- 所有 CMake、VS Code、烧录、缓存、日志产物都放在 KeilTool 自己的工作区。
+- 所有 CMake、VS Code、烧录、缓存、日志产物都放在 KeilBridge 自己的工作区。
 - Keil 能继续照常使用，CMake 只是并行构建入口。
 
 一句话目标：
@@ -19,7 +25,7 @@ KeilTool 是一个面向嵌入式工程的外部构建适配器。
 
 ## 2. 非目标
 
-为了保持技术边界清晰，KeilTool 第一阶段不做这些事：
+为了保持技术边界清晰，KeilBridge 第一阶段不做这些事：
 
 - 不重排用户工程目录。
 - 不把目标工程源码复制到工具仓库。
@@ -51,9 +57,8 @@ k2c build
 生成物示例：
 
 ```text
-D:/GD32/GDproject/KeilTool/
-  keiltool.yaml
-  .keiltool/
+<keil-project-root>/
+  .keilbridge/
     generated/
       CMakeLists.txt
       CMakePresets.json
@@ -66,7 +71,7 @@ D:/GD32/GDproject/KeilTool/
     logs/
 ```
 
-目标 Keil 工程目录保持原样。
+`.keilbridge/` 默认放在目标 Keil 工程根目录下。这样每个工程天然隔离，多个 Keil 工程来回编译不会互相覆盖。KeilBridge 不修改源码、不修改 `.uvprojx`、不修改 Keil 配置文件，只新增可删除、可再生成的工具工作区。
 
 ## 4. 总体架构
 
@@ -174,7 +179,7 @@ KeilTool/
 
 ## 7. GCC 兼容适配
 
-KeilTool 必须把“不兼容点”工具化，而不是甩给用户手动改。
+KeilBridge 必须把“不兼容点”工具化，而不是甩给用户手动改。
 
 ### 7.1 Startup
 
@@ -184,7 +189,7 @@ Keil ARMASM `.s` 通常不能直接交给 GCC。
 
 1. 优先在工程或芯片包中寻找 GCC 版 startup。
 2. 找不到时，根据芯片型号和向量表模板生成 GCC startup。
-3. 生成文件放入 `.keiltool/generated/startup/`。
+3. 生成文件放入 `.keilbridge/generated/startup/`。
 
 ### 7.2 Linker Script
 
@@ -224,7 +229,15 @@ ARMCC `.lib` 不能假定可被 GCC 链接。
 
 - CMSIS-DSP：优先替换为 GCC 兼容库或源码构建。
 - 普通第三方库：尝试识别格式；不兼容时输出阻断级诊断。
-- 用户可在 `keiltool.yaml` 中配置替代库路径。
+- 用户可在 `keilbridge.yaml` 中配置替代库路径。
+
+当前边界：
+
+- KeilBridge 会检测 `arm_cortexM4lf_math.lib` 这类 ARMCC CMSIS-DSP 库，并在诊断中报告 `armcc_library`。
+- 当前生成层不会把 ARMCC `.lib` 直接交给 GCC 链接。
+- 为了打通早期样例工程，当前只生成最小 `arm_math_compat.c`，覆盖少量已验证符号，例如 `arm_sin_f32`、`arm_cos_f32`。
+- 这只是兼容兜底，不等价于完整 CMSIS-DSP 支持。如果用户工程调用 `arm_mat_mult_f32`、`arm_pid_f32`、`arm_rfft_fast_f32`、`arm_biquad_cascade_df1_f32` 等未覆盖 API，仍可能在链接阶段出现 `undefined reference`。
+- 完整方案必须实现 CMSIS-DSP adapter：优先使用工程内 CMSIS-DSP 源码，或链接 GCC/arm-none-eabi 可用的 `.a`，或要求用户通过 override 配置 DSP pack/root。
 
 ## 8. 芯片与烧录器抽象
 
@@ -274,7 +287,7 @@ pyocd:
 
 ## 9. 配置文件规范
 
-`keiltool.yaml` 是用户可编辑配置，保存 override，不保存自动解析出来的大量清单。
+`keilbridge.yaml` 是用户可编辑配置，保存 override，不保存自动解析出来的大量清单。
 
 示例：
 
@@ -395,7 +408,7 @@ k2c flash --probe stlink 可调用烧录流程
 
 下一步从最小闭环开始：
 
-1. 创建 KeilTool Python 项目骨架。
+1. 创建 KeilBridge Python 项目骨架。
 2. 实现 `k2c inspect <uvprojx>`，只解析并打印工程摘要。
 3. 实现 `k2c model <uvprojx> --json`，输出中间模型。
 4. 用 `HS_STEP_42C.uvprojx` 做第一条真实样例。
@@ -405,7 +418,7 @@ k2c flash --probe stlink 可调用烧录流程
 
 ## 14. 长期适配目标：STM/GD 全系列优先
 
-KeilTool 的长期目标不是只服务某一个工程，而是形成一个可扩展的 Keil 外部构建适配平台。
+KeilBridge 的长期目标不是只服务某一个工程，而是形成一个可扩展的 Keil 外部构建适配平台。
 
 优先覆盖范围：
 
@@ -425,7 +438,7 @@ KeilTool 的长期目标不是只服务某一个工程，而是形成一个可�
 - 工程形态差异通过 project classifier 识别，例如 CubeMX、StdPeriph、裸机、RTOS。
 - 不兼容点全部进入 diagnostics，不让用户靠猜。
 
-这意味着 KeilTool 不会把“通用”写成一堆硬编码 if，而是把信息拆成可维护的数据和插件式适配层。
+这意味着 KeilBridge 不会把“通用”写成一堆硬编码 if，而是把信息拆成可维护的数据和插件式适配层。
 
 ## 15. 当前实现状态
 
@@ -443,10 +456,128 @@ KeilTool 的长期目标不是只服务某一个工程，而是形成一个可�
 - `inspect` 已能显示设备数据库命中状态和 OpenOCD target。
 - 增加 scatter 自动发现：当 `.uvprojx` 没有显式 ScatterFile 时，可在 Keil 工程目录下寻找 `.sct` 候选。
 - 增加 `k2c scatter`：可解析 Keil `.sct` 并预览 GNU ld 脚本。
+- 工具英文名确定为 **KeilBridge**，CLI 短命令继续使用 `k2c`。
+- 增加 `configure` 命令：默认在目标 Keil 工程根目录生成 `.keilbridge/generated` 外部 CMake/OpenOCD/VS Code 工作区，避免多个工程互相覆盖。
+- 增加 GCC startup 生成：从 Keil ARMASM startup 抽取向量表并生成 GNU as `.S`。
+- 明确源码边界：KeilBridge 不修改、不替换、不自动修复用户源码；用户代码存在语法错误时，CMake/GCC 应正常报错。
+- 增加最小 CMSIS-DSP 兼容层和 newlib syscalls 支持源。
+- 增加 `build` 命令：可自动发现 VS CMake/Ninja 和 Arm GNU Toolchain。
+- 已真实构建 `HS_STEP_42C`：生成 `elf/hex/bin/map`，Flash 约 36.48%，RAM 约 76.73%。
+- `HS_STEP_42C` 当前能通过，是因为没有直接链接 ARMCC `DSP_LIB/arm_cortexM4lf_math.lib`，且最小 CMSIS-DSP 兼容层覆盖了当前用到的符号；这不代表 ARMCC CMSIS-DSP 库已被完整替换。
+- 增加 `openocd` 命令和 VS Code Cortex-Debug 配置生成；当前机器未发现 `openocd.exe`，可通过 `--openocd` 显式传入。
 
 下一步：
 
-- 将 scatter 转换结果真正写入 `.keiltool/generated/linker/`。
-- 增加 `configure` 命令，生成外部 CMake 工作区。
-- 增加 GCC startup 模板生成。
+- 增加 OpenOCD 路径发现范围，例如 STM32CubeIDE、xPack OpenOCD。
+- 增加 `flash` 命令，直接调用 OpenOCD program/verify/reset。
+- 增加 `debug` 命令，可启动 OpenOCD server 或生成一键调试入口。
 - 增加 project classifier，用于识别 CubeMX、标准库、裸机、RTOS 等工程形态。
+
+## 16. 参考适配性注意事项后的补充原则
+
+用户提供的《0侵入式Keil转CMake工具适配性注意事项》不作为逐字实现规范，但其中几个工程化原则已经纳入 KeilBridge：
+
+- 必须先生成中间模型 IR，再由 generator 生成 CMake/OpenOCD/VS Code 文件，避免直接把 Keil XML 结构写死进 CMake。
+- 解析层只提取事实：target、source、include、define、library、startup、scatter、device、CPU、工程形态。
+- 兼容层必须有明确诊断：ARMCC 专有宏、ARMCC `.lib`、ARMASM startup、缺失 scatter、RTOS port、GD OpenOCD 未验证等。
+- 路径解析必须支持 Keil 相对路径、Windows 反斜杠、空格、中文路径、环境变量、`$PROJ_DIR$` / `$(PROJ_DIR)` 这类工程宏。
+- 芯片适配不能只靠硬编码，短期用内置 seed database，长期接入 CMSIS-Pack、厂商 pack、OpenOCD/J-Link/pyOCD 数据和用户 override。
+- CubeMX 工程不重新生成代码，只复用 `.ioc` 旁边的 Core/Drivers/Middlewares 和 Keil 已选文件，不触碰 `USER CODE` 区域。
+- RTOS 工程先识别和报告风险，再做明确的 port 映射；例如 FreeRTOS 的 RVDS/ARMCC portable layer 不能假装等价于 GCC port。
+- 每次 `configure` 生成 `reports/project_ir.json` 和 `reports/conversion_report.md`，后续验证 GD、CubeMX、RTOS 都以报告为入口。
+
+## 17. CubeMX / RTOS / GD32 当前边界
+
+### CubeMX
+
+当前支持状态：**识别 + 复用**。
+
+KeilBridge 可以识别 `.ioc` 和 STM32 HAL/CubeMX 常见目录结构，生成外部 CMake 时复用 Keil 工程里已经列出的源文件、include、define。工具不会调用 CubeMX，不会改 `.ioc`，不会移动 Core/Drivers/Middlewares。
+
+当前不承诺：自动处理所有 CubeMX 中间件组合、自动补齐未被 Keil target 选中的文件、自动重写 CubeMX 生成逻辑。
+
+### RTOS
+
+当前支持状态：**识别 + 诊断 + FreeRTOS RVDS/ARMCC 到 GCC port 的首个映射**。
+
+KeilBridge 已开始识别 FreeRTOS、RT-Thread、ThreadX、uCOS 等工程形态，并在报告中提示 RTOS port 风险。GD32F303 验证工程中，Keil target 使用 FreeRTOS `portable/RVDS/ARM_CM4F`，外部 GCC 构建已映射到 `portable/GCC/ARM_CM4F`，原 Keil 工程和源码目录保持不变。后续完整支持仍需要逐个 RTOS 做 adapter，并检查 heap 文件是否重复。
+
+当前不承诺：自动解决堆实现冲突、自动处理所有 BSP/中间件组合、自动修复用户 RTOS 配置错误。
+
+### GD32
+
+当前支持状态：**设备数据库 seed + 工程形态识别 + GD32F303CB/DAPLink/OpenOCD 实板验证**。
+
+已加入 GD32F1/F3/F4/E2/L2 的少量 seed 条目，用来打通 parser、CMake 参数、内存模型和调试配置生成流程。GD32F303CB 已用 DAPLink/CMSIS-DAP 和 OpenOCD `stm32f3x.cfg` 兼容 target 完成编译、下载、verify、GDB 断到 `main`、运行到 FreeRTOS idle 的首个闭环验证。其他 GD 系列在未确认 OpenOCD target 前仍只生成诊断，不做“已支持”的虚假承诺。
+
+下一步需要继续收集 GD32F1/F4/E/L 等真实板卡，用同一套流程跑 `inspect -> configure -> build -> openocd -> gdb`，再把成功/失败结果沉淀回设备数据库和 adapter。
+
+## 18. VS Code 调试工作区规划
+
+`configure/build/openocd` 打通以后，KeilBridge 还必须把 VS Code 调试体验当成独立功能处理，不能简单让用户打开 `.keilbridge/generated` 目录。
+
+### 18.1 问题边界
+
+- Keil 工程文件常在 `MDK-ARM`、`Keil5_project` 这类子目录，真实源码可能分散在上级 `Firmware`、`Drivers`、`Freertos`、`User`、`USP`、`Utilities` 等目录。
+- 只打开 `generated` 会看不到完整源码，用户无法自然地在原始 `.c/.h` 文件中下断点。
+- 多根 VS Code 工作区中 `${workspaceFolder}` 会随当前文件根目录变化，OpenOCD cfg、ELF、cwd 如果使用相对路径，容易导致 GDB server 启动失败。
+- IntelliSense 不能手写一份 includePath，必须跟随 CMake 生成的 `compile_commands.json`，否则和真实 GCC 构建漂移。
+- 生成的兼容源必须按需存在；不需要 CMSIS-DSP 时不能残留 `arm_math_compat.c` 让 C/C++ 插件报 `arm_math.h` 错误。
+
+### 18.2 目标体验
+
+- 用户打开 `.keilbridge/KeilBridge_<target>.code-workspace`，而不是打开 generated 文件夹。
+- 工作区至少包含两个根：
+  - `Original Source`：从 source/include 共同祖先推导出的完整源码根。
+  - `KeilBridge Generated`：CMake、linker、startup、OpenOCD、报告等生成层。
+- 用户在 `Original Source` 里的原始源码下断点。
+- 调试配置、构建任务、C/C++ 设置写入 `.code-workspace` 顶层，避免 VS Code 多根目录解析歧义。
+- launch 中关键路径全部使用绝对路径：
+  - `executable`
+  - `cwd`
+  - `serverpath`
+  - `searchDir`
+  - `configFiles`
+- tasks 中直接使用已发现的 CMake/Ninja/Arm GNU Toolchain 路径，保证换电脑时可通过重新 `configure` 再生成。
+
+### 18.3 当前实现策略
+
+- 从 target 的所有源文件目录和 include 目录计算公共祖先，作为 `Original Source`。
+- 顶层 `.code-workspace` 写入 `launch.configurations` 和 `tasks.tasks`。
+- `C_Cpp.default.compileCommands` 指向 `.keilbridge/build/gcc-debug/compile_commands.json`。
+- 对 GD32F303 + DAPLink，生成工程专属 OpenOCD cfg，实测使用 `cmsis-dap.cfg + stm32f3x.cfg` 可连接、下载、verify。
+- 生成层保留 `.vscode/launch.json` 作为兼容入口，但推荐入口是 `.code-workspace`。
+
+### 18.4 验收标准
+
+- VS Code 左侧能看到完整源码树，而不是只有局部 Keil 工程目录或 generated 目录。
+- 在原始源码文件中设置断点，Cortex-Debug 能加载同一个 ELF 并命中源码路径。
+- `OpenOCD: GDB Server Quit Unexpectedly` 不能由路径解析错误导致；如果 OpenOCD 仍失败，终端输出必须指向真实硬件/驱动/OpenOCD target 问题。
+- 不需要的 generated support 源不会被 C/C++ 插件扫描出 include 错误。
+- 重新 `configure` 后，VS Code 工作区能适配当前电脑上的工具链路径。
+
+## 19. GD32F303 首次实板 Fault 复盘
+
+### 19.1 现象
+
+GD32F303CB 验证工程在初次生成的 GCC 固件中先进入 `MemManage_Handler`，修复启动向量后又进入 `HardFault_Handler`。这类问题必须优先按“工具生成错误”排查，不能把责任直接推给用户源码。
+
+### 19.2 根因
+
+- ARMASM startup 里存在 `__Vectors DCD __initial_sp` 这种“标签和 DCD 同行”的写法，早期解析器没有识别，导致生成的 GCC 向量表首项被误写成 Reset_Handler 地址，而不是初始 MSP。
+- Keil output 目录里残留了 `motor.sct`，其中 RAM 为 48K；当前 target `GD32F303CB` 的 Cpu/device memory 是 32K。早期生成器把候选 scatter 当成事实来源，导致 `_estack = 0x2000c000`，超出真实 RAM 顶部 `0x20008000`，启动或任务切换后触发 Fault。
+
+### 19.3 修复原则
+
+- 向量表第 0 项必须强制生成 `_estack`，不依赖 ARMASM 原符号名。
+- 只有 Keil target 显式配置了 `ScatterFile`，才把该 scatter 作为链接事实来源。
+- 未显式配置 scatter 时，优先使用当前 target 的 Cpu/device memory。
+- 自动发现的 `.sct` 只能作为诊断候选；如果候选内存和当前 target 不一致，报告 `scatter_candidate_memory_mismatch`，不能静默使用。
+
+### 19.4 当前验证结果
+
+- CMake/GCC 构建通过，链接内存为 `FLASH 128K`、`RAM 32K`。
+- ELF `.isr_vector` 首项为 `0x20008000`，Reset 向量为 `Reset_Handler`。
+- OpenOCD 通过 DAPLink/CMSIS-DAP 连接 `GD32F303CB`，下载和 verify 通过。
+- 板子 reset run 运行 2 秒后 halt，PC 位于 `Freertos/Source/tasks.c` 的 `prvIdleTask`，没有立即进入 HardFault。
+- GDB 可连接 OpenOCD，`monitor reset halt` 后硬件断点命中原始源码 `Template/main.c:25`。

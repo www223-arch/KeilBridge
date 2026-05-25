@@ -41,6 +41,21 @@ class DeviceInfo:
 
 
 @dataclass(slots=True)
+class ProjectFeatures:
+    """工程形态识别结果。
+
+    这层只描述“看起来用了什么框架/中间件”，不直接改变源码集合。
+    真正要替换 RTOS port、替换库或生成兼容层时，必须再经过 adapter 和诊断。
+    """
+
+    framework: str = "unknown"
+    generated_by: str = ""
+    rtos: list[str] = field(default_factory=list)
+    middleware: list[str] = field(default_factory=list)
+    evidence: list[str] = field(default_factory=list)
+
+
+@dataclass(slots=True)
 class KeilTargetModel:
     """单个 Keil Target 的归一化模型。
 
@@ -65,6 +80,7 @@ class KeilTargetModel:
     scatter_file: str = ""
     scatter_candidates: list[str] = field(default_factory=list)
     device_info: DeviceInfo = field(default_factory=DeviceInfo)
+    features: ProjectFeatures = field(default_factory=ProjectFeatures)
     c_standard: str = "c11"
     optimization: str = ""
 

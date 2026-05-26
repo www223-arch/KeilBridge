@@ -610,7 +610,39 @@ python -m keiltool.cli configure --project "C:\Path\To\YourProject\MDK-ARM\App.u
 python -m keiltool.cli configure --project "C:\Path\To\YourProject\MDK-ARM\App.uvprojx" --target App --probe cmsis-dap --backend gcc
 ```
 
-`--backend armclang` 已作为明确选择入口保留，但完整 ArmClang CMake/ArmLink 生成仍在开发中。当前它会输出边界说明，不会假装已经完成。
+生成 ArmClang 独立工作区：
+
+```powershell
+python -m keiltool.cli configure --project "C:\Path\To\YourProject\MDK-ARM\App.uvprojx" --target App --probe cmsis-dap --backend armclang
+```
+
+ArmClang 生成目录和 GCC 分离：
+
+```text
+<keil-project-root>\.keilbridge\generated\armclang\
+<keil-project-root>\.keilbridge\build\armclang-debug\
+<keil-project-root>\.keilbridge\KeilBridge_<target>_armclang.code-workspace
+```
+
+ArmClang 构建命令：
+
+```powershell
+python -m keiltool.cli build --project "C:\Path\To\YourProject\MDK-ARM\App.uvprojx" --target App --backend armclang
+```
+
+如果提示缺少 `armclang/armlink/armasm/fromelf`，需要安装 Keil MDK ArmClang/Arm Compiler 6，并设置：
+
+```powershell
+$env:ARMCLANG_ROOT="C:\Keil_v5\ARM\ARMCLANG"
+```
+
+或者构建时显式指定：
+
+```powershell
+python -m keiltool.cli build --project "C:\Path\To\YourProject\MDK-ARM\App.uvprojx" --target App --backend armclang --armclang-root "C:\Keil_v5\ARM\ARMCLANG"
+```
+
+当前 ArmClang 后端已经能生成 CMake/ArmLink 工作区，但仍属于待实机验证阶段；GCC 仍是 24Sentry 已验证可运行的主路线。
 
 build 成功后建议立刻运行 ELF Doctor，确认“能烧录”之外的启动/链接语义也没有明显风险：
 
@@ -631,3 +663,76 @@ python -m keiltool.cli doctor elf --project "C:\Path\To\YourProject\MDK-ARM\App.
 <keil-project-root>\.keilbridge\generated\reports\elf_doctor_report.md
 <keil-project-root>\.keilbridge\generated\reports\elf_doctor_result.json
 ```
+
+## 10. 24Sentry 三模式体验命令
+
+下面这组命令已经在 `24-Sentry-Gimbal` 工程上跑通过，适合你直接体验三条路线的差异。
+
+```powershell
+cd D:\GD32\GDproject\KeilTool
+
+$project = "C:\Users\86199\Desktop\sentry\sentry\24sentry\24-Sentry-Gimbal\MDK-ARM\Template.uvprojx"
+$target = "Template"
+$probe = "cmsis-dap"
+```
+
+### 10.1 GCC 模式
+
+GCC 模式会生成 `.elf/.hex/.bin`，产物放在目标工程自己的 `.keilbridge\build\gcc-debug`。
+
+```powershell
+python -m keiltool.cli configure --project $project --target $target --probe $probe --backend gcc
+python -m keiltool.cli build --project $project --target $target --backend gcc
+```
+
+打开工作区：
+
+```text
+C:\Users\86199\Desktop\sentry\sentry\24sentry\24-Sentry-Gimbal\.keilbridge\KeilBridge_Template.code-workspace
+```
+
+### 10.2 ArmClang 模式
+
+ArmClang 模式尽量贴近 Keil AC6/ArmLink 语义，产物放在 `.keilbridge\build\armclang-debug`，不会覆盖 GCC 产物。
+
+```powershell
+python -m keiltool.cli configure --project $project --target $target --probe $probe --backend armclang
+python -m keiltool.cli build --project $project --target $target --backend armclang
+```
+
+打开工作区：
+
+```text
+C:\Users\86199\Desktop\sentry\sentry\24sentry\24-Sentry-Gimbal\.keilbridge\KeilBridge_Template_armclang.code-workspace
+```
+
+### 10.3 Debug-only 模式
+
+Debug-only 模式不编译、不下载固件，只拿 Keil 已经生成的 AXF/ELF 做符号调试。默认会自动找：
+
+```text
+C:\Users\86199\Desktop\sentry\sentry\24sentry\24-Sentry-Gimbal\MDK-ARM\Template\Template.axf
+```
+
+生成工作区：
+
+```powershell
+python -m keiltool.cli configure --project $project --target $target --probe $probe --backend debug-only
+```
+
+如果 Keil 产物不在默认位置，可以手动指定：
+
+```powershell
+python -m keiltool.cli configure --project $project --target $target --probe $probe --backend debug-only --elf "C:\Path\To\Your.axf"
+```
+
+打开工作区：
+
+```text
+C:\Users\86199\Desktop\sentry\sentry\24sentry\24-Sentry-Gimbal\.keilbridge\KeilBridge_Template_debug.code-workspace
+```
+
+Debug-only 工作区里有两个调试入口：
+
+- `KeilBridge Debug-only Attach (cmsis-dap)`：连接当前运行现场，不构建、不下载、不主动复位。
+- `KeilBridge Debug-only Reset/Halt (cmsis-dap)`：不下载固件，但会复位/暂停，适合从入口附近排查。

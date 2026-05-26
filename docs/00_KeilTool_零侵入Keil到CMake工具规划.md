@@ -1050,7 +1050,7 @@ python -m keiltool.cli doctor backend --project "<project.uvprojx>" --target "<t
 当前后端边界：
 
 - `gcc`：已经是当前可用主路线，负责 CMake、GNU ld、GCC startup、OpenOCD/VS Code 工作区。
-- `armclang`：作为兼容迁移路线优先实现入口和诊断，完整 ArmLink/CMake 生成后续推进。
+- `armclang`：作为兼容迁移路线，当前已能生成独立 ArmClang/CMake/ArmLink 工作区，下一步需要在安装 ArmClang 的机器上实测 build/fromelf/flash/debug。
 - `debug-only`：构建暂时无法迁移时，用已有 ELF/AXF 做调试和故障采集。
 - `keil-cli`：保留 Keil 原构建语义的兜底路线。
 
@@ -1064,4 +1064,4 @@ python -m keiltool.cli configure --project "<project.uvprojx>" --target "<target
 
 - `--backend auto`：只输出推荐报告，不生成工作区，让用户明确选择。
 - `--backend gcc`：生成当前已验证的 GCC 工作区。
-- `--backend armclang`：当前只保留选择入口和工具链诊断，完整生成器未启用前必须明确提示。
+- `--backend armclang`：生成 `.keilbridge/generated/armclang` 和 `.keilbridge/build/armclang-debug`，与 GCC 产物隔离；缺少 `armclang/armlink/armasm/fromelf` 时 build 前直接诊断。

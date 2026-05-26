@@ -368,7 +368,7 @@ python -m keiltool.cli doctor elf --project "<project.uvprojx>" --target "<targe
 - `doctor backend` 只做项目事实扫描和后端推荐，不生成 CMake，不接触硬件。
 - `configure --backend auto` 只写入后端推荐报告，让用户选择 `gcc` 或 `armclang`，不默认替用户迁移。
 - `configure --backend gcc` 继续走当前已经验证过的 GCC/CMake/OpenOCD 路线。
-- `configure --backend armclang` 现在只接受选择并输出明确边界：ArmClang 完整 CMake/ArmLink 生成仍在后续实现，不伪装成已完成。
+- `configure --backend armclang` 生成独立 ArmClang 工作区；该后端已进入可审查、待实机验证阶段，不与已验证的 GCC 产物互相覆盖。
 - `doctor elf` 在 build 后检查启动和链接语义，重点覆盖 `.init_array`、`.CCM/.ccmram`、RAM orphan section、FreeRTOS handler 等曾经导致“能烧录但运行 HardFault”的问题。
 
 生成报告：
@@ -387,6 +387,49 @@ python -m keiltool.cli doctor elf --project "<project.uvprojx>" --target "<targe
 3. 优先复用或生成 `.sct`，使用 `armlink` 保持接近 Keil 的链接语义。
 4. 保留 Debug Backend 解耦：ArmClang 构建出的 ELF/AXF 仍然可以走 OpenOCD/J-Link GDB Server 调试。
 5. 每个 ArmClang 工程先跑 `doctor backend`、`build`、`doctor elf`，再进入 flash/debug。
+
+## 13. 当前实现进度：ArmClang 后端生成骨架
+
+已实现 ArmClang 独立工作区生成：
+
+```powershell
+python -m keiltool.cli configure --project "<project.uvprojx>" --target "<target>" --probe cmsis-dap --backend armclang
+```
+
+生成目录：
+
+```text
+<keil-project-root>\.keilbridge\generated\armclang\
+<keil-project-root>\.keilbridge\build\armclang-debug\
+<keil-project-root>\.keilbridge\KeilBridge_<target>_armclang.code-workspace
+```
+
+设计要求：
+
+- ArmClang 产物和 GCC 产物分离，避免 `gcc-debug` 与 `armclang-debug` 互相覆盖。
+- ArmClang 路线优先复用 Keil 的 `.sct`、startup、`.lib` 和源文件列表，尽量保持 Keil/ArmLink 语义。
+- 如果 Keil target 没有显式 ScatterFile，则先尝试 scatter candidate；仍不可用时从 Cpu/device memory 生成最小 `.sct`。
+- build 前检查 `armclang/armlink/armasm/fromelf`，缺工具时直接输出 KeilBridge 诊断，不把用户扔给 CMake 原始报错。
+- 当前 ArmClang 生成器属于可审查、待实机验证阶段；下一步要在安装 ArmClang 的机器上跑通 configure/build/fromelf/flash/debug 全链路。
+
+ArmClang 构建命令：
+
+```powershell
+python -m keiltool.cli build --project "<project.uvprojx>" --target "<target>" --backend armclang
+```
+
+换电脑使用时，可以选择以下任一方式暴露工具链：
+
+```powershell
+$env:ARMCLANG_ROOT="C:\Keil_v5\ARM\ARMCLANG"
+python -m keiltool.cli build --project "<project.uvprojx>" --target "<target>" --backend armclang
+```
+
+或：
+
+```powershell
+python -m keiltool.cli build --project "<project.uvprojx>" --target "<target>" --backend armclang --armclang-root "C:\Keil_v5\ARM\ARMCLANG"
+```
 
 ### 6.2 工作区生成
 

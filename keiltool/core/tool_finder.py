@@ -22,6 +22,10 @@ ARM_GCC_ROOTS = [
 ARMCLANG_ROOTS = [
     Path(r"C:\Keil_v5\ARM\ARMCLANG"),
     Path(r"C:\Keil_v5\ARM\ARMCLANG\bin"),
+    Path(r"D:\Keil5\ARM\ARMCLANG"),
+    Path(r"D:\Keil5\ARM\ARMCLANG\bin"),
+    Path(r"D:\Keil_v5\ARM\ARMCLANG"),
+    Path(r"D:\Keil_v5\ARM\ARMCLANG\bin"),
     Path(r"C:\Program Files\Arm\Development Studio 2024.1\bin"),
     Path(r"C:\Program Files\Arm\Development Studio 2023.1\bin"),
 ]
@@ -72,15 +76,42 @@ def find_armclang_tools(explicit_root: str | None = None) -> dict[str, str]:
     """
 
     root = _normalize_tool_root(explicit_root)
-    candidates = [root] if root else []
-    candidates.extend(ARMCLANG_ROOTS)
+    candidates = [root] if root else [*ARMCLANG_ROOTS]
     tools = {
-        "armclang": _find_tool_in_roots("armclang.exe", candidates),
+        "armclang": _find_first_tool_in_roots(["armclang_kb.exe", "armclang.exe"], candidates),
         "armlink": _find_tool_in_roots("armlink.exe", candidates),
         "armasm": _find_tool_in_roots("armasm.exe", candidates),
         "fromelf": _find_tool_in_roots("fromelf.exe", candidates),
     }
     return tools
+
+
+def armclang_environment(explicit_root: str | None = None) -> dict[str, str]:
+    """生成命令行调用 ArmClang 所需的环境变量。
+
+    Keil IDE 会在内部补齐 license/product/toolkit 环境；直接从 CMake 或 PowerShell
+    调 `armclang/armlink/fromelf` 时，这些变量经常缺失。这里按 Keil 安装目录推导，
+    让外部构建尽量复用和 Keil 相同的授权配置。
+    """
+
+    tools = find_armclang_tools(explicit_root)
+    armclang = tools.get("armclang", "")
+    if not armclang:
+        return {}
+    bin_dir = Path(armclang).parent
+    arm_dir = bin_dir.parent.parent
+    keil_root = arm_dir.parent
+    env: dict[str, str] = {
+        "ARMCLANG_ROOT": str(bin_dir.parent),
+        "PATH_PREFIX": os.pathsep.join([str(bin_dir), str(arm_dir / "BIN")]),
+    }
+    product_path = arm_dir / "sw" / "mappings"
+    if product_path.exists():
+        env["ARM_PRODUCT_PATH"] = str(product_path)
+    tool_variant = _read_tool_variant(keil_root / "TOOLS.INI")
+    if tool_variant:
+        env["ARM_TOOL_VARIANT"] = tool_variant
+    return env
 
 
 def find_openocd(explicit: str | None = None) -> str:
@@ -145,4 +176,24 @@ def _find_tool_in_roots(tool: str, roots: list[Path]) -> str:
         candidate = root / tool
         if candidate.exists():
             return str(candidate)
+    return ""
+
+
+def _find_first_tool_in_roots(tools: list[str], roots: list[Path]) -> str:
+    for tool in tools:
+        found = _find_tool_in_roots(tool, roots)
+        if found:
+            return found
+    return ""
+
+
+def _read_tool_variant(tools_ini: Path) -> str:
+    if not tools_ini.exists():
+        return ""
+    try:
+        for line in tools_ini.read_text(encoding="utf-8", errors="ignore").splitlines():
+            if line.strip().upper().startswith("TOOL_VARIANT="):
+                return line.split("=", 1)[1].strip().strip('"')
+    except OSError:
+        return ""
     return ""

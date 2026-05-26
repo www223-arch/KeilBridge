@@ -8,13 +8,15 @@ from dataclasses import asdict
 from pathlib import Path
 from time import strftime
 
+from .core.armclang_workspace import configure_armclang_workspace
 from .core.backend_recommender import recommend_backends, render_backend_recommendation_markdown
 from .core.diagnostics import diagnose_target
 from .core.doctor import classify_openocd_log, render_flash_doctor_markdown, run_flash_doctor
+from .core.debug_only_workspace import configure_debug_only_workspace
 from .core.elf_doctor import render_elf_doctor_markdown, run_elf_doctor
 from .core.keil_parser import parse_uvprojx
 from .core.scatter import generate_gnu_ld, parse_scatter_memory
-from .core.tool_finder import find_arm_gcc_root, find_cmake, find_ninja, find_openocd, find_openocd_scripts
+from .core.tool_finder import armclang_environment, find_arm_gcc_root, find_armclang_tools, find_cmake, find_ninja, find_openocd, find_openocd_scripts
 from .core.workspace import configure_workspace
 
 
@@ -162,12 +164,26 @@ def cmd_configure(args: argparse.Namespace) -> int:
     _print_backend_summary(recommendation)
 
     if args.backend == "auto":
-        print("Auto mode only writes the backend diagnosis. Re-run configure with --backend gcc or --backend armclang after choosing.")
+        print("Auto mode only writes the backend diagnosis. Re-run configure with --backend gcc, armclang, or debug-only after choosing.")
         return 0
     if args.backend == "armclang":
-        print("ArmClang backend selected, but full ArmClang CMake/ArmLink generation is not enabled yet.")
-        print("The backend diagnosis has been written; GCC remains the verified build backend for this project today.")
-        return 2
+        generated_dir = configure_armclang_workspace(workspace_root, target, probe=args.probe, armclang_root=args.armclang_root)
+        print(f"Generated ArmClang workspace: {generated_dir}")
+        print("Next:")
+        print(f"  python -m keiltool.cli build --project \"{model.project_file}\" --target {target.name} --backend armclang")
+        return 0
+    if args.backend == "debug-only":
+        generated_dir = configure_debug_only_workspace(
+            workspace_root,
+            target,
+            probe=args.probe,
+            executable=args.elf,
+            keil_project_dir=model.keil_project_dir,
+        )
+        print(f"Generated Debug-only workspace: {generated_dir}")
+        print("Open:")
+        print(f"  {workspace_root / '.keilbridge' / f'KeilBridge_{_sanitize_name(target.name)}_debug.code-workspace'}")
+        return 0
 
     generated_dir = configure_workspace(workspace_root, target, probe=args.probe)
     print(f"Generated workspace: {generated_dir}")
@@ -183,9 +199,24 @@ def cmd_build(args: argparse.Namespace) -> int:
     cmake = find_cmake(args.cmake)
     ninja = find_ninja(args.ninja)
     env = dict(os.environ)
-    arm_gcc_root = find_arm_gcc_root(args.arm_gcc_root)
+    arm_gcc_root = find_arm_gcc_root(args.arm_gcc_root) if args.backend == "gcc" else ""
     if arm_gcc_root:
         env["ARM_GCC_ROOT"] = arm_gcc_root
+    if args.backend == "armclang":
+        tools = find_armclang_tools(args.armclang_root)
+        missing = [name for name, path in tools.items() if not path]
+        if missing:
+            raise SystemExit(
+                "ArmClang tools not found: "
+                + ", ".join(missing)
+                + ". Install Keil MDK ArmClang/Arm Compiler 6, add ARMCLANG/bin to PATH, "
+                + "or pass --armclang-root / set ARMCLANG_ROOT."
+            )
+        for key, value in armclang_environment(args.armclang_root).items():
+            if key == "PATH_PREFIX":
+                env["PATH"] = value + os.pathsep + env.get("PATH", "")
+            else:
+                env[key] = value
 
     _run([
         cmake,
@@ -404,6 +435,11 @@ def _resolve_build_dirs(args: argparse.Namespace) -> tuple[Path, Path]:
         model = parse_uvprojx(args.project)
         _pick_target(model, args.target)
         workspace_root = Path(args.workspace_root).resolve() if args.workspace_root else Path(model.inferred_project_root)
+        if args.backend == "armclang":
+            return (
+                workspace_root / ".keilbridge" / "generated" / "armclang",
+                workspace_root / ".keilbridge" / "build" / "armclang-debug",
+            )
         return (
             workspace_root / ".keilbridge" / "generated",
             workspace_root / ".keilbridge" / "build" / "gcc-debug",
@@ -440,8 +476,9 @@ def build_parser() -> argparse.ArgumentParser:
     configure_parser.add_argument("--target", help="Keil target name")
     configure_parser.add_argument("--probe", default="stlink", help="Probe profile: stlink, cmsis-dap, daplink")
     configure_parser.add_argument("--workspace-root", help="Override .keilbridge location; defaults to inferred Keil project root")
-    configure_parser.add_argument("--backend", choices=["auto", "gcc", "armclang"], default="auto", help="Build backend. Default auto writes recommendation only.")
+    configure_parser.add_argument("--backend", choices=["auto", "gcc", "armclang", "debug-only"], default="auto", help="Build backend. Default auto writes recommendation only.")
     configure_parser.add_argument("--armclang-root", help="Path to ArmClang/Keil ARMCLANG root or bin directory")
+    configure_parser.add_argument("--elf", help="Existing AXF/ELF for debug-only backend")
     configure_parser.set_defaults(func=cmd_configure)
 
     build_cmd = subparsers.add_parser("build", help="Build generated CMake workspace")
@@ -450,9 +487,11 @@ def build_parser() -> argparse.ArgumentParser:
     build_cmd.add_argument("--workspace-root", help="Override .keilbridge location; defaults to inferred Keil project root")
     build_cmd.add_argument("--generated-dir", default=".keilbridge/generated", help="Generated workspace directory")
     build_cmd.add_argument("--build-dir", default=".keilbridge/build/gcc-debug", help="CMake build directory")
+    build_cmd.add_argument("--backend", choices=["gcc", "armclang"], default="gcc", help="Build backend to use")
     build_cmd.add_argument("--cmake", help="Path to cmake executable")
     build_cmd.add_argument("--ninja", help="Path to ninja executable")
     build_cmd.add_argument("--arm-gcc-root", help="Path to Arm GNU Toolchain root")
+    build_cmd.add_argument("--armclang-root", help="Path to ArmClang/Keil ARMCLANG root or bin directory")
     build_cmd.set_defaults(func=cmd_build)
 
     openocd_cmd = subparsers.add_parser("openocd", help="Print or run OpenOCD debug server command")

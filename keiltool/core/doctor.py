@@ -67,7 +67,7 @@ def run_flash_doctor(
     logs_dir.mkdir(parents=True, exist_ok=True)
 
     project_name = _sanitize_name(target.name)
-    cfg = generated_dir / "openocd" / f"{project_name}_{probe}.cfg"
+    cfg = _resolve_openocd_cfg(generated_dir, project_name, probe)
     openocd = find_openocd(openocd_path)
     scripts = find_openocd_scripts(openocd)
     command = _openocd_doctor_command(openocd, scripts, cfg)
@@ -106,10 +106,7 @@ def run_flash_doctor(
         findings.extend(classify_openocd_log("\n".join(text_parts), openocd, target, probe))
 
     if not any(item.severity in {"fail", "fatal", "pass"} for item in findings):
-        command_hint = (
-            f'python -m keiltool.cli doctor flash --project "{target.project_file}" '
-            f"--target {target.name} --probe {probe} --run"
-        )
+        command_hint = f"python -m keiltool.cli doctor flash --target {target.name} --probe {probe} --run"
         findings.append(
             DoctorFinding(
                 stage="flash",
@@ -345,6 +342,18 @@ def _openocd_doctor_command(openocd: str, scripts: str, cfg: Path) -> list[str]:
         ]
     )
     return command
+
+
+def _resolve_openocd_cfg(generated_dir: Path, project_name: str, probe: str) -> Path:
+    candidates = [
+        generated_dir / "openocd" / f"{project_name}_{probe}.cfg",
+        generated_dir / "debug-only" / "openocd" / f"{project_name}_{probe}.cfg",
+        generated_dir / "armclang" / "openocd" / f"{project_name}_{probe}.cfg",
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return candidates[0]
 
 
 def _latest_doctor_log_pair(logs_dir: Path) -> list[Path]:

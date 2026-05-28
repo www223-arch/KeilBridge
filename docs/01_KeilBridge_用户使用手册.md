@@ -1,595 +1,99 @@
 # KeilBridge 用户使用手册
 
-## 1. KeilBridge 是什么
+KeilBridge 用来把现有 Keil MDK 工程接入外部构建、诊断、烧录和 VS Code 调试流程。它默认不修改原工程，不移动源码，不改 `.uvprojx/.uvoptx/.ioc/.sct`，只在目标工程根目录生成 `.keilbridge/`。
 
-KeilBridge 用来给现有 Keil MDK 工程生成一套外部 CMake/GCC/OpenOCD/VS Code 构建与调试入口。
+## 1. 前置环境
 
-核心边界：
+### 1.1 公共前置
 
-- 不修改用户源码。
-- 不修改 `.uvprojx`、`.uvoptx`、`.ioc`。
-- 不移动用户工程目录。
-- 不要求用户手工维护 CMake 源文件列表。
-- 默认只在目标 Keil 工程根目录新增 `.keilbridge/`。
+所有使用方式都需要：
 
-当前主入口命令是：
+- Windows PowerShell。
+- Python 3.10 或更高版本。
+- VS Code。
+- VS Code 插件 `C/C++`，插件 ID：`ms-vscode.cpptools`。
+- VS Code 插件 `Cortex-Debug`，插件 ID：`marus25.cortex-debug`。
+- OpenOCD，推荐 xPack OpenOCD 或 STM32CubeCLT OpenOCD。
+- Arm GNU Toolchain 中的 `arm-none-eabi-gdb.exe`。
 
-```powershell
-python -m keiltool.cli <command> ...
-```
-
-执行命令前，先进入 KeilBridge 工具目录：
+建议把 KeilBridge 工具目录固定下来，执行命令前先进入：
 
 ```powershell
 cd D:\GD32\GDproject\KeilTool
 ```
 
-## 2. 一条完整使用流程
+### 1.2 GCC/CMake 后端需要
 
-下面是正常用户从 Keil 工程到 CMake 编译、烧录、VS Code 调试的完整流程。
+如果使用 `--backend gcc`，还需要：
+
+- CMake。
+- Ninja。
+- Arm GNU Toolchain 中的 `arm-none-eabi-gcc.exe`、`arm-none-eabi-objcopy.exe`、`arm-none-eabi-size.exe`。
+
+这条路线会由 KeilBridge 生成独立 CMake 工程，并生成 `.elf/.hex/.bin/.map`。
+
+### 1.3 ArmClang 后端需要
+
+如果使用 `--backend armclang`，还需要：
+
+- Keil MDK Arm Compiler 6。
+- `armclang.exe`。
+- `armlink.exe`。
+- `fromelf.exe`。
+
+如果工具不在常规路径，可以设置：
+
+```powershell
+$env:ARMCLANG_ROOT="C:\Keil_v5\ARM\ARMCLANG"
+```
+
+或在 build 时显式传入：
+
+```powershell
+python -m keiltool.cli build --project "C:\Path\To\App.uvprojx" --target App --backend armclang --armclang-root "C:\Keil_v5\ARM\ARMCLANG"
+```
+
+### 1.4 Debug-only 后端需要
+
+如果使用 `--backend debug-only`，还需要：
+
+- Keil MDK 能正常编译原工程。
+- 已有 Keil 生成的 `.axf` 或 `.elf`。
+- 该 `.axf/.elf` 带调试符号。
+
+这条路线不编译、不下载固件，只用 Keil 产物做符号调试。
+
+## 2. 推荐流程：先诊断，再选择
+
+首次接入一个 Keil 工程时，推荐按下面顺序走。
 
 ### 2.1 查看工程信息
 
 ```powershell
-python -m keiltool.cli inspect "C:\Path\To\YourProject\MDK-ARM\App.uvprojx" --target App -v
+python -m keiltool.cli inspect "C:\Path\To\Project\MDK-ARM\App.uvprojx" --target App -v
 ```
 
-作用：
+它会显示：
 
-- 查看 Keil target 是否识别正确。
-- 查看芯片型号、内核、FPU、内存、OpenOCD target。
-- 查看源文件、include、define、startup、scatter。
-- 查看 CubeMX、RTOS、CMSIS-DSP、ARMCC `.lib` 等风险提示。
+- 目标芯片、内核、FPU、内存。
+- Keil target 名称。
+- 源文件、include、define、startup、scatter。
+- 是否检测到 CubeMX、RTOS、CMSIS-DSP、ARMCC `.lib` 等风险点。
 
-如果不确定 target 名，可以先不加 `--target`，或看报错里的 `Available targets`。
+如果不知道 target 名称，可以先不写 `--target`，或看报错中的 `Available targets`。
 
-### 2.2 生成外部工作区
+### 2.2 让系统推荐后端
 
 ```powershell
-python -m keiltool.cli configure --project "C:\Path\To\YourProject\MDK-ARM\App.uvprojx" --target App --probe cmsis-dap
+python -m keiltool.cli doctor backend --project "C:\Path\To\Project\MDK-ARM\App.uvprojx" --target App
 ```
 
-常见探针参数：
-
-- `--probe cmsis-dap`：DAPLink、CMSIS-DAP。
-- `--probe daplink`：DAPLink，当前等价于 CMSIS-DAP。
-- `--probe stlink`：ST-Link。
-
-生成位置：
-
-```text
-<keil-project-root>\.keilbridge\
-  generated\
-  build\
-  logs\
-```
-
-### 2.3 编译
-
-```powershell
-python -m keiltool.cli build --project "C:\Path\To\YourProject\MDK-ARM\App.uvprojx" --target App
-```
-
-成功后产物在：
-
-```text
-<keil-project-root>\.keilbridge\build\gcc-debug\App.elf
-<keil-project-root>\.keilbridge\build\gcc-debug\App.hex
-<keil-project-root>\.keilbridge\build\gcc-debug\App.bin
-<keil-project-root>\.keilbridge\build\gcc-debug\App.map
-```
-
-第二次编译会走 Ninja 增量构建。没有文件变化时通常会显示：
-
-```text
-ninja: no work to do.
-```
-
-### 2.4 先诊断烧录链路
-
-```powershell
-python -m keiltool.cli doctor flash --project "C:\Path\To\YourProject\MDK-ARM\App.uvprojx" --target App --probe cmsis-dap --run
-```
-
-作用：
-
-- 检查 OpenOCD 是否能启动。
-- 检查 DAPLink/ST-Link 是否能连接。
-- 检查复位后 PC/MSP 是否看起来有效。
-- 生成诊断报告。
-
-报告位置：
-
-```text
-<keil-project-root>\.keilbridge\generated\reports\flash_doctor_report.md
-<keil-project-root>\.keilbridge\generated\reports\flash_doctor_result.json
-```
-
-注意：`doctor flash --run` 只诊断，不下载固件。
-
-### 2.5 真正烧录
-
-```powershell
-python -m keiltool.cli flash --project "C:\Path\To\YourProject\MDK-ARM\App.uvprojx" --target App --probe cmsis-dap
-```
-
-成功输出应包含：
-
-```text
-** Programming Finished **
-** Verify Started **
-** Verified OK **
-** Resetting Target **
-```
-
-`flash` 会真实覆盖芯片 Flash。它默认烧录：
-
-```text
-<keil-project-root>\.keilbridge\build\gcc-debug\App.elf
-```
-
-如果要指定 ELF：
-
-```powershell
-python -m keiltool.cli flash --project "C:\Path\To\YourProject\MDK-ARM\App.uvprojx" --target App --probe cmsis-dap --elf "D:\firmware\App.elf"
-```
-
-### 2.6 在 VS Code 里调试
-
-不要打开：
-
-```text
-<keil-project-root>\.keilbridge\generated
-```
-
-应该打开 KeilBridge 生成的多根工作区：
-
-```text
-<keil-project-root>\.keilbridge\KeilBridge_<target>.code-workspace
-```
-
-原因：
-
-- 工作区会同时包含原始源码和 generated 目录。
-- 左侧能看到完整源码树。
-- 断点应下在原始源码里，不是在 generated 副本里。
-- launch/tasks 使用绝对路径，避免 VS Code 多根工作区路径解析错乱。
-
-VS Code 需要插件：
-
-- C/C++。
-- CMake Tools。
-- Cortex-Debug。
-
-调试时选择类似下面的配置：
-
-```text
-KeilBridge OpenOCD (cmsis-dap)
-```
-
-## 3. `--target` 是什么
-
-Keil 一个 `.uvprojx` 里可以有多个 Target，例如：
-
-```text
-Debug
-Release
-Template
-HS_STEP_42C
-Sentry_gimbal
-```
-
-`--target` 用来指定你要转换哪一个 Keil Target：
-
-```powershell
-python -m keiltool.cli inspect "xxx.uvprojx" --target Template -v
-```
-
-如果 target 写错，工具会提示：
-
-```text
-Target not found: xxx. Available targets: Template
-```
-
-这时把 `--target` 改成 `Available targets` 里列出的名字即可。
-
-## 4. 真实示例
-
-### 4.1 STM32G431 42Step 工程
-
-```powershell
-cd D:\GD32\GDproject\KeilTool
-
-python -m keiltool.cli inspect "C:\Users\86199\Desktop\42Step\MCU_userapp_motor\MDK-ARM\HS_STEP_42C.uvprojx" --target HS_STEP_42C -v
-
-python -m keiltool.cli configure --project "C:\Users\86199\Desktop\42Step\MCU_userapp_motor\MDK-ARM\HS_STEP_42C.uvprojx" --target HS_STEP_42C --probe stlink
-
-python -m keiltool.cli build --project "C:\Users\86199\Desktop\42Step\MCU_userapp_motor\MDK-ARM\HS_STEP_42C.uvprojx" --target HS_STEP_42C
-
-python -m keiltool.cli doctor flash --project "C:\Users\86199\Desktop\42Step\MCU_userapp_motor\MDK-ARM\HS_STEP_42C.uvprojx" --target HS_STEP_42C --probe stlink --run
-
-python -m keiltool.cli flash --project "C:\Users\86199\Desktop\42Step\MCU_userapp_motor\MDK-ARM\HS_STEP_42C.uvprojx" --target HS_STEP_42C --probe stlink
-```
-
-### 4.2 STM32F405 Sentry 24 工程
-
-```powershell
-cd D:\GD32\GDproject\KeilTool
-
-python -m keiltool.cli inspect "C:\Users\86199\Desktop\sentry\sentry\24sentry\24-Sentry-Gimbal\MDK-ARM\Template.uvprojx" --target Template -v
-
-python -m keiltool.cli configure --project "C:\Users\86199\Desktop\sentry\sentry\24sentry\24-Sentry-Gimbal\MDK-ARM\Template.uvprojx" --target Template --probe cmsis-dap
-
-python -m keiltool.cli build --project "C:\Users\86199\Desktop\sentry\sentry\24sentry\24-Sentry-Gimbal\MDK-ARM\Template.uvprojx" --target Template
-
-python -m keiltool.cli doctor flash --project "C:\Users\86199\Desktop\sentry\sentry\24sentry\24-Sentry-Gimbal\MDK-ARM\Template.uvprojx" --target Template --probe cmsis-dap --run
-
-python -m keiltool.cli flash --project "C:\Users\86199\Desktop\sentry\sentry\24sentry\24-Sentry-Gimbal\MDK-ARM\Template.uvprojx" --target Template --probe cmsis-dap
-```
-
-打开 VS Code 工作区：
-
-```text
-C:\Users\86199\Desktop\sentry\sentry\24sentry\24-Sentry-Gimbal\.keilbridge\KeilBridge_Template.code-workspace
-```
-
-### 4.3 STM32F405 Sentry 25 工程
-
-```powershell
-cd D:\GD32\GDproject\KeilTool
-
-python -m keiltool.cli inspect "C:\Users\86199\Desktop\sentry\sentry\25_Sentry\25Sentry\25Sentry_gimbal\MDK-ARM\Sentry_gimbal.uvprojx" --target Sentry_gimbal -v
-
-python -m keiltool.cli configure --project "C:\Users\86199\Desktop\sentry\sentry\25_Sentry\25Sentry\25Sentry_gimbal\MDK-ARM\Sentry_gimbal.uvprojx" --target Sentry_gimbal --probe cmsis-dap
-
-python -m keiltool.cli build --project "C:\Users\86199\Desktop\sentry\sentry\25_Sentry\25Sentry\25Sentry_gimbal\MDK-ARM\Sentry_gimbal.uvprojx" --target Sentry_gimbal
-
-python -m keiltool.cli doctor flash --project "C:\Users\86199\Desktop\sentry\sentry\25_Sentry\25Sentry\25Sentry_gimbal\MDK-ARM\Sentry_gimbal.uvprojx" --target Sentry_gimbal --probe cmsis-dap --run
-
-python -m keiltool.cli flash --project "C:\Users\86199\Desktop\sentry\sentry\25_Sentry\25Sentry\25Sentry_gimbal\MDK-ARM\Sentry_gimbal.uvprojx" --target Sentry_gimbal --probe cmsis-dap
-```
-
-打开 VS Code 工作区：
-
-```text
-C:\Users\86199\Desktop\sentry\sentry\25_Sentry\25Sentry\25Sentry_gimbal\.keilbridge\KeilBridge_Sentry_gimbal.code-workspace
-```
-
-## 5. 多个工程会不会互相覆盖
-
-不会。
-
-KeilBridge 的生成目录放在各自 Keil 工程根目录：
-
-```text
-D:\Projects\A\.keilbridge\
-D:\Projects\B\.keilbridge\
-```
-
-即使两个工程 target 都叫 `App`，产物也分别在各自工程下：
-
-```text
-D:\Projects\A\.keilbridge\build\gcc-debug\App.elf
-D:\Projects\B\.keilbridge\build\gcc-debug\App.elf
-```
-
-KeilBridge 工具目录本身不保存这些工程产物。
-
-## 6. 换电脑怎么用
-
-建议迁移：
-
-```text
-KeilBridge 工具目录
-目标 Keil 工程目录
-```
-
-不建议迁移：
-
-```text
-<keil-project-root>\.keilbridge\generated
-<keil-project-root>\.keilbridge\build
-__pycache__
-```
-
-原因：
-
-- `generated` 里包含当前电脑的绝对路径。
-- `build` 里包含 CMake/Ninja 缓存。
-- 换电脑后用户名、工具链路径、OpenOCD 路径可能不同。
-
-新电脑推荐步骤：
-
-1. 安装 Python 3.10+。
-2. 安装 Arm GNU Toolchain `arm-none-eabi`。
-3. 安装 CMake 和 Ninja，或使用 Visual Studio 2022 自带的 CMake/Ninja。
-4. 安装 OpenOCD，推荐 xPack OpenOCD、STM32CubeCLT OpenOCD 或系统独立 OpenOCD。
-5. 进入 KeilBridge 工具目录。
-6. 重新执行 `configure`。
-7. 重新执行 `build`。
-8. 重新打开 `.keilbridge\KeilBridge_<target>.code-workspace`。
-
-如果工具链不在常见路径，可以显式指定：
-
-```powershell
-python -m keiltool.cli build `
-  --project "C:\Path\To\YourProject\MDK-ARM\App.uvprojx" `
-  --target App `
-  --cmake "C:\Program Files\CMake\bin\cmake.exe" `
-  --ninja "C:\ninja\ninja.exe" `
-  --arm-gcc-root "C:\Toolchains\Arm GNU Toolchain arm-none-eabi\14.2 rel1"
-```
-
-如果 OpenOCD 不在常见路径，可以显式指定：
-
-```powershell
-python -m keiltool.cli doctor flash `
-  --project "C:\Path\To\YourProject\MDK-ARM\App.uvprojx" `
-  --target App `
-  --probe cmsis-dap `
-  --openocd "C:\OpenOCD\bin\openocd.exe" `
-  --run
-```
-
-烧录时同样可以指定：
-
-```powershell
-python -m keiltool.cli flash `
-  --project "C:\Path\To\YourProject\MDK-ARM\App.uvprojx" `
-  --target App `
-  --probe cmsis-dap `
-  --openocd "C:\OpenOCD\bin\openocd.exe"
-```
-
-## 7. 什么时候需要重新 configure
-
-只改 `.c/.h`：
-
-```powershell
-python -m keiltool.cli build --project "xxx.uvprojx" --target App
-```
-
-需要重新 `configure` 的情况：
-
-- Keil 里新增或删除源文件。
-- Keil include path 变化。
-- Keil define 变化。
-- 切换 Keil Target。
-- 切换探针，例如 `stlink` 改成 `cmsis-dap`。
-- 换电脑。
-- 删除了 `.keilbridge/generated`。
-
-推荐流程：
-
-```powershell
-python -m keiltool.cli configure --project "xxx.uvprojx" --target App --probe cmsis-dap
-python -m keiltool.cli build --project "xxx.uvprojx" --target App
-```
-
-## 8. 常见问题
-
-### 8.1 `doctor flash --run` 和 `flash` 有什么区别
-
-`doctor flash --run`：
-
-- 只诊断连接、OpenOCD、探针、复位向量。
-- 不下载固件。
-- 会生成报告。
-
-`flash`：
-
-- 真正执行 OpenOCD `program <elf> verify reset exit`。
-- 会覆盖芯片 Flash。
-- 成功标准是 `Programming Finished` 和 `Verified OK`。
-
-### 8.2 VS Code 里看不到完整源码怎么办
-
-不要打开：
-
-```text
-<keil-project-root>\.keilbridge\generated
-```
-
-打开：
-
-```text
-<keil-project-root>\.keilbridge\KeilBridge_<target>.code-workspace
-```
-
-然后在 `Original Source` 里的原始源码文件上下断点。
-
-### 8.3 OpenOCD 显示 GDB Server Quit Unexpectedly 怎么办
-
-先执行：
-
-```powershell
-python -m keiltool.cli doctor flash --project "xxx.uvprojx" --target App --probe cmsis-dap --run
-```
-
-再查看报告：
-
-```text
-<keil-project-root>\.keilbridge\generated\reports\flash_doctor_report.md
-```
-
-常见原因：
-
-- OpenOCD 版本不适合当前芯片，例如用 ESP-IDF OpenOCD 调 STM32/GD32。
-- DAPLink/CMSIS-DAP 被串口工具、旧 OpenOCD、旧 GDB 占用。
-- 目标芯片 OpenOCD cfg 不匹配。
-- 板子没有供电或 SWD 接线异常。
-- 复位线配置不匹配。
-
-### 8.4 `preLaunchTask "CMake: build" 已终止` 怎么办
-
-如果 VS Code 调试前弹窗：
-
-```text
-preLaunchTask "CMake: build" 已终止，退出代码为 1
-cmake: 无法将 "cmake" 项识别为 cmdlet、函数、脚本文件或可运行程序的名称
-```
-
-原因通常是旧版 `.keilbridge/generated/.vscode/tasks.json` 依赖 PATH 里的 `cmake`，但 VS Code task 环境找不到 `cmake.exe`。
-
-解决方法：
-
-1. 回到 KeilBridge 工具目录。
-2. 重新执行 `configure`。
-3. 重新打开 `.keilbridge\KeilBridge_<target>.code-workspace`。
-
-示例：
-
-```powershell
-cd D:\GD32\GDproject\KeilTool
-python -m keiltool.cli configure --project "C:\Path\To\YourProject\MDK-ARM\App.uvprojx" --target App --probe cmsis-dap
-```
-
-新版生成结果里，调试配置应使用：
-
-```text
-preLaunchTask: KeilBridge: build
-```
-
-构建任务应使用当前电脑上已发现的绝对 `cmake.exe` 路径，而不是 `cmake --preset ...`。
-
-### 8.5 `CMSIS-DAP command mismatch` 怎么办
-
-如果烧录时出现：
-
-```text
-Error: CMSIS-DAP command mismatch. Sent 0x11 received 0x5
-Error: CMSIS-DAP command CMD_DAP_SWJ_CLOCK failed.
-Error: Failed to write memory at 0x20001a58
-Error: error writing to flash at address 0x08000000 at offset 0x00000000
-** Programming Failed **
-```
-
-含义：
-
-- OpenOCD 已经识别到芯片。
-- 烧录已经进入 `program` 阶段。
-- 失败发生在 CMSIS-DAP/DAPLink 与 OpenOCD 的通信层。
-- 这通常不是 CMake、链接脚本或 ELF 本身的问题。
-
-建议按顺序处理：
-
-1. 结束所有 `openocd.exe`、`arm-none-eabi-gdb.exe`、VS Code gdb-server 终端。
-2. 关闭串口监视器、DAPLink 文件拖拽窗口和其他可能占用调试器的软件。
-3. 重新插拔 DAPLink。
-4. 重新执行 `doctor flash --run`。
-5. 再执行 `flash`。
-6. 如果仍然复现，优先换用 xPack OpenOCD、STM32CubeCLT OpenOCD 或系统独立 OpenOCD，不建议长期用 ESP-IDF 打包的 `openocd-esp32` 调 STM32/GD32。
-7. 如果通信层稳定后仍写入失败，再检查读保护、供电、SWD 接线、复位线和 OpenOCD target cfg。
-
-### 8.6 ARMCC `.lib` 为什么会提示风险
-
-Keil 工程里常见：
-
-```text
-arm_cortexM4lf_math.lib
-```
-
-这类 `.lib` 通常是 ARMCC/Keil 格式，GCC 不能保证直接链接。KeilBridge 当前策略：
-
-- `inspect` 会诊断为 `armcc_library`。
-- GCC 构建不会盲目链接 ARMCC `.lib`。
-- 对少数 CMSIS-DSP 符号有兼容兜底。
-- 如果工程用到更多 DSP API，可能仍然链接失败。
-- 完整方案需要 GCC 可用的 CMSIS-DSP 源码或 `.a`。
-
-### 8.7 用户源码报错会不会被自动修
-
-不会。
-
-如果用户源码本身有语法错误，`build` 应该失败并显示编译器报错。KeilBridge 不会默认修改原始源码。少数机械兼容处理只会生成 overlay 副本，原工程不动。
-
-### 8.8 一进调试就卡在 HardFault 怎么办
-
-先不要只看 `HardFault_Handler` 本身。HardFault 是结果，不是原因。KeilBridge 需要采集：
-
-```text
-PC / LR / MSP / PSP / xPSR
-CFSR / HFSR / MMFAR / BFAR
-异常栈帧里的原始 PC/LR
-```
-
-24-Sentry 曾经出现过一次典型问题：全局 C++ 对象 `attitudeAlgorithm` 有虚函数，但 GCC 链接脚本没有保留 `.init_array`，导致 C++ 全局构造函数没有执行，对象虚表指针为 0，FreeRTOS 任务运行后虚函数调用跳到非法地址并 HardFault。
-
-这个问题已经在 KeilBridge 里修复：
-
-- startup 调用 `__libc_init_array()`。
-- linker script 保留 `.preinit_array/.init_array/.fini_array/.ctors/.dtors`。
-- 重新 `configure/build/flash` 后生效。
-
-如果你遇到类似问题，先重新生成并烧录：
-
-```powershell
-python -m keiltool.cli configure --project "xxx.uvprojx" --target App --probe cmsis-dap
-python -m keiltool.cli build --project "xxx.uvprojx" --target App
-python -m keiltool.cli flash --project "xxx.uvprojx" --target App --probe cmsis-dap
-```
-
-如果仍然 HardFault，再采集 Fault 现场，而不是直接改用户源码。
-
-### 8.9 CubeMX 工程支持吗
-
-当前策略是识别并复用：
-
-- 识别 `.ioc`、STM32 HAL、Core、Drivers、Middlewares。
-- 复用 Keil target 中已有源文件、include、define。
-- 不调用 CubeMX。
-- 不修改 `.ioc`。
-- 不改 `USER CODE`。
-
-### 8.10 RTOS 工程支持吗
-
-当前策略是识别、诊断、对已验证组合做映射：
-
-- 已能识别 FreeRTOS、RT-Thread、ThreadX、uCOS 等常见形态。
-- FreeRTOS ARMCC/RVDS port 到 GCC port 的映射只对已验证组合启用。
-- 不承诺自动解决所有 heap、BSP、中间件组合问题。
-
-### 8.11 GD32 支持吗
-
-已经有初步支持：
-
-- 能识别 `GD32...` 芯片名。
-- 已加入少量 GD32F1/F3/F4/E2/L2 seed 条目。
-- GD32F303CB 已用 DAPLink/CMSIS-DAP + OpenOCD 完成编译、下载、verify、GDB 命中 `main` 的实板验证。
-- 其他 GD32 型号需要继续用真实板卡验证后沉淀到设备数据库。
-
-## 9. 快速命令模板
-
-把下面的路径和 target 改成自己的即可：
-
-```powershell
-$project = "C:\Path\To\YourProject\MDK-ARM\App.uvprojx"
-$target = "App"
-$probe = "cmsis-dap"
-
-cd D:\GD32\GDproject\KeilTool
-
-python -m keiltool.cli inspect $project --target $target -v
-python -m keiltool.cli configure --project $project --target $target --probe $probe
-python -m keiltool.cli build --project $project --target $target
-python -m keiltool.cli doctor flash --project $project --target $target --probe $probe --run
-python -m keiltool.cli flash --project $project --target $target --probe $probe
-```
-
-## 新增：后端诊断与选择流程
-
-首次给一个 Keil 工程创建 `.keilbridge` 前，建议先运行 Backend Doctor：
-
-```powershell
-python -m keiltool.cli doctor backend --project "C:\Path\To\YourProject\MDK-ARM\App.uvprojx" --target App
-```
-
-它会同时评估：
-
-- `gcc`：开放构建、CI、跨平台和 CMake 主路线。
-- `armclang`：更接近 Keil/AC6 语义的兼容迁移路线。
-- `debug-only`：只调试已有 ELF/AXF，不负责重建固件的保底路线。
-- `keil-cli`：保留 Keil 构建语义的兜底路线。
+它会评估：
+
+- `gcc`：开放工具链、CMake/Ninja、CI 友好。
+- `armclang`：更贴近 Keil/ArmLink 语义。
+- `debug-only`：复用已有 Keil AXF/ELF，只做调试。
+- `keil-cli`：保留 Keil 构建语义的兜底方向。
 
 报告位置：
 
@@ -598,25 +102,42 @@ python -m keiltool.cli doctor backend --project "C:\Path\To\YourProject\MDK-ARM\
 <keil-project-root>\.keilbridge\generated\reports\backend_recommendation.json
 ```
 
-只生成诊断报告、不生成 CMake 工作区：
+### 2.3 只生成诊断报告，不生成工作区
 
 ```powershell
-python -m keiltool.cli configure --project "C:\Path\To\YourProject\MDK-ARM\App.uvprojx" --target App --probe cmsis-dap --backend auto
+python -m keiltool.cli configure --project "C:\Path\To\Project\MDK-ARM\App.uvprojx" --target App --probe stlink --backend auto
 ```
 
-确认使用当前已验证的 GCC 路线：
+`auto` 不替用户强行选择后端，只写推荐报告。确认路线后，再显式指定后端。
+
+## 3. 指定编译或调试方式
+
+### 3.1 指定 GCC/CMake
 
 ```powershell
-python -m keiltool.cli configure --project "C:\Path\To\YourProject\MDK-ARM\App.uvprojx" --target App --probe cmsis-dap --backend gcc
+python -m keiltool.cli configure --project "C:\Path\To\Project\MDK-ARM\App.uvprojx" --target App --probe stlink --backend gcc
+
+python -m keiltool.cli build --project "C:\Path\To\Project\MDK-ARM\App.uvprojx" --target App --backend gcc
 ```
 
-生成 ArmClang 独立工作区：
+产物位置：
+
+```text
+<keil-project-root>\.keilbridge\build\gcc-debug\App.elf
+<keil-project-root>\.keilbridge\build\gcc-debug\App.hex
+<keil-project-root>\.keilbridge\build\gcc-debug\App.bin
+<keil-project-root>\.keilbridge\build\gcc-debug\App.map
+```
+
+### 3.2 指定 ArmClang
 
 ```powershell
-python -m keiltool.cli configure --project "C:\Path\To\YourProject\MDK-ARM\App.uvprojx" --target App --probe cmsis-dap --backend armclang
+python -m keiltool.cli configure --project "C:\Path\To\Project\MDK-ARM\App.uvprojx" --target App --probe stlink --backend armclang
+
+python -m keiltool.cli build --project "C:\Path\To\Project\MDK-ARM\App.uvprojx" --target App --backend armclang
 ```
 
-ArmClang 生成目录和 GCC 分离：
+产物和工作区与 GCC 分开：
 
 ```text
 <keil-project-root>\.keilbridge\generated\armclang\
@@ -624,38 +145,67 @@ ArmClang 生成目录和 GCC 分离：
 <keil-project-root>\.keilbridge\KeilBridge_<target>_armclang.code-workspace
 ```
 
-ArmClang 构建命令：
+### 3.3 指定 Debug-only
 
 ```powershell
-python -m keiltool.cli build --project "C:\Path\To\YourProject\MDK-ARM\App.uvprojx" --target App --backend armclang
+python -m keiltool.cli configure `
+  --project "C:\Path\To\Project\MDK-ARM\App.uvprojx" `
+  --target App `
+  --probe stlink `
+  --backend debug-only `
+  --elf "C:\Path\To\Project\MDK-ARM\App\App.axf"
 ```
 
-如果提示缺少 `armclang/armlink/armasm/fromelf`，需要安装 Keil MDK ArmClang/Arm Compiler 6，并设置：
+工作区位置：
 
-```powershell
-$env:ARMCLANG_ROOT="C:\Keil_v5\ARM\ARMCLANG"
+```text
+<keil-project-root>\.keilbridge\KeilBridge_<target>_debug.code-workspace
 ```
 
-或者构建时显式指定：
+Debug-only 工作区通常有两个入口：
+
+- `KeilBridge Debug-only Attach (...)`：连接当前运行现场，不主动复位，不下载。
+- `KeilBridge Debug-only Reset/Halt (...)`：不下载固件，但会复位并暂停。
+
+## 4. 烧录和调试前诊断
+
+### 4.1 Flash Doctor
 
 ```powershell
-python -m keiltool.cli build --project "C:\Path\To\YourProject\MDK-ARM\App.uvprojx" --target App --backend armclang --armclang-root "C:\Keil_v5\ARM\ARMCLANG"
-```
-
-当前 ArmClang 后端已经能生成 CMake/ArmLink 工作区，但仍属于待实机验证阶段；GCC 仍是 24Sentry 已验证可运行的主路线。
-
-build 成功后建议立刻运行 ELF Doctor，确认“能烧录”之外的启动/链接语义也没有明显风险：
-
-```powershell
-python -m keiltool.cli doctor elf --project "C:\Path\To\YourProject\MDK-ARM\App.uvprojx" --target App
+python -m keiltool.cli doctor flash --project "C:\Path\To\Project\MDK-ARM\App.uvprojx" --target App --probe stlink --run
 ```
 
 它会检查：
 
-- C++ 全局构造相关的 `.init_array` / `__libc_init_array`。
-- `.data/.bss/.ccmram` 是否覆盖应初始化的 RAM 数据。
-- 是否存在可能没有被 startup 复制或清零的 RAM orphan section。
-- FreeRTOS 的 `SVC/PendSV/SysTick` 入口是否存在。
+- OpenOCD 是否能启动。
+- 探针是否能连接目标芯片。
+- reset/halt 后 PC/MSP 是否像有效启动向量。
+- 常见 OpenOCD、CMSIS-DAP、ST-Link 通信错误。
+
+它不会下载固件。
+
+报告位置：
+
+```text
+<keil-project-root>\.keilbridge\generated\reports\flash_doctor_report.md
+<keil-project-root>\.keilbridge\generated\reports\flash_doctor_result.json
+<keil-project-root>\.keilbridge\logs\
+```
+
+### 4.2 ELF Doctor
+
+构建成功后建议运行：
+
+```powershell
+python -m keiltool.cli doctor elf --project "C:\Path\To\Project\MDK-ARM\App.uvprojx" --target App
+```
+
+它会检查：
+
+- 启动段和向量表。
+- `.data/.bss` 等 RAM 段风险。
+- C++ 全局构造相关 `.init_array` 风险。
+- FreeRTOS 常见入口符号风险。
 
 报告位置：
 
@@ -664,75 +214,133 @@ python -m keiltool.cli doctor elf --project "C:\Path\To\YourProject\MDK-ARM\App.
 <keil-project-root>\.keilbridge\generated\reports\elf_doctor_result.json
 ```
 
-## 10. 24Sentry 三模式体验命令
+### 4.3 真正烧录
 
-下面这组命令已经在 `24-Sentry-Gimbal` 工程上跑通过，适合你直接体验三条路线的差异。
+```powershell
+python -m keiltool.cli flash --project "C:\Path\To\Project\MDK-ARM\App.uvprojx" --target App --probe stlink
+```
+
+成功时通常会看到：
+
+```text
+Programming Finished
+Verified OK
+Resetting Target
+```
+
+`flash` 会真实改写目标芯片 Flash。Debug-only 模式下，VS Code 调试配置默认 `loadFiles: []`，不会由调试动作下载固件。
+
+## 5. VS Code 使用方式
+
+不要只打开 `.keilbridge/generated`。应该打开 KeilBridge 生成的 `.code-workspace`：
+
+```text
+<keil-project-root>\.keilbridge\KeilBridge_<target>.code-workspace
+<keil-project-root>\.keilbridge\KeilBridge_<target>_armclang.code-workspace
+<keil-project-root>\.keilbridge\KeilBridge_<target>_debug.code-workspace
+```
+
+原因：
+
+- 工作区同时包含原始源码和生成文件。
+- 断点应该下在原始源码里。
+- launch/tasks 使用当前电脑探测到的工具路径。
+- Debug-only 可包含 `sourceFileMap`，处理 Keil AXF 里的旧源码路径。
+
+## 6. 三种方式的简要原理
+
+### 6.1 GCC/CMake
+
+KeilBridge 解析 `.uvprojx`，抽取源文件、include、define、芯片内存和启动信息，生成外部 CMake 工程。构建由 CMake/Ninja/Arm GCC 完成，调试由 OpenOCD/GDB/Cortex-Debug 完成。
+
+适合长期开放化、脚本化、CI 化。
+
+### 6.2 ArmClang
+
+KeilBridge 生成使用 ArmClang/ArmLink 的外部工作区，尽量保留 Keil/Arm 工具链语义。它更适合历史 Keil 工程、scatter/ArmLink 语义较重的工程。
+
+当前定位是兼容迁移路线，仍需要逐项目实机验证。
+
+### 6.3 Debug-only
+
+KeilBridge 不构建用户固件，只使用已有 Keil `.axf/.elf` 作为符号文件，生成 VS Code/OpenOCD/GDB 调试入口。固件由 Keil 或用户原有方式编译和烧录。
+
+适合短期过渡、现场调试、AI 调试信息采集和无法马上迁移的工程。
+
+## 7. 已验证示例：MCU_userapp_motor
+
+目标工程：
+
+```text
+D:\GD32\GDproject\MCU_userapp_motor
+```
+
+Keil 工程：
+
+```text
+D:\GD32\GDproject\MCU_userapp_motor\MDK-ARM\HS_STEP_42C.uvprojx
+```
+
+Keil 产物：
+
+```text
+D:\GD32\GDproject\MCU_userapp_motor\MDK-ARM\HS_STEP_42C\HS_STEP_42C.axf
+```
+
+实测命令：
 
 ```powershell
 cd D:\GD32\GDproject\KeilTool
 
-$project = "C:\Users\86199\Desktop\sentry\sentry\24sentry\24-Sentry-Gimbal\MDK-ARM\Template.uvprojx"
-$target = "Template"
-$probe = "cmsis-dap"
+python -m keiltool.cli inspect "D:\GD32\GDproject\MCU_userapp_motor\MDK-ARM\HS_STEP_42C.uvprojx" --target HS_STEP_42C -v
+
+python -m keiltool.cli configure `
+  --project "D:\GD32\GDproject\MCU_userapp_motor\MDK-ARM\HS_STEP_42C.uvprojx" `
+  --target HS_STEP_42C `
+  --backend debug-only `
+  --probe stlink `
+  --elf "D:\GD32\GDproject\MCU_userapp_motor\MDK-ARM\HS_STEP_42C\HS_STEP_42C.axf"
+
+python -m keiltool.cli doctor flash `
+  --project "D:\GD32\GDproject\MCU_userapp_motor\MDK-ARM\HS_STEP_42C.uvprojx" `
+  --target HS_STEP_42C `
+  --probe stlink `
+  --run
 ```
 
-### 10.1 GCC 模式
-
-GCC 模式会生成 `.elf/.hex/.bin`，产物放在目标工程自己的 `.keilbridge\build\gcc-debug`。
-
-```powershell
-python -m keiltool.cli configure --project $project --target $target --probe $probe --backend gcc
-python -m keiltool.cli build --project $project --target $target --backend gcc
-```
-
-打开工作区：
+已验证结果：
 
 ```text
-C:\Users\86199\Desktop\sentry\sentry\24sentry\24-Sentry-Gimbal\.keilbridge\KeilBridge_Template.code-workspace
+OpenOCD 可连接 STM32G431CBUx
+reset/halt 后 PC/MSP 有效
+arm-none-eabi-gdb 可读取 Keil AXF 符号
+GDB 可对 main 设置硬件断点
+VS Code 可正常打断点
 ```
 
-### 10.2 ArmClang 模式
-
-ArmClang 模式尽量贴近 Keil AC6/ArmLink 语义，产物放在 `.keilbridge\build\armclang-debug`，不会覆盖 GCC 产物。
-
-```powershell
-python -m keiltool.cli configure --project $project --target $target --probe $probe --backend armclang
-python -m keiltool.cli build --project $project --target $target --backend armclang
-```
-
-打开工作区：
+打开：
 
 ```text
-C:\Users\86199\Desktop\sentry\sentry\24sentry\24-Sentry-Gimbal\.keilbridge\KeilBridge_Template_armclang.code-workspace
+D:\GD32\GDproject\MCU_userapp_motor\.keilbridge\KeilBridge_HS_STEP_42C_debug.code-workspace
 ```
 
-### 10.3 Debug-only 模式
+## 8. 路径和生成目录
 
-Debug-only 模式不编译、不下载固件，只拿 Keil 已经生成的 AXF/ELF 做符号调试。默认会自动找：
+每个目标工程独立生成：
 
 ```text
-C:\Users\86199\Desktop\sentry\sentry\24sentry\24-Sentry-Gimbal\MDK-ARM\Template\Template.axf
+<keil-project-root>\.keilbridge\generated\
+<keil-project-root>\.keilbridge\build\
+<keil-project-root>\.keilbridge\logs\
+<keil-project-root>\.keilbridge\KeilBridge_<target>*.code-workspace
 ```
 
-生成工作区：
+换电脑、换工程目录、换工具链路径后，建议重新运行 `configure`。
 
-```powershell
-python -m keiltool.cli configure --project $project --target $target --probe $probe --backend debug-only
-```
+## 9. 常见问题
 
-如果 Keil 产物不在默认位置，可以手动指定：
-
-```powershell
-python -m keiltool.cli configure --project $project --target $target --probe $probe --backend debug-only --elf "C:\Path\To\Your.axf"
-```
-
-打开工作区：
+常见问题已经移到单独文档：
 
 ```text
-C:\Users\86199\Desktop\sentry\sentry\24sentry\24-Sentry-Gimbal\.keilbridge\KeilBridge_Template_debug.code-workspace
+docs\03_KeilBridge_FAQ.md
 ```
-
-Debug-only 工作区里有两个调试入口：
-
-- `KeilBridge Debug-only Attach (cmsis-dap)`：连接当前运行现场，不构建、不下载、不主动复位。
-- `KeilBridge Debug-only Reset/Halt (cmsis-dap)`：不下载固件，但会复位/暂停，适合从入口附近排查。

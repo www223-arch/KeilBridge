@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from keiltool.core.openocd_target_resolver import resolve_openocd_target
 from keiltool.core.project_model import KeilTargetModel
 
 
@@ -136,7 +137,13 @@ def generate_debug_configuration(
         "cmsis-dap": "interface/cmsis-dap.cfg",
         "daplink": "interface/cmsis-dap.cfg",
     }.get(probe, "interface/stlink.cfg")
-    config_files = [_json_path(str(openocd_config))] if openocd_config else [interface, target.device_info.openocd_target or f"target/{target.family}x.cfg"]
+    if openocd_config:
+        config_files = [_json_path(str(openocd_config))]
+    else:
+        target_resolution = resolve_openocd_target(target, openocd_scripts)
+        if not target_resolution.target_cfg:
+            raise ValueError(f"OpenOCD target could not be resolved: {target_resolution.reason}")
+        config_files = [interface, target_resolution.target_cfg]
     configuration = {
         "name": f"KeilBridge OpenOCD ({probe})",
         "type": "cortex-debug",
@@ -158,7 +165,7 @@ def generate_debug_configuration(
     return configuration
 
 
-def generate_openocd_config(target: KeilTargetModel, probe: str = "stlink") -> str:
+def generate_openocd_config(target: KeilTargetModel, probe: str = "stlink", openocd_scripts: str = "") -> str:
     """生成单文件 OpenOCD 配置。
 
     对 GD32F303 这类 OpenOCD 没有官方专用 target 的芯片，实测可先复用 STM32F3 flash
@@ -171,7 +178,8 @@ def generate_openocd_config(target: KeilTargetModel, probe: str = "stlink") -> s
         "cmsis-dap": "interface/cmsis-dap.cfg",
         "daplink": "interface/cmsis-dap.cfg",
     }.get(probe, "interface/stlink.cfg")
-    target_cfg = target.device_info.openocd_target or f"target/{target.family}x.cfg"
+    target_resolution = resolve_openocd_target(target, openocd_scripts)
+    target_cfg = target_resolution.target_cfg
     adapter_speed = "1000" if probe in {"cmsis-dap", "daplink"} else "4000"
     chip_name = (target.device or target.name).lower()
     flash_size = _flash_size_hex(target)
@@ -187,7 +195,7 @@ set CHIPNAME {chip_name}
 set FLASH_SIZE {flash_size}
 set WORKAREASIZE {workarea}
 
-source [find {target_cfg}]
+{_openocd_target_source_line(target_cfg, target_resolution.reason)}
 """
 
 
@@ -255,6 +263,12 @@ def _length_to_hex(length: str) -> str:
     if text.endswith("M"):
         return hex(int(text[:-1]) * 1024 * 1024)
     return hex(int(text, 0))
+
+
+def _openocd_target_source_line(target_cfg: str, reason: str) -> str:
+    if target_cfg:
+        return f"source [find {target_cfg}]"
+    return f"# KeilBridge OpenOCD target unresolved: {reason}"
 
 
 def _json_path(path: str) -> str:

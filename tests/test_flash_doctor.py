@@ -32,3 +32,16 @@ def test_flash_doctor_classifies_probe_open_failed():
     )
 
     assert any(item.code == "OPENOCD_PROBE_OPEN_FAILED" and item.severity == "fail" for item in findings)
+
+
+def test_flash_doctor_reports_unresolved_generated_target(tmp_path):
+    generated = tmp_path / "generated"
+    cfg = generated / "openocd" / "App_stlink.cfg"
+    cfg.parent.mkdir(parents=True)
+    cfg.write_text("# KeilBridge OpenOCD target unresolved: no mapping\n", encoding="utf-8")
+
+    from keiltool.core.doctor import _static_flash_findings
+
+    findings = _static_flash_findings(KeilTargetModel(name="App"), "openocd", cfg, "stlink")
+
+    assert any(item.code == "OPENOCD_TARGET_UNRESOLVED" and item.severity == "fatal" for item in findings)

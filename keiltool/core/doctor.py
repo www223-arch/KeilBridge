@@ -341,6 +341,17 @@ def _static_flash_findings(target: KeilTargetModel, openocd: str, cfg: Path, pro
                 suggestion="先运行 configure 重新生成 `.keilbridge/generated/openocd`。",
             )
         )
+    elif "openocd target unresolved" in cfg.read_text(encoding="utf-8", errors="replace").lower():
+        findings.append(
+            DoctorFinding(
+                stage="flash",
+                severity="fatal",
+                code="OPENOCD_TARGET_UNRESOLVED",
+                title="OpenOCD target could not be resolved",
+                message=f"The generated OpenOCD config does not contain a target cfg source line: `{cfg}`.",
+                suggestion="Add a device database target, improve the family mapping, or provide a project override for the OpenOCD target cfg.",
+            )
+        )
     if probe in {"cmsis-dap", "daplink"}:
         findings.append(
             DoctorFinding(

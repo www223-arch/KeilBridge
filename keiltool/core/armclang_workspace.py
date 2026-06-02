@@ -55,7 +55,7 @@ def configure_armclang_workspace(
     _write(generated_dir / "cmake" / "armclang.cmake", generate_armclang_toolchain(target))
     _write(generated_dir / "CMakeLists.txt", generate_armclang_cmakelists(target, scatter_file))
     _write(generated_dir / "CMakePresets.json", generate_armclang_presets())
-    _write(openocd_config, generate_openocd_config(target, probe))
+    _write(openocd_config, generate_openocd_config(target, probe, openocd_scripts))
     _write(generated_dir / ".vscode" / "launch.json", _launch_json(target, probe, build_dir, openocd, openocd_scripts, openocd_config))
     _write(generated_dir / ".vscode" / "tasks.json", _tasks_json(cmake, ninja, generated_dir, build_dir, armclang_root))
     _write_json(

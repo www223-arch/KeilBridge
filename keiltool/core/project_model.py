@@ -79,6 +79,9 @@ class KeilTargetModel:
     startup_files: list[str] = field(default_factory=list)
     scatter_file: str = ""
     scatter_candidates: list[str] = field(default_factory=list)
+    debug_probe: str = ""
+    keil_debug_dll: str = ""
+    flash_algorithm: str = ""
     device_info: DeviceInfo = field(default_factory=DeviceInfo)
     features: ProjectFeatures = field(default_factory=ProjectFeatures)
     c_standard: str = "c11"

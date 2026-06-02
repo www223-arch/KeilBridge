@@ -258,9 +258,15 @@ def cmd_openocd(args: argparse.Namespace) -> int:
         "cmsis-dap": "interface/cmsis-dap.cfg",
         "daplink": "interface/cmsis-dap.cfg",
     }.get(probe, "interface/stlink.cfg")
-    target_cfg = resolve_openocd_target(target).target_cfg or f"target/{target.family}x.cfg"
     openocd = find_openocd(args.openocd)
-    command = [openocd, "-f", interface, "-f", target_cfg]
+    scripts = find_openocd_scripts(openocd)
+    target_resolution = resolve_openocd_target(target, scripts)
+    if not target_resolution.target_cfg:
+        raise SystemExit(f"OpenOCD target could not be resolved: {target_resolution.reason}")
+    command = [openocd]
+    if scripts:
+        command.extend(["-s", scripts])
+    command.extend(["-f", interface, "-f", target_resolution.target_cfg])
     print(" ".join(command))
     if args.run:
         _run(command, cwd=Path.cwd())

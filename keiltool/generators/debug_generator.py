@@ -137,8 +137,13 @@ def generate_debug_configuration(
         "cmsis-dap": "interface/cmsis-dap.cfg",
         "daplink": "interface/cmsis-dap.cfg",
     }.get(probe, "interface/stlink.cfg")
-    target_resolution = resolve_openocd_target(target, openocd_scripts)
-    config_files = [_json_path(str(openocd_config))] if openocd_config else [interface, target_resolution.target_cfg or f"target/{target.family}x.cfg"]
+    if openocd_config:
+        config_files = [_json_path(str(openocd_config))]
+    else:
+        target_resolution = resolve_openocd_target(target, openocd_scripts)
+        if not target_resolution.target_cfg:
+            raise ValueError(f"OpenOCD target could not be resolved: {target_resolution.reason}")
+        config_files = [interface, target_resolution.target_cfg]
     configuration = {
         "name": f"KeilBridge OpenOCD ({probe})",
         "type": "cortex-debug",

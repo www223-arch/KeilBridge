@@ -1,6 +1,8 @@
 from keiltool.core.openocd_target_resolver import resolve_openocd_target
 from keiltool.core.project_model import KeilTargetModel
-from keiltool.generators.debug_generator import generate_openocd_config
+import pytest
+
+from keiltool.generators.debug_generator import generate_debug_configuration, generate_openocd_config
 
 
 def test_resolve_gd32f3_family_to_verified_stm32f3_target(tmp_path):
@@ -25,3 +27,19 @@ def test_generate_openocd_config_marks_unresolved_target_when_candidate_missing(
 
     assert "OpenOCD target unresolved" in content
     assert "source [find target/gd32f3x.cfg]" not in content
+
+
+def test_generate_debug_configuration_fails_instead_of_guessing_family_cfg():
+    target = KeilTargetModel(name="App", device="UNKNOWN123", family="unknown123")
+
+    with pytest.raises(ValueError, match="OpenOCD target could not be resolved"):
+        generate_debug_configuration(
+            target=target,
+            probe="stlink",
+            executable="App.elf",
+            cwd=".",
+            openocd_path="",
+            openocd_scripts="",
+            openocd_config="",
+            pre_launch_task="",
+        )

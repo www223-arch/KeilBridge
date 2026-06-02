@@ -152,6 +152,32 @@ def classify_openocd_log(text: str, openocd_path: str, target: KeilTargetModel, 
             )
         )
 
+    if "can't find target/" in lower or "can't find interface/" in lower or "can't find board/" in lower:
+        findings.append(
+            DoctorFinding(
+                stage="flash",
+                severity="fatal",
+                code="OPENOCD_CONFIG_INCLUDE_NOT_FOUND",
+                title="OpenOCD referenced config file was not found",
+                message="OpenOCD started, but one of the generated `source [find ...]` config references could not be resolved.",
+                evidence=_first_matching_line(text, ["Can't find target/", "Can't find interface/", "Can't find board/"]),
+                suggestion="Check the generated OpenOCD target/interface cfg. For GD32 parts, prefer a verified compatibility target such as `target/stm32f3x.cfg` when the exact GD32 cfg is not available.",
+            )
+        )
+
+    if "error: open failed" in lower:
+        findings.append(
+            DoctorFinding(
+                stage="flash",
+                severity="fail",
+                code="OPENOCD_PROBE_OPEN_FAILED",
+                title="OpenOCD could not open the debug probe",
+                message="OpenOCD loaded the generated configuration, but failed while opening the selected probe interface.",
+                evidence=_first_matching_line(text, ["Error: open failed"]),
+                suggestion="Check that the probe is connected, not held by Keil/VS Code/another OpenOCD process, and that the selected `--probe` profile matches the actual hardware.",
+            )
+        )
+
     if "cmsis-dap command mismatch" in lower or "cmd_dap_swj_clock failed" in lower:
         findings.append(
             DoctorFinding(

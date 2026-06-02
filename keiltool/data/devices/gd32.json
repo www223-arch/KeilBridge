@@ -47,6 +47,18 @@
       { "name": "RAM", "origin": "0x20000000", "length": "32K" }
     ]
   },
+  "GD32F303CC": {
+    "vendor": "gd",
+    "family": "gd32f3",
+    "core": "cortex-m4",
+    "fpu": "fpv4-sp-d16",
+    "float_abi": "hard",
+    "openocd_target": "target/stm32f3x.cfg",
+    "memory": [
+      { "name": "FLASH", "origin": "0x08000000", "length": "256K" },
+      { "name": "RAM", "origin": "0x20000000", "length": "48K" }
+    ]
+  },
   "GD32F303RC": {
     "vendor": "gd",
     "family": "gd32f3",

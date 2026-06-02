@@ -1,4 +1,5 @@
-from keiltool.core.doctor import _resolve_openocd_cfg
+from keiltool.core.doctor import _resolve_openocd_cfg, classify_openocd_log
+from keiltool.core.project_model import KeilTargetModel
 
 
 def test_flash_doctor_finds_debug_only_openocd_config(tmp_path):
@@ -20,3 +21,14 @@ def test_flash_doctor_prefers_default_openocd_config(tmp_path):
     debug_cfg.write_text("debug\n", encoding="utf-8")
 
     assert _resolve_openocd_cfg(generated, "App", "stlink") == default_cfg
+
+
+def test_flash_doctor_classifies_probe_open_failed():
+    findings = classify_openocd_log(
+        "xPack Open On-Chip Debugger\nError: open failed\n",
+        "openocd",
+        KeilTargetModel(name="App", device="GD32F303CC"),
+        "stlink",
+    )
+
+    assert any(item.code == "OPENOCD_PROBE_OPEN_FAILED" and item.severity == "fail" for item in findings)

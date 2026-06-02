@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
+from .openocd_target_resolver import resolve_openocd_target
 from .project_model import KeilTargetModel
 from .scatter import parse_scatter_memory
 
@@ -80,17 +81,18 @@ def diagnose_target(target: KeilTargetModel) -> list[Diagnostic]:
             )
         )
 
-    if target.vendor == "gd" and target.device_info.openocd_target:
+    openocd_target = resolve_openocd_target(target)
+    if target.vendor == "gd" and openocd_target.target_cfg:
         diagnostics.append(
             Diagnostic(
                 level="warning",
                 code="gd32_openocd_needs_board_validation",
-                message=f"GD32 OpenOCD target selected: {target.device_info.openocd_target}",
+                message=f"GD32 OpenOCD target selected: {openocd_target.target_cfg}",
                 detail="Some GD32 parts can be debugged through OpenOCD compatibility targets, but flash/debug behavior must be verified with the actual chip and probe.",
             )
         )
 
-    if target.vendor == "gd" and not target.device_info.openocd_target:
+    if target.vendor == "gd" and not openocd_target.target_cfg:
         diagnostics.append(
             Diagnostic(
                 level="warning",

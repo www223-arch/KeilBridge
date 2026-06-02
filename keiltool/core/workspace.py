@@ -63,7 +63,7 @@ def configure_workspace(workspace_root: Path, target: KeilTargetModel, probe: st
     _write(generated_dir / "support" / "syscalls.c", generate_syscalls())
     _write(generated_dir / "CMakeLists.txt", generate_cmakelists(target, generated_dir, source_overlays))
     _write(generated_dir / "CMakePresets.json", generate_presets())
-    _write(generated_dir / "openocd" / f"{project_name}_{probe}.cfg", generate_openocd_config(target, probe))
+    _write(generated_dir / "openocd" / f"{project_name}_{probe}.cfg", generate_openocd_config(target, probe, openocd_scripts))
     _write(
         generated_dir / ".vscode" / "launch.json",
         generate_launch_json(target, probe, openocd_path=openocd, openocd_scripts=openocd_scripts, openocd_config=openocd_config),

@@ -37,7 +37,7 @@ def configure_debug_only_workspace(
     openocd_config = generated_dir / "openocd" / f"{project_name}_{probe}.cfg"
     source_root = _source_view_root(target, workspace_root)
 
-    _write(openocd_config, generate_openocd_config(target, probe))
+    _write(openocd_config, generate_openocd_config(target, probe, openocd_scripts))
     _write(generated_dir / ".vscode" / "launch.json", _launch_json(target, probe, resolved_executable, generated_dir, openocd, openocd_scripts, openocd_config))
     _write(
         workspace_root / ".keilbridge" / f"KeilBridge_{project_name}_debug.code-workspace",

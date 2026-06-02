@@ -15,6 +15,7 @@ from .core.doctor import classify_openocd_log, render_flash_doctor_markdown, run
 from .core.debug_only_workspace import configure_debug_only_workspace
 from .core.elf_doctor import render_elf_doctor_markdown, run_elf_doctor
 from .core.keil_parser import parse_uvprojx
+from .core.openocd_target_resolver import resolve_openocd_target
 from .core.scatter import generate_gnu_ld, parse_scatter_memory
 from .core.tool_finder import armclang_environment, find_arm_gcc_root, find_armclang_tools, find_cmake, find_ninja, find_openocd, find_openocd_scripts
 from .core.workspace import configure_workspace
@@ -49,6 +50,10 @@ def _sanitize_name(name: str) -> str:
     return "".join(ch if ch.isalnum() or ch == "_" else "_" for ch in name)
 
 
+def _resolve_probe(target, explicit_probe: str | None) -> str:
+    return explicit_probe or target.debug_probe or "stlink"
+
+
 def cmd_inspect(args: argparse.Namespace) -> int:
     """打印工程摘要，用于第一阶段快速验证 parser 是否理解 Keil 工程。"""
 
@@ -63,8 +68,9 @@ def cmd_inspect(args: argparse.Namespace) -> int:
     print(f"Core: {target.core or '(unknown)'}")
     print(f"FPU/float ABI: {(target.fpu or 'none')}/{target.float_abi or 'unknown'}")
     print(f"Device database: {'matched' if target.device_info.matched else 'not matched'}")
-    if target.device_info.openocd_target:
-        print(f"OpenOCD target: {target.device_info.openocd_target}")
+    openocd_target = resolve_openocd_target(target)
+    if openocd_target.target_cfg:
+        print(f"OpenOCD target: {openocd_target.target_cfg} ({openocd_target.status})")
     print(f"CPU: {target.cpu or '(not specified)'}")
     if target.memory:
         memory = ", ".join(f"{region.name} {region.origin}+{region.length}" for region in target.memory)
@@ -75,6 +81,9 @@ def cmd_inspect(args: argparse.Namespace) -> int:
     print(f"Defines: {len(target.defines)}")
     print(f"Libraries: {len(target.libraries)}")
     print(f"Startup files: {len(target.startup_files)}")
+    print(f"Debug probe: {target.debug_probe or '(not inferred)'}")
+    print(f"Keil debug DLL: {target.keil_debug_dll or '(unknown)'}")
+    print(f"Flash algorithm: {target.flash_algorithm or '(unknown)'}")
     print(f"Scatter file: {target.scatter_file or '(none)'}")
     print(f"Scatter candidates: {len(target.scatter_candidates)}")
     print(f"Framework: {target.features.framework}")
@@ -167,16 +176,18 @@ def cmd_configure(args: argparse.Namespace) -> int:
         print("Auto mode only writes the backend diagnosis. Re-run configure with --backend gcc, armclang, or debug-only after choosing.")
         return 0
     if args.backend == "armclang":
-        generated_dir = configure_armclang_workspace(workspace_root, target, probe=args.probe, armclang_root=args.armclang_root)
+        probe = _resolve_probe(target, args.probe)
+        generated_dir = configure_armclang_workspace(workspace_root, target, probe=probe, armclang_root=args.armclang_root)
         print(f"Generated ArmClang workspace: {generated_dir}")
         print("Next:")
         print(f"  python -m keiltool.cli build --project \"{model.project_file}\" --target {target.name} --backend armclang")
         return 0
     if args.backend == "debug-only":
+        probe = _resolve_probe(target, args.probe)
         generated_dir = configure_debug_only_workspace(
             workspace_root,
             target,
-            probe=args.probe,
+            probe=probe,
             executable=args.elf,
             keil_project_dir=model.keil_project_dir,
         )
@@ -185,7 +196,8 @@ def cmd_configure(args: argparse.Namespace) -> int:
         print(f"  {workspace_root / '.keilbridge' / f'KeilBridge_{_sanitize_name(target.name)}_debug.code-workspace'}")
         return 0
 
-    generated_dir = configure_workspace(workspace_root, target, probe=args.probe)
+    probe = _resolve_probe(target, args.probe)
+    generated_dir = configure_workspace(workspace_root, target, probe=probe)
     print(f"Generated workspace: {generated_dir}")
     print("Next:")
     print(f"  python -m keiltool.cli build --project \"{model.project_file}\" --target {target.name}")
@@ -240,12 +252,13 @@ def cmd_openocd(args: argparse.Namespace) -> int:
 
     model = parse_uvprojx(args.project)
     target = _pick_target(model, args.target)
+    probe = _resolve_probe(target, args.probe)
     interface = {
         "stlink": "interface/stlink.cfg",
         "cmsis-dap": "interface/cmsis-dap.cfg",
         "daplink": "interface/cmsis-dap.cfg",
-    }.get(args.probe, "interface/stlink.cfg")
-    target_cfg = target.device_info.openocd_target or f"target/{target.family}x.cfg"
+    }.get(probe, "interface/stlink.cfg")
+    target_cfg = resolve_openocd_target(target).target_cfg or f"target/{target.family}x.cfg"
     openocd = find_openocd(args.openocd)
     command = [openocd, "-f", interface, "-f", target_cfg]
     print(" ".join(command))
@@ -264,11 +277,12 @@ def cmd_flash(args: argparse.Namespace) -> int:
 
     model = parse_uvprojx(args.project)
     target = _pick_target(model, args.target)
+    probe = _resolve_probe(target, args.probe)
     workspace_root = Path(args.workspace_root).resolve() if args.workspace_root else Path(model.inferred_project_root)
     project_name = _sanitize_name(target.name)
     generated_dir = workspace_root / ".keilbridge" / "generated"
     build_dir = workspace_root / ".keilbridge" / "build" / "gcc-debug"
-    cfg = generated_dir / "openocd" / f"{project_name}_{args.probe}.cfg"
+    cfg = generated_dir / "openocd" / f"{project_name}_{probe}.cfg"
     elf = Path(args.elf).resolve() if args.elf else build_dir / f"{project_name}.elf"
     if not cfg.exists():
         raise SystemExit(f"OpenOCD config not found: {cfg}. Run configure first.")
@@ -288,8 +302,8 @@ def cmd_flash(args: argparse.Namespace) -> int:
     logs_dir = workspace_root / ".keilbridge" / "logs"
     logs_dir.mkdir(parents=True, exist_ok=True)
     stamp = strftime("%Y%m%d-%H%M%S")
-    stdout_path = logs_dir / f"flash_{project_name}_{args.probe}_{stamp}.out.log"
-    stderr_path = logs_dir / f"flash_{project_name}_{args.probe}_{stamp}.err.log"
+    stdout_path = logs_dir / f"flash_{project_name}_{probe}_{stamp}.out.log"
+    stderr_path = logs_dir / f"flash_{project_name}_{probe}_{stamp}.err.log"
     completed = subprocess.run(command, cwd=generated_dir, text=True, capture_output=True)
     stdout_path.write_text(completed.stdout, encoding="utf-8", newline="\n")
     stderr_path.write_text(completed.stderr, encoding="utf-8", newline="\n")
@@ -299,7 +313,7 @@ def cmd_flash(args: argparse.Namespace) -> int:
         print(completed.stderr, end="")
     print(f"Flash logs: {stdout_path} ; {stderr_path}")
     if completed.returncode != 0:
-        findings = classify_openocd_log(completed.stdout + "\n" + completed.stderr, openocd, target, args.probe)
+        findings = classify_openocd_log(completed.stdout + "\n" + completed.stderr, openocd, target, probe)
         if findings:
             print("KeilBridge Flash Doctor:")
             for finding in findings:
@@ -322,11 +336,12 @@ def cmd_doctor_flash(args: argparse.Namespace) -> int:
 
     model = parse_uvprojx(args.project)
     target = _pick_target(model, args.target)
+    probe = _resolve_probe(target, args.probe)
     workspace_root = Path(args.workspace_root).resolve() if args.workspace_root else Path(model.inferred_project_root)
     result = run_flash_doctor(
         target=target,
         workspace_root=workspace_root,
-        probe=args.probe,
+        probe=probe,
         openocd_path=args.openocd,
         run_probe=args.run,
     )
@@ -335,7 +350,7 @@ def cmd_doctor_flash(args: argparse.Namespace) -> int:
     json_path = report_dir / "flash_doctor_result.json"
     md_path = report_dir / "flash_doctor_report.md"
     json_path.write_text(json.dumps(result.to_dict(), ensure_ascii=False, indent=2), encoding="utf-8", newline="\n")
-    md_path.write_text(render_flash_doctor_markdown(result, target, args.probe), encoding="utf-8", newline="\n")
+    md_path.write_text(render_flash_doctor_markdown(result, target, probe), encoding="utf-8", newline="\n")
 
     print(f"Flash Doctor report: {md_path}")
     for finding in result.findings:
@@ -474,7 +489,7 @@ def build_parser() -> argparse.ArgumentParser:
     configure_parser = subparsers.add_parser("configure", help="Generate external CMake/OpenOCD workspace")
     configure_parser.add_argument("--project", required=True, type=Path, help="Path to .uvprojx")
     configure_parser.add_argument("--target", help="Keil target name")
-    configure_parser.add_argument("--probe", default="stlink", help="Probe profile: stlink, cmsis-dap, daplink")
+    configure_parser.add_argument("--probe", help="Probe profile: stlink, cmsis-dap, daplink. Defaults to uvoptx inference, then stlink.")
     configure_parser.add_argument("--workspace-root", help="Override .keilbridge location; defaults to inferred Keil project root")
     configure_parser.add_argument("--backend", choices=["auto", "gcc", "armclang", "debug-only"], default="auto", help="Build backend. Default auto writes recommendation only.")
     configure_parser.add_argument("--armclang-root", help="Path to ArmClang/Keil ARMCLANG root or bin directory")
@@ -497,7 +512,7 @@ def build_parser() -> argparse.ArgumentParser:
     openocd_cmd = subparsers.add_parser("openocd", help="Print or run OpenOCD debug server command")
     openocd_cmd.add_argument("--project", required=True, type=Path, help="Path to .uvprojx")
     openocd_cmd.add_argument("--target", help="Keil target name")
-    openocd_cmd.add_argument("--probe", default="stlink", help="Probe profile: stlink, cmsis-dap, daplink")
+    openocd_cmd.add_argument("--probe", help="Probe profile: stlink, cmsis-dap, daplink. Defaults to uvoptx inference, then stlink.")
     openocd_cmd.add_argument("--openocd", help="Path to openocd executable")
     openocd_cmd.add_argument("--run", action="store_true", help="Run OpenOCD instead of only printing the command")
     openocd_cmd.set_defaults(func=cmd_openocd)
@@ -505,7 +520,7 @@ def build_parser() -> argparse.ArgumentParser:
     flash_cmd = subparsers.add_parser("flash", help="Program the generated ELF with OpenOCD")
     flash_cmd.add_argument("--project", required=True, type=Path, help="Path to .uvprojx")
     flash_cmd.add_argument("--target", help="Keil target name")
-    flash_cmd.add_argument("--probe", default="stlink", help="Probe profile: stlink, cmsis-dap, daplink")
+    flash_cmd.add_argument("--probe", help="Probe profile: stlink, cmsis-dap, daplink. Defaults to uvoptx inference, then stlink.")
     flash_cmd.add_argument("--workspace-root", help="Override .keilbridge location; defaults to inferred Keil project root")
     flash_cmd.add_argument("--openocd", help="Path to openocd executable")
     flash_cmd.add_argument("--elf", help="Override ELF path; defaults to .keilbridge/build/gcc-debug/<target>.elf")
@@ -517,7 +532,7 @@ def build_parser() -> argparse.ArgumentParser:
     doctor_flash = doctor_subparsers.add_parser("flash", help="Diagnose OpenOCD/probe/flash connection")
     doctor_flash.add_argument("--project", required=True, type=Path, help="Path to .uvprojx")
     doctor_flash.add_argument("--target", help="Keil target name")
-    doctor_flash.add_argument("--probe", default="stlink", help="Probe profile: stlink, cmsis-dap, daplink")
+    doctor_flash.add_argument("--probe", help="Probe profile: stlink, cmsis-dap, daplink. Defaults to uvoptx inference, then stlink.")
     doctor_flash.add_argument("--workspace-root", help="Override .keilbridge location; defaults to inferred Keil project root")
     doctor_flash.add_argument("--openocd", help="Path to openocd executable")
     doctor_flash.add_argument("--run", action="store_true", help="Run a minimal OpenOCD connect/reset/vector read test")

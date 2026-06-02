@@ -91,4 +91,19 @@ def parse_memory_regions(cpu_text: str) -> list[MemoryRegion]:
                 length=_format_length(length),
             )
         )
+    for name, start_hex, size_hex in re.findall(r"(IROM\d*|IRAM\d*)\(0x([0-9A-Fa-f]+),\s*0x([0-9A-Fa-f]+)\)", cpu_text):
+        region_name = "FLASH" if name.startswith("IROM") else "RAM"
+        if any(region.name == region_name for region in regions):
+            continue
+        start = int(start_hex, 16)
+        length = int(size_hex, 16)
+        if length <= 0:
+            continue
+        regions.append(
+            MemoryRegion(
+                name=region_name,
+                origin=f"0x{start:08X}",
+                length=_format_length(length),
+            )
+        )
     return regions

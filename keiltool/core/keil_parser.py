@@ -5,7 +5,9 @@ import xml.etree.ElementTree as ET
 from pathlib import Path
 
 from .device_database import lookup_device
+from .device_override import apply_device_override
 from .device_inference import infer_core, infer_family, infer_fpu, infer_vendor, parse_memory_regions
+from .keil_option_parser import parse_uvoptx_debug_options
 from .path_resolver import infer_project_root, normalize_path, resolve_keil_path
 from .project_classifier import classify_project
 from .project_model import KeilFile, KeilProjectModel, KeilTargetModel
@@ -143,13 +145,13 @@ def parse_uvprojx(uvprojx_path: str | Path) -> KeilProjectModel:
         device_info = lookup_device(device)
         vendor = device_info.vendor or infer_vendor(device)
         family = device_info.family or infer_family(device)
-        core = device_info.core or infer_core(cpu, device)
+        core = infer_core(cpu, device) or device_info.core
         inferred_fpu, inferred_float_abi = infer_fpu(cpu, core)
         # Keil 的 Cpu 字段来自当前 target，通常比 seed 设备库更贴近实际工程配置。
         # 如果 Cpu 明确写了 FPU，而设备库条目还没有完善 FPU 信息，则优先采用 Cpu 推导结果。
         fpu = inferred_fpu or device_info.fpu
         float_abi = inferred_float_abi if inferred_fpu else (device_info.float_abi or inferred_float_abi)
-        memory = device_info.memory or parse_memory_regions(cpu)
+        memory = parse_memory_regions(cpu) or device_info.memory
 
         scatter_file = resolve_keil_path(base_dir, scatter_text, project_root) if scatter_text else ""
         scatter_candidates = [] if scatter_file else discover_scatter_files(base_dir, target_name)
@@ -159,30 +161,34 @@ def parse_uvprojx(uvprojx_path: str | Path) -> KeilProjectModel:
             for item in _split_semicolon(include_text)
         ]
         features = classify_project(str(project_root), sources, includes, _split_defines(define_text))
+        debug_options = parse_uvoptx_debug_options(project_path.with_suffix(".uvoptx"), target_name)
 
-        model.targets.append(
-            KeilTargetModel(
-                name=target_name,
-                device=device,
-                vendor=vendor,
-                family=family,
-                core=core,
-                fpu=fpu,
-                float_abi=float_abi,
-                cpu=cpu,
-                memory=memory,
-                sources=sources,
-                includes=includes,
-                defines=_split_defines(define_text),
-                libraries=libraries,
-                startup_files=startup_files,
-                scatter_file=scatter_file,
-                scatter_candidates=scatter_candidates,
-                device_info=device_info,
-                features=features,
-                c_standard="c99" if c99_mode == "1" else "c11",
-                optimization=optimization,
-            )
+        target_model = KeilTargetModel(
+            name=target_name,
+            device=device,
+            vendor=vendor,
+            family=family,
+            core=core,
+            fpu=fpu,
+            float_abi=float_abi,
+            cpu=cpu,
+            memory=memory,
+            sources=sources,
+            includes=includes,
+            defines=_split_defines(define_text),
+            libraries=libraries,
+            startup_files=startup_files,
+            scatter_file=scatter_file,
+            scatter_candidates=scatter_candidates,
+            debug_probe=debug_options.probe,
+            keil_debug_dll=debug_options.debug_dll,
+            flash_algorithm=debug_options.flash_algorithm,
+            device_info=device_info,
+            features=features,
+            c_standard="c99" if c99_mode == "1" else "c11",
+            optimization=optimization,
         )
+        apply_device_override(target_model, project_root)
+        model.targets.append(target_model)
 
     return model

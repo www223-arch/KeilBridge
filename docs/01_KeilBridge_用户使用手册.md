@@ -61,7 +61,17 @@ python -m keiltool.cli build --project "C:\Path\To\App.uvprojx" --target App --b
 - 已有 Keil 生成的 `.axf` 或 `.elf`。
 - 该 `.axf/.elf` 带调试符号。
 
-这条路线不编译、不下载固件，只用 Keil 产物做符号调试。
+这条路线不编译、不下载固件，只用 Keil 产物做符号调试。换句话说，Debug-only 的固件来源仍然是 Keil IDE、Keil 命令行或项目原有构建链路；KeilBridge 只接管 OpenOCD/GDB/VS Code 调试入口和诊断报告。
+
+KeilBridge 也提供了 Keil 命令行封装，用户不需要记住 `UV4.exe` 参数：
+
+```powershell
+python -m keiltool.cli keil build --project "C:\Path\To\App.uvprojx" --target App
+python -m keiltool.cli keil rebuild --project "C:\Path\To\App.uvprojx" --target App
+python -m keiltool.cli keil download --project "C:\Path\To\App.uvprojx" --target App
+```
+
+`build/rebuild` 优先调用 Keil `UV4.exe`；如果当前机器找不到 `UV4.exe`，但工程目录里有 Keil 生成的 `<target>.BAT`，KeilBridge 会运行一份 `.keilbridge/generated/keil-batch/` 下的副本作为 fallback，不修改原 `.BAT`。`download` 需要 Keil `UV4.exe`，因为它依赖 Keil target 里的 Flash Download 配置。
 
 ## 2. 推荐流程：先诊断，再选择
 
@@ -147,6 +157,12 @@ python -m keiltool.cli build --project "C:\Path\To\Project\MDK-ARM\App.uvprojx" 
 
 ### 3.3 指定 Debug-only
 
+Debug-only 的典型流程是：
+
+1. 先用 Keil IDE、Keil 命令行、KeilBridge 的 `keil build/rebuild`，或项目原有脚本编译工程，生成带调试符号的 `.axf/.elf`。
+2. 如果目标板上还没有这份固件，先用 Keil 下载、KeilBridge 的 `keil download`，或原项目已有下载方式下载。
+3. 再让 KeilBridge 生成 debug-only 工作区，使用同一个 `.axf/.elf` 作为符号文件进行 VS Code/OpenOCD/GDB 调试。
+
 ```powershell
 python -m keiltool.cli configure `
   --project "C:\Path\To\Project\MDK-ARM\App.uvprojx" `
@@ -166,6 +182,8 @@ Debug-only 工作区通常有两个入口：
 
 - `KeilBridge Debug-only Attach (...)`：连接当前运行现场，不主动复位，不下载。
 - `KeilBridge Debug-only Reset/Halt (...)`：不下载固件，但会复位并暂停。
+
+注意：这两个入口都不会把 `.axf/.elf` 下载进芯片。它们只使用 `.axf/.elf` 里的符号信息来解释当前芯片里已经存在的程序。如果重新编译了 Keil 工程，通常需要先确保新固件已经下载到板子，再开始 debug-only 调试。
 
 ## 4. 烧录和调试前诊断
 

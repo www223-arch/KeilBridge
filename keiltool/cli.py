@@ -15,6 +15,7 @@ from .core.doctor import classify_openocd_log, render_flash_doctor_markdown, run
 from .core.debug_only_workspace import configure_debug_only_workspace
 from .core.elf_doctor import render_elf_doctor_markdown, run_elf_doctor
 from .core.keil_parser import parse_uvprojx
+from .core.keil_cli import run_keil_cli
 from .core.openocd_target_resolver import resolve_openocd_target
 from .core.scatter import generate_gnu_ld, parse_scatter_memory
 from .core.tool_finder import armclang_environment, find_arm_gcc_root, find_armclang_tools, find_cmake, find_ninja, find_openocd, find_openocd_scripts
@@ -409,6 +410,28 @@ def cmd_doctor_elf(args: argparse.Namespace) -> int:
     return 1 if any(item.severity in {"fail", "fatal"} for item in result.findings) else 0
 
 
+def cmd_keil(args: argparse.Namespace) -> int:
+    """Call Keil uVision command line for build/rebuild/download fallback workflows."""
+
+    model = parse_uvprojx(args.project)
+    target = _pick_target(model, args.target)
+    workspace_root = Path(args.workspace_root).resolve() if args.workspace_root else Path(model.inferred_project_root)
+    try:
+        result = run_keil_cli(
+            project=Path(model.project_file),
+            target=target.name,
+            action=args.keil_command,
+            uvision=args.uvision,
+            workspace_root=workspace_root,
+        )
+    except FileNotFoundError as exc:
+        raise SystemExit(str(exc)) from exc
+    print(" ".join(f'"{item}"' if " " in item else item for item in result.command))
+    print(f"Keil {args.keil_command} mode: {result.mode}")
+    print(f"Keil {args.keil_command} log: {result.log_path}")
+    return result.returncode
+
+
 def _write_backend_report(workspace_root: Path, target, armclang_root: str | None, arm_gcc_root: str | None):
     """写入后端推荐报告，供首次配置和独立 Doctor 共用。"""
 
@@ -559,6 +582,20 @@ def build_parser() -> argparse.ArgumentParser:
     doctor_elf.add_argument("--elf", help="Override ELF path; defaults to .keilbridge/build/gcc-debug/<target>.elf")
     doctor_elf.add_argument("--arm-gcc-root", help="Path to Arm GNU Toolchain root")
     doctor_elf.set_defaults(func=cmd_doctor_elf)
+
+    keil_parser = subparsers.add_parser("keil", help="Run Keil uVision CLI build/rebuild/download")
+    keil_subparsers = keil_parser.add_subparsers(dest="keil_command", required=True)
+    for name, help_text in {
+        "build": "Build the selected Keil target with uVision CLI",
+        "rebuild": "Rebuild the selected Keil target with uVision CLI",
+        "download": "Program Flash with the selected Keil target settings",
+    }.items():
+        cmd = keil_subparsers.add_parser(name, help=help_text)
+        cmd.add_argument("--project", required=True, type=Path, help="Path to .uvprojx")
+        cmd.add_argument("--target", help="Keil target name")
+        cmd.add_argument("--workspace-root", help="Override .keilbridge location; defaults to inferred Keil project root")
+        cmd.add_argument("--uvision", help="Path to UV4.exe/UV4.com. Defaults to PATH and common Keil install paths.")
+        cmd.set_defaults(func=cmd_keil)
 
     return parser
 

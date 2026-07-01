@@ -22,7 +22,56 @@ python -m keiltool.cli flash --project "xxx.uvprojx" --target App --probe stlink
 
 它会执行 OpenOCD `program <elf> verify reset exit`，会改写目标芯片 Flash。
 
-## 2. 报告在哪里？
+## 2. Debug-only 会帮我编译或下载固件吗？
+
+不会。
+
+Debug-only 的定位是“调试已有固件”：
+
+- `.axf/.elf` 通常由 Keil IDE、Keil 命令行或项目原有构建脚本生成。
+- 固件下载通常也由 Keil 或项目原有下载流程完成。
+- KeilBridge 生成的 Debug-only VS Code 配置默认 `loadFiles: []`，不会在启动调试时下载固件。
+
+所以 Debug-only 的推荐顺序是：
+
+1. 用 Keil、KeilBridge 的 `keil build/rebuild`，或原有脚本编译，生成带符号的 `.axf/.elf`。
+2. 用 Keil、KeilBridge 的 `keil download`，或原有下载流程把对应固件下载到目标板。
+3. 运行 `configure --backend debug-only --elf ...`。
+4. 打开生成的 `KeilBridge_<target>_debug.code-workspace`，选择 Attach 或 Reset/Halt 调试。
+
+如果 `.axf/.elf` 更新了但板子里的固件没更新，调试符号和实际运行程序可能不一致，断点、变量、调用栈都会变得不可信。
+
+## 3. KeilBridge 怎么调用 Keil 命令行？
+
+KeilBridge 提供三个封装命令：
+
+```powershell
+python -m keiltool.cli keil build --project "xxx.uvprojx" --target App
+python -m keiltool.cli keil rebuild --project "xxx.uvprojx" --target App
+python -m keiltool.cli keil download --project "xxx.uvprojx" --target App
+```
+
+对应 Keil µVision CLI：
+
+- `build`：`UV4.exe -b ...`
+- `rebuild`：`UV4.exe -r ...`
+- `download`：`UV4.exe -f ...`
+
+如果 `UV4.exe` 不在 PATH 或常见安装目录，可以传：
+
+```powershell
+python -m keiltool.cli keil build --project "xxx.uvprojx" --target App --uvision "C:\Keil_v5\UV4\UV4.exe"
+```
+
+如果当前工程有 Keil 生成的 `<target>.BAT`，`keil build/rebuild` 在找不到 `UV4.exe` 时会自动运行 BAT 副本。这个副本位于 `.keilbridge/generated/keil-batch/`，原始 BAT 不会被修改。`keil download` 仍需要 `UV4.exe`，因为下载动作依赖 Keil target 的 Flash Download 配置。
+
+日志在：
+
+```text
+<keil-project-root>\.keilbridge\logs\keil_<action>_<target>_<time>.log
+```
+
+## 4. 报告在哪里？
 
 后端推荐报告：
 
@@ -53,7 +102,7 @@ Debug-only 工作区报告：
 <keil-project-root>\.keilbridge\generated\reports\debug_only_workspace.json
 ```
 
-## 3. VS Code 里看不到完整源码怎么办？
+## 5. VS Code 里看不到完整源码怎么办？
 
 不要打开：
 
@@ -76,7 +125,7 @@ KeilBridge_<target>_armclang.code-workspace
 
 这些 workspace 会同时包含原始源码和生成目录。
 
-## 4. Debug-only 断点灰色、跳到反汇编怎么办？
+## 6. Debug-only 断点灰色、跳到反汇编怎么办？
 
 Keil `.axf` 里保存的是编译时源码路径。如果当前工程路径和编译时路径不同，需要 `sourceFileMap`。
 
@@ -90,7 +139,7 @@ Keil `.axf` 里保存的是编译时源码路径。如果当前工程路径和�
 
 换电脑或换目录后，重新运行 `configure --backend debug-only`，必要时手动检查生成的 `.code-workspace`。
 
-## 5. `GDB Server Quit Unexpectedly` 怎么办？
+## 7. `GDB Server Quit Unexpectedly` 怎么办？
 
 先跑：
 
@@ -112,7 +161,7 @@ python -m keiltool.cli doctor flash --project "xxx.uvprojx" --target App --probe
 - 板子没供电、SWD 接线异常、复位线异常。
 - 芯片读保护或处于异常低功耗/锁死状态。
 
-## 6. `CMSIS-DAP command mismatch` 怎么办？
+## 8. `CMSIS-DAP command mismatch` 怎么办？
 
 常见输出：
 
@@ -133,7 +182,7 @@ Error: Failed to write memory
 5. 重新运行 `doctor flash --run`。
 6. 仍然失败时，换用 xPack OpenOCD 或 STM32CubeCLT OpenOCD。
 
-## 7. `preLaunchTask "CMake: build" 已终止` 怎么办？
+## 9. `preLaunchTask "CMake: build" 已终止` 怎么办？
 
 这通常是旧生成文件依赖 PATH 中的 `cmake`，但 VS Code task 环境找不到。
 
@@ -146,7 +195,7 @@ python -m keiltool.cli configure --project "C:\Path\To\App.uvprojx" --target App
 
 然后重新打开生成的 `.code-workspace`。
 
-## 8. 什么时候需要重新 `configure`？
+## 10. 什么时候需要重新 `configure`？
 
 这些情况建议重新运行：
 
@@ -162,7 +211,7 @@ python -m keiltool.cli configure --project "C:\Path\To\App.uvprojx" --target App
 
 Debug-only 如果 `.axf` 路径不变，通常不用重新 `configure`。
 
-## 9. ARMCC `.lib` 为什么会被提示风险？
+## 11. ARMCC `.lib` 为什么会被提示风险？
 
 Keil 工程里常见：
 
@@ -178,7 +227,7 @@ arm_cortexM4lf_math.lib
 - ArmClang 路线：更可能兼容 Keil/Arm 格式。
 - Debug-only 路线：不重新链接，所以不受这个问题影响。
 
-## 10. 一进调试就 HardFault 怎么办？
+## 12. 一进调试就 HardFault 怎么办？
 
 先不要只看 `HardFault_Handler`。需要采集：
 
@@ -196,7 +245,7 @@ python -m keiltool.cli doctor elf --project "xxx.uvprojx" --target App
 
 重点看 `.init_array`、启动文件、链接脚本、RAM 段和 RTOS 中断入口。
 
-## 11. CubeMX 工程支持吗？
+## 13. CubeMX 工程支持吗？
 
 支持识别和复用：
 
@@ -208,13 +257,13 @@ python -m keiltool.cli doctor elf --project "xxx.uvprojx" --target App
 
 KeilBridge 不调用 CubeMX，不改 `.ioc`，不改 `USER CODE`。
 
-## 12. RTOS 工程支持吗？
+## 14. RTOS 工程支持吗？
 
 当前策略是识别、诊断和对已验证组合做适配。
 
 常见 RTOS 形态可以被识别，例如 FreeRTOS、RT-Thread、ThreadX、uCOS。涉及 ARMCC/RVDS port 到 GCC port 的工程，需要看具体项目诊断结果。
 
-## 13. GD32 支持吗？
+## 15. GD32 支持吗？
 
 已有初步支持。GD32F303CB 已经过 DAPLink/CMSIS-DAP + OpenOCD 的最小工程验证。
 

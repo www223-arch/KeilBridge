@@ -13,3 +13,6 @@ build/
 .keilbridge/
 keiltool.yaml
 keilbridge.yaml
+
+.superpowers/
+.worktrees/

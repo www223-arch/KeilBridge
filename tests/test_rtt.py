@@ -6,6 +6,8 @@ import socket
 import threading
 import time
 
+import pytest
+
 from keiltool.core.openocd_backend import OpenOcdConfig
 from keiltool.core.rtt import RttRequest, RttSession, build_rtt_command
 
@@ -44,6 +46,7 @@ class FakeProcess:
         self.returncode = returncode
         self.terminated = False
         self.killed = False
+        self.wait_calls = 0
 
     def poll(self) -> int | None:
         return self.returncode
@@ -57,6 +60,7 @@ class FakeProcess:
         self.returncode = -9
 
     def wait(self, timeout: float | None = None) -> int:
+        self.wait_calls += 1
         if self.returncode is None:
             raise TimeoutError("process is still running")
         return self.returncode
@@ -121,6 +125,15 @@ def _next_event(session: RttSession, kind: str, timeout: float = 1.0):
     raise AssertionError(f"RTT event {kind!r} was not emitted before timeout")
 
 
+def _drain_events(session: RttSession):
+    events = []
+    while True:
+        try:
+            events.append(session.events.get_nowait())
+        except queue.Empty:
+            return events
+
+
 def test_session_decodes_fragmented_utf8_and_writes_log(tmp_path):
     expected = "电机启动\n"
     port, server = _start_rtt_server(expected.encode("utf-8"))
@@ -148,8 +161,10 @@ def test_session_decodes_fragmented_utf8_and_writes_log(tmp_path):
 class FakeClock:
     def __init__(self) -> None:
         self.value = 0.0
+        self.calls = 0
 
     def monotonic(self) -> float:
+        self.calls += 1
         return self.value
 
     def sleep(self, duration: float) -> None:
@@ -214,6 +229,9 @@ class BlockingSocket:
         self.closed.wait(timeout=1)
         raise OSError("socket closed")
 
+    def shutdown(self, how: int) -> None:
+        self.closed.set()
+
     def close(self) -> None:
         self.closed.set()
 
@@ -221,6 +239,256 @@ class BlockingSocket:
 class StubbornProcess(FakeProcess):
     def terminate(self) -> None:
         self.terminated = True
+
+
+class BlockingTerminateProcess(FakeProcess):
+    def __init__(self) -> None:
+        super().__init__()
+        self.terminate_calls = 0
+        self.terminate_entered = threading.Event()
+        self.release_terminate = threading.Event()
+
+    def terminate(self) -> None:
+        self.terminate_calls += 1
+        self.terminate_entered.set()
+        self.release_terminate.wait(timeout=1)
+        self.returncode = 0
+
+
+class ExitRaceProcess(FakeProcess):
+    def poll(self) -> int | None:
+        if self.terminated:
+            raise ProcessLookupError("process exited")
+        return None
+
+    def terminate(self) -> None:
+        self.terminated = True
+        raise ProcessLookupError("process exited during terminate")
+
+
+class KillRaceProcess(FakeProcess):
+    def terminate(self) -> None:
+        self.terminated = True
+
+    def kill(self) -> None:
+        self.killed = True
+        self.returncode = -9
+        raise OSError("process exited during kill")
+
+
+class RecordingSocket:
+    def __init__(self, connection: socket.socket) -> None:
+        self._connection = connection
+        self.operations: list[str] = []
+
+    def settimeout(self, value: float | None) -> None:
+        self._connection.settimeout(value)
+
+    def recv(self, size: int) -> bytes:
+        return self._connection.recv(size)
+
+    def shutdown(self, how: int) -> None:
+        self.operations.append("shutdown")
+        self._connection.shutdown(how)
+
+    def close(self) -> None:
+        self.operations.append("close")
+        self._connection.close()
+
+
+def _start_idle_rtt_server() -> tuple[int, threading.Thread]:
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(1)
+    port = listener.getsockname()[1]
+
+    def serve() -> None:
+        try:
+            connection, _ = listener.accept()
+            with connection:
+                try:
+                    connection.recv(1)
+                except OSError:
+                    pass
+        finally:
+            listener.close()
+
+    thread = threading.Thread(target=serve)
+    thread.start()
+    return port, thread
+
+
+def test_stop_shuts_down_real_blocking_socket_and_joins_worker(tmp_path):
+    port, server = _start_idle_rtt_server()
+    process = FakeProcess(stdout_lines=("rtt: Found control block at 0x20000000\n",))
+    connections: list[RecordingSocket] = []
+
+    def connect(address, timeout):
+        connection = RecordingSocket(socket.create_connection(address, timeout=timeout))
+        connections.append(connection)
+        return connection
+
+    session = RttSession(
+        CONFIG,
+        RttRequest(scan_address=0x20000000, scan_size=0x10000, port=port),
+        tmp_path / "rtt.log",
+        popen_factory=lambda *args, **kwargs: process,
+        socket_factory=connect,
+        stop_timeout=0.2,
+    )
+
+    session.start()
+    _next_event(session, "connected")
+    session.stop()
+    server.join(timeout=1)
+
+    assert connections[0].operations[:2] == ["shutdown", "close"]
+    assert not server.is_alive()
+    assert session.wait(timeout=0.2)
+
+
+def test_concurrent_stop_calls_terminate_the_process_once(tmp_path):
+    process = BlockingTerminateProcess()
+    session = RttSession(
+        CONFIG,
+        RttRequest(scan_address=0x20000000, scan_size=0x10000),
+        tmp_path / "rtt.log",
+        popen_factory=lambda *args, **kwargs: process,
+        stop_timeout=0.2,
+    )
+    session.start()
+
+    first = threading.Thread(target=session.stop)
+    second = threading.Thread(target=session.stop)
+    first.start()
+    assert process.terminate_entered.wait(timeout=1)
+    second.start()
+    time.sleep(0.05)
+    process.release_terminate.set()
+    first.join(timeout=1)
+    second.join(timeout=1)
+
+    assert process.terminate_calls == 1
+    assert not first.is_alive()
+    assert not second.is_alive()
+
+
+def test_stop_before_start_prevents_openocd_launch(tmp_path):
+    launches: list[object] = []
+    session = RttSession(
+        CONFIG,
+        RttRequest(scan_address=0x20000000, scan_size=0x10000),
+        tmp_path / "rtt.log",
+        popen_factory=lambda *args, **kwargs: launches.append(args),
+    )
+
+    session.stop()
+
+    with pytest.raises(RuntimeError, match="stopped"):
+        session.start()
+
+    assert launches == []
+
+
+def test_stop_handles_process_exit_race_and_emits_one_clean_event(tmp_path):
+    process = ExitRaceProcess()
+    session = RttSession(
+        CONFIG,
+        RttRequest(scan_address=0x20000000, scan_size=0x10000),
+        tmp_path / "rtt.log",
+        popen_factory=lambda *args, **kwargs: process,
+    )
+    session.start()
+
+    session.stop()
+    session.stop()
+
+    stopped = [event for event in _drain_events(session) if event.kind == "stopped"]
+    assert process.terminated is True
+    assert len(stopped) == 1
+    assert stopped[0].outcome == "clean"
+
+
+def test_stop_reaps_process_after_forced_kill_even_when_kill_races(tmp_path):
+    clock = FakeClock()
+    process = KillRaceProcess()
+    session = RttSession(
+        CONFIG,
+        RttRequest(scan_address=0x20000000, scan_size=0x10000),
+        tmp_path / "rtt.log",
+        popen_factory=lambda *args, **kwargs: process,
+        monotonic=clock.monotonic,
+        sleep=clock.sleep,
+        stop_timeout=0.1,
+        retry_interval=0.05,
+    )
+    session.start()
+
+    session.stop()
+
+    stopped = [event for event in _drain_events(session) if event.kind == "stopped"]
+    assert process.killed is True
+    assert process.wait_calls == 1
+    assert len(stopped) == 1
+    assert stopped[0].outcome == "forced"
+
+
+class UnresponsiveSocket:
+    def __init__(self) -> None:
+        self.release = threading.Event()
+        self.recv_entered = threading.Event()
+
+    def settimeout(self, value: float | None) -> None:
+        pass
+
+    def recv(self, size: int) -> bytes:
+        self.recv_entered.set()
+        self.release.wait(timeout=1)
+        return b""
+
+    def shutdown(self, how: int) -> None:
+        pass
+
+    def close(self) -> None:
+        pass
+
+
+def test_stop_reports_join_failure_and_emits_one_cleanup_event(tmp_path):
+    process = FakeProcess(stdout_lines=("rtt: Found control block at 0x20000000\n",))
+    connection = UnresponsiveSocket()
+    session = RttSession(
+        CONFIG,
+        RttRequest(scan_address=0x20000000, scan_size=0x10000),
+        tmp_path / "rtt.log",
+        popen_factory=lambda *args, **kwargs: process,
+        socket_factory=lambda *args, **kwargs: connection,
+        stop_timeout=0.01,
+    )
+    session.start()
+    _next_event(session, "connected")
+    assert connection.recv_entered.wait(timeout=1)
+
+    session.stop()
+    events = _drain_events(session)
+    connection.release.set()
+
+    assert any(event.kind == "error" and "worker" in event.message.lower() for event in events)
+    assert len([event for event in events if event.kind == "stopped"]) == 1
+    assert session.wait(timeout=1)
+
+
+def test_wait_uses_injected_monotonic_clock(tmp_path):
+    clock = FakeClock()
+    session = RttSession(
+        CONFIG,
+        RttRequest(scan_address=0x20000000, scan_size=0x10000),
+        tmp_path / "rtt.log",
+        monotonic=clock.monotonic,
+    )
+
+    assert session.wait(timeout=0)
+    assert clock.calls >= 1
 
 
 def test_stop_closes_resources_then_terminates_and_kills_after_timeout(tmp_path):

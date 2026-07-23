@@ -53,6 +53,7 @@ class RttEvent:
     text: str = ""
     message: str = ""
     stream: str = ""
+    outcome: str = ""
 
 
 class RttProcess(Protocol):
@@ -64,6 +65,8 @@ class RttProcess(Protocol):
     def terminate(self) -> None: ...
 
     def kill(self) -> None: ...
+
+    def wait(self, timeout: float | None = None) -> int: ...
 
 
 PopenFactory = Callable[..., RttProcess]
@@ -107,21 +110,25 @@ class RttSession:
         self._host = host
         self._port = request.port
         self._lock = threading.RLock()
+        self._lifecycle = threading.Condition(threading.RLock())
         self._stop_requested = threading.Event()
         self._control_block_found = threading.Event()
         self._process: RttProcess | None = None
         self._socket: socket.socket | None = None
         self._log_file: TextIO | None = None
         self._workers: list[threading.Thread] = []
-        self._started = False
+        self._state = "new"
+        self._cleanup_emitted = False
 
     def start(self) -> None:
         """Start OpenOCD and return while background workers establish RTT."""
 
-        with self._lock:
-            if self._started:
+        with self._lifecycle:
+            if self._state == "stopped":
+                raise RuntimeError("RTT session has been stopped and cannot be started.")
+            if self._state != "new":
                 raise RuntimeError("RTT session has already been started.")
-            self._started = True
+            self._state = "running"
             self.log_path.parent.mkdir(parents=True, exist_ok=True)
             self._log_file = self.log_path.open("w", encoding="utf-8", newline="")
             try:
@@ -136,6 +143,8 @@ class RttSession:
             except OSError as exc:
                 self._emit("error", message=f"Unable to start OpenOCD: {exc}")
                 self._close_log()
+                self._state = "stopped"
+                self._lifecycle.notify_all()
                 return
 
             if self._process.stdout is not None:
@@ -147,18 +156,46 @@ class RttSession:
     def stop(self) -> None:
         """Close RTT resources and give OpenOCD a bounded graceful shutdown."""
 
+        with self._lifecycle:
+            if self._state == "stopped":
+                return
+            if self._state == "stopping":
+                while self._state == "stopping":
+                    self._lifecycle.wait()
+                return
+            self._state = "stopping"
+
         self._stop_requested.set()
-        self._close_socket()
-        self._close_log()
-        process = self._process
-        if process is not None and process.poll() is None:
-            process.terminate()
-            deadline = self._monotonic() + self._stop_timeout
-            while process.poll() is None and self._monotonic() < deadline:
-                self._sleep(min(self._retry_interval, max(0.0, deadline - self._monotonic())))
-            if process.poll() is None:
-                process.kill()
-        self._join_workers(timeout=self._stop_timeout)
+        forced = False
+        joined = False
+        try:
+            self._close_socket()
+            self._close_log()
+            process = self._process
+            if process is not None and self._process_running(process):
+                try:
+                    process.terminate()
+                except OSError:
+                    pass
+                if self._wait_for_process_exit(process):
+                    pass
+                else:
+                    forced = True
+                    try:
+                        process.kill()
+                    except OSError:
+                        pass
+                    finally:
+                        self._reap_process(process)
+            joined = self._join_workers(timeout=self._stop_timeout)
+            if not joined:
+                self._emit("error", message="RTT worker threads did not finish during cleanup.")
+        finally:
+            outcome = "forced" if forced else "clean"
+            self._emit_cleanup(outcome, joined)
+            with self._lifecycle:
+                self._state = "stopped"
+                self._lifecycle.notify_all()
 
     def wait(self, timeout: float | None = None) -> bool:
         """Wait for started worker threads to finish, returning whether they did."""
@@ -239,22 +276,44 @@ class RttSession:
 
     def _process_exited(self) -> bool:
         process = self._process
-        return process is None or process.poll() is not None
+        return process is None or not self._process_running(process)
+
+    @staticmethod
+    def _process_running(process: RttProcess) -> bool:
+        try:
+            return process.poll() is None
+        except OSError:
+            return False
+
+    def _wait_for_process_exit(self, process: RttProcess) -> bool:
+        deadline = self._monotonic() + self._stop_timeout
+        while self._process_running(process) and self._monotonic() < deadline:
+            self._sleep(min(self._retry_interval, max(0.0, deadline - self._monotonic())))
+        return not self._process_running(process)
+
+    def _reap_process(self, process: RttProcess) -> None:
+        try:
+            process.wait(timeout=self._stop_timeout)
+        except (OSError, subprocess.TimeoutExpired, TimeoutError):
+            pass
 
     def _start_worker(self, name: str, target: Callable[..., None], *args: object) -> None:
         worker = threading.Thread(name=name, target=target, args=args, daemon=True)
-        self._workers.append(worker)
+        with self._lock:
+            self._workers.append(worker)
         worker.start()
 
     def _join_workers(self, timeout: float | None) -> bool:
-        deadline = None if timeout is None else time.monotonic() + timeout
+        deadline = None if timeout is None else self._monotonic() + timeout
         current = threading.current_thread()
-        for worker in tuple(self._workers):
+        with self._lock:
+            workers = tuple(self._workers)
+        for worker in workers:
             if worker is current:
                 continue
-            remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
+            remaining = None if deadline is None else max(0.0, deadline - self._monotonic())
             worker.join(remaining)
-        return all(not worker.is_alive() or worker is current for worker in self._workers)
+        return all(not worker.is_alive() or worker is current for worker in workers)
 
     def _close_socket(self, expected: socket.socket | None = None) -> None:
         with self._lock:
@@ -262,6 +321,10 @@ class RttSession:
             if connection is None or (expected is not None and connection is not expected):
                 return
             self._socket = None
+        try:
+            connection.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
         try:
             connection.close()
         except OSError:
@@ -274,5 +337,15 @@ class RttSession:
         if log_file is not None:
             log_file.close()
 
-    def _emit(self, kind: str, *, text: str = "", message: str = "", stream: str = "") -> None:
-        self.events.put(RttEvent(kind=kind, text=text, message=message, stream=stream))
+    def _emit_cleanup(self, outcome: str, joined: bool) -> None:
+        with self._lifecycle:
+            if self._cleanup_emitted:
+                return
+            self._cleanup_emitted = True
+        message = "RTT session stopped cleanly." if outcome == "clean" else "RTT session was forcefully terminated."
+        if not joined:
+            message = f"{message} Worker cleanup is incomplete."
+        self._emit("stopped", message=message, outcome=outcome)
+
+    def _emit(self, kind: str, *, text: str = "", message: str = "", stream: str = "", outcome: str = "") -> None:
+        self.events.put(RttEvent(kind=kind, text=text, message=message, stream=stream, outcome=outcome))

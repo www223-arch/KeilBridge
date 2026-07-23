@@ -175,6 +175,8 @@ class RttSession:
                 while self._state == "stopping":
                     self._lifecycle.wait()
                 return
+            if self._state == "cleanup_incomplete":
+                self._cleanup_emitted = False
             self._state = "stopping"
 
         self._stop_requested.set()
@@ -216,7 +218,7 @@ class RttSession:
             outcome = "incomplete" if incomplete else "forced" if forced else "clean"
             self._emit_terminal(outcome)
             with self._lifecycle:
-                self._state = "stopped"
+                self._state = "cleanup_incomplete" if incomplete else "stopped"
                 self._lifecycle.notify_all()
 
     def wait(self, timeout: float | None = None) -> bool:
@@ -360,10 +362,10 @@ class RttSession:
     def _close_log(self) -> bool:
         with self._lock:
             log_file = self._log_file
-            self._log_file = None
         if log_file is None:
             return True
         closed = True
+        close_succeeded = False
         try:
             log_file.flush()
         except Exception as exc:
@@ -371,16 +373,21 @@ class RttSession:
             self._emit("error", message=f"RTT log flush during cleanup failed: {exc}")
         try:
             log_file.close()
+            close_succeeded = True
         except Exception as exc:
             closed = False
             self._emit("error", message=f"RTT log close during cleanup failed: {exc}")
+        if close_succeeded:
+            with self._lock:
+                if self._log_file is log_file:
+                    self._log_file = None
         return closed
 
     def _finish_startup_failure(self, message: str) -> None:
         self._emit("error", message=message)
         outcome = "startup_failed" if self._close_log() else "incomplete"
         self._emit_terminal(outcome)
-        self._state = "stopped"
+        self._state = "cleanup_incomplete" if outcome == "incomplete" else "stopped"
         self._lifecycle.notify_all()
 
     def _emit_terminal(self, outcome: str) -> None:

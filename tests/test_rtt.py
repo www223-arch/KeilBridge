@@ -502,6 +502,32 @@ def test_stop_reports_join_failure_and_emits_one_cleanup_event(tmp_path):
     assert session.wait(timeout=1)
 
 
+def test_incomplete_cleanup_can_be_retried_until_complete(tmp_path):
+    process = FakeProcess(stdout_lines=("rtt: Found control block at 0x20000000\n",))
+    connection = UnresponsiveSocket()
+    session = RttSession(
+        CONFIG,
+        RttRequest(scan_address=0x20000000, scan_size=0x10000),
+        tmp_path / "rtt.log",
+        popen_factory=lambda *args, **kwargs: process,
+        socket_factory=lambda *args, **kwargs: connection,
+        stop_timeout=0.01,
+    )
+    session.start()
+    _next_event(session, "connected")
+    assert connection.recv_entered.wait(timeout=1)
+
+    session.stop()
+    first = [event for event in _drain_events(session) if event.kind == "stopped"]
+    connection.release.set()
+    assert session.wait(timeout=1)
+    session.stop()
+    second = [event for event in _drain_events(session) if event.kind == "stopped"]
+
+    assert [event.outcome for event in first] == ["incomplete"]
+    assert [event.outcome for event in second] == ["clean"]
+
+
 def test_stop_reports_unreaped_forced_kill_as_incomplete(tmp_path):
     clock = FakeClock()
     process = UnreapedKillProcess()
@@ -537,6 +563,16 @@ class FailingLog:
 
     def close(self) -> None:
         raise OSError("log close failed")
+
+
+class FlakyCloseLog(FailingLog):
+    def __init__(self) -> None:
+        self.close_calls = 0
+
+    def close(self) -> None:
+        self.close_calls += 1
+        if self.close_calls == 1:
+            raise OSError("log close failed")
 
 
 def test_start_reports_log_directory_failure_without_launching_openocd(tmp_path):
@@ -590,7 +626,7 @@ def test_start_reports_log_open_failure_without_launching_openocd(tmp_path):
     assert _drain_events(session) == []
 
 
-def test_start_reports_popen_and_log_close_failures_with_one_incomplete_event(tmp_path):
+def test_start_reports_one_incomplete_terminal_per_cleanup_attempt(tmp_path):
     log = FailingLog()
     launches: list[object] = []
 
@@ -616,7 +652,34 @@ def test_start_reports_popen_and_log_close_failures_with_one_incomplete_event(tm
     assert len(stopped) == 1
     assert stopped[0].outcome == "incomplete"
     session.stop()
-    assert _drain_events(session) == []
+    retry_events = _drain_events(session)
+    retry_stopped = [event for event in retry_events if event.kind == "stopped"]
+    assert any(event.kind == "error" and "log close" in event.message.lower() for event in retry_events)
+    assert [event.outcome for event in retry_stopped] == ["incomplete"]
+
+
+def test_incomplete_startup_cleanup_can_be_retried_until_complete(tmp_path):
+    log = FlakyCloseLog()
+
+    def fail_to_launch(*args, **kwargs):
+        raise OSError("OpenOCD launch failed")
+
+    session = RttSession(
+        CONFIG,
+        RttRequest(scan_address=0x20000000, scan_size=0x10000),
+        tmp_path / "rtt.log",
+        popen_factory=fail_to_launch,
+        log_factory=lambda path: log,
+    )
+
+    session.start()
+    first = [event for event in _drain_events(session) if event.kind == "stopped"]
+    session.stop()
+    second = [event for event in _drain_events(session) if event.kind == "stopped"]
+
+    assert [event.outcome for event in first] == ["incomplete"]
+    assert [event.outcome for event in second] == ["clean"]
+    assert log.close_calls == 2
 
 
 def test_stop_reports_log_close_error_and_continues_cleanup(tmp_path):

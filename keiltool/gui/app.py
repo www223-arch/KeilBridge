@@ -10,7 +10,7 @@ import threading
 import time
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
-from typing import Callable
+from typing import Callable, cast
 
 from keiltool.core.openocd_backend import (
     ConnectionResult,
@@ -21,14 +21,23 @@ from keiltool.core.openocd_backend import (
 )
 from keiltool.core.rtt import RttEvent, RttSession
 from keiltool.gui.project_config import (
-    LoadedProjectTargets,
     ProjectTargetFacts,
     load_project_targets,
-    resolve_target_facts,
 )
 from keiltool.gui.settings import GuiSettings, SettingsStore
 from keiltool.gui.state import BusySessionError, SessionState, TaskGate
 from keiltool.gui.widgets import ConfigurationPane, OutputNotebook
+from keiltool.gui.workbench_controller import (
+    FactInputs,
+    FreshnessController,
+    LifecycleAction,
+    RttLifecycleController,
+    RttPhase,
+    SaveFailureAction,
+    VerifiedSnapshot,
+    resolve_verified_snapshot,
+    save_failure_action,
+)
 from keiltool.gui.workbench_model import (
     RttLogPaths,
     TargetFactsDisplay,
@@ -76,8 +85,9 @@ class KeilToolGui:
         self.root = root
         self.settings_store = settings_store or SettingsStore()
         self.gate = TaskGate()
+        self._freshness = FreshnessController()
+        self._rtt_lifecycle = RttLifecycleController()
         self._events: queue.Queue[_UiEvent] = queue.Queue()
-        self._loaded_project: LoadedProjectTargets | None = None
         self._facts: ProjectTargetFacts | None = None
         self._rtt_session: RttSession | None = None
         self._rtt_log_paths: RttLogPaths | None = None
@@ -86,7 +96,6 @@ class KeilToolGui:
         self._rtt_lines = 0
         self._closing = False
         self._destroyed = False
-        self._stop_requested = False
 
         settings = self.settings_store.load()
         self._create_variables(settings)
@@ -181,9 +190,34 @@ class KeilToolGui:
         controls.manual_radio.configure(command=self._refresh_controls)
         controls.target_combo.bind("<<ComboboxSelected>>", lambda _event: self._resolve_selected_target())
         self.firmware_var.trace_add("write", lambda *_args: self._refresh_controls())
+        for variable in (
+            self.project_var,
+            self.target_var,
+            self.openocd_var,
+            self.scripts_var,
+            self.target_override_var,
+        ):
+            variable.trace_add("write", self._on_fact_input_changed)
+        controls.project_entry.bind("<FocusOut>", lambda _event: self._load_project(Path(self.project_var.get().strip())))
+        controls.project_entry.bind("<Return>", lambda _event: self._load_project(Path(self.project_var.get().strip())))
         for entry in (controls.openocd_entry, controls.scripts_entry, controls.override_entry):
             entry.bind("<FocusOut>", lambda _event: self._resolve_selected_target())
             entry.bind("<Return>", lambda _event: self._resolve_selected_target())
+
+    def _visible_fact_inputs(self) -> FactInputs:
+        return FactInputs(
+            project=self.project_var.get().strip(),
+            target=self.target_var.get().strip(),
+            openocd=self.openocd_var.get().strip(),
+            scripts=self.scripts_var.get().strip(),
+            target_override=self.target_override_var.get().strip(),
+        )
+
+    def _on_fact_input_changed(self, *_args: object) -> None:
+        if self._freshness.observe(self._visible_fact_inputs()):
+            self._facts = None
+            self._clear_facts("配置已更改，请重新解析")
+            self._refresh_controls()
 
     def _choose_project(self) -> None:
         path = filedialog.askopenfilename(
@@ -236,13 +270,12 @@ class KeilToolGui:
             self._resolve_selected_target()
 
     def _load_project(self, path: Path, *, restored: bool = False) -> None:
-        if self.gate.state in _BUSY_STATES:
+        if self._hardware_busy():
             self._show_busy()
             return
         try:
             loaded = load_project_targets(path)
         except Exception as exc:
-            self._loaded_project = None
             self._facts = None
             self.controls.target_combo.configure(values=())
             self._clear_facts(f"工程读取失败: {exc}")
@@ -252,7 +285,6 @@ class KeilToolGui:
             self._refresh_controls()
             return
 
-        self._loaded_project = loaded
         names = tuple(target.name for target in loaded.targets)
         self.controls.target_combo.configure(values=names)
         requested = self.target_var.get()
@@ -265,45 +297,42 @@ class KeilToolGui:
         self._resolve_selected_target()
 
     def _resolve_selected_target(self) -> None:
-        loaded = self._loaded_project
-        if loaded is None or self.gate.state in _BUSY_STATES:
-            return
-        target = self._selected_target()
-        if target is None:
-            self._facts = None
-            self._clear_facts("请选择 Target")
-            self._refresh_controls()
+        if self._hardware_busy():
             return
         try:
-            facts = resolve_target_facts(
-                target,
-                loaded.project_root,
-                openocd_path=self.openocd_var.get().strip(),
-                scripts_dir=self.scripts_var.get().strip(),
-                target_override=self.target_override_var.get().strip(),
-            )
+            self._obtain_fresh_snapshot()
         except Exception as exc:
             self._facts = None
+            self._freshness.observe(self._visible_fact_inputs())
             self._clear_facts(f"Target 解析失败: {exc}")
             self._refresh_controls()
             return
-
-        self._facts = facts
-        self._apply_facts_display(target_facts_display(facts))
-        if not self.openocd_var.get().strip() and facts.openocd_executable:
-            self.openocd_var.set(facts.openocd_executable)
-        if not self.scripts_var.get().strip() and facts.openocd_scripts:
-            self.scripts_var.set(facts.openocd_scripts)
-        if not self.logs_dir_var.get().strip():
-            self.logs_dir_var.set(facts.default_log_dir)
         self._refresh_controls()
 
-    def _selected_target(self):
-        loaded = self._loaded_project
-        if loaded is None:
-            return None
-        selected = self.target_var.get()
-        return next((target for target in loaded.targets if target.name == selected), None)
+    def _obtain_fresh_snapshot(self) -> VerifiedSnapshot:
+        visible = self._visible_fact_inputs()
+        self._freshness.observe(visible)
+        snapshot = resolve_verified_snapshot(visible)
+        facts = cast(ProjectTargetFacts, snapshot.facts)
+        if not visible.openocd and facts.openocd_executable:
+            self.openocd_var.set(facts.openocd_executable)
+        if not visible.scripts and facts.openocd_scripts:
+            self.scripts_var.set(facts.openocd_scripts)
+
+        current = self._visible_fact_inputs()
+        snapshot = VerifiedSnapshot(
+            key=current,
+            loaded_project=snapshot.loaded_project,
+            target=snapshot.target,
+            facts=facts,
+        )
+        self._freshness.observe(current)
+        self._freshness.accept(snapshot)
+        self._facts = facts
+        self._apply_facts_display(target_facts_display(facts))
+        if not self.logs_dir_var.get().strip():
+            self.logs_dir_var.set(facts.default_log_dir)
+        return snapshot
 
     def _clear_facts(self, reason: str) -> None:
         self._apply_facts_display(target_facts_display(None, empty_reason=reason))
@@ -315,15 +344,15 @@ class KeilToolGui:
         self.target_cfg_var.set(display.target_cfg)
         self.resolution_var.set(display.resolution)
 
-    def _build_openocd_config(self) -> OpenOcdConfig:
-        facts = self._facts
-        if not is_target_ready(facts) or facts is None:
+    @staticmethod
+    def _build_openocd_config(snapshot: VerifiedSnapshot) -> OpenOcdConfig:
+        facts = cast(ProjectTargetFacts, snapshot.facts)
+        if not is_target_ready(facts):
             reason = facts.resolution_reason if facts else "请先选择并解析 Keil Target。"
             raise ValueError(reason)
-        scripts_text = self.scripts_var.get().strip()
         return OpenOcdConfig(
             executable=Path(facts.openocd_executable),
-            scripts_dir=Path(scripts_text) if scripts_text else None,
+            scripts_dir=Path(facts.openocd_scripts) if facts.openocd_scripts else None,
             interface_cfg=facts.interface_cfg,
             target_cfg=facts.target_cfg,
         )
@@ -339,14 +368,15 @@ class KeilToolGui:
 
     def _check_connection(self) -> None:
         try:
-            config = self._build_openocd_config()
+            snapshot = self._obtain_fresh_snapshot()
+            config = self._build_openocd_config(snapshot)
             log_dir = self._log_dir()
-            target = self._selected_target()
+            target = snapshot.target
             self.gate.begin(SessionState.CONNECT)
         except BusySessionError:
             self._show_busy()
             return
-        except (OSError, ValueError) as exc:
+        except Exception as exc:
             messagebox.showerror("无法检查连接", str(exc), parent=self.root)
             return
         self._set_status()
@@ -358,15 +388,16 @@ class KeilToolGui:
 
     def _flash(self) -> None:
         try:
-            config = self._build_openocd_config()
+            snapshot = self._obtain_fresh_snapshot()
+            config = self._build_openocd_config(snapshot)
             request = build_flash_request(self.firmware_var.get().strip(), self.bin_address_var.get().strip())
             log_dir = self._log_dir()
-            target = self._selected_target()
-        except (OSError, ValueError) as exc:
+            target = snapshot.target
+        except Exception as exc:
             messagebox.showerror("无法烧录", str(exc), parent=self.root)
             return
 
-        facts = self._facts
+        facts = cast(ProjectTargetFacts, snapshot.facts)
         address_line = (
             f"\nBIN 地址: 0x{request.base_address:08X}"
             if request.firmware.suffix.lower() == ".bin"
@@ -401,13 +432,14 @@ class KeilToolGui:
 
     def _start_rtt(self) -> None:
         try:
-            config = self._build_openocd_config()
-            facts = self._facts
+            snapshot = self._obtain_fresh_snapshot()
+            config = self._build_openocd_config(snapshot)
+            facts = cast(ProjectTargetFacts, snapshot.facts)
             request = build_rtt_request(
                 manual=self.rtt_manual_var.get(),
                 address=self.rtt_address_var.get().strip(),
-                ram_origin=facts.ram_origin if facts else None,
-                ram_size=facts.ram_size if facts else None,
+                ram_origin=facts.ram_origin,
+                ram_size=facts.ram_size,
                 port=self.rtt_port_var.get().strip(),
                 channel=self.rtt_channel_var.get().strip(),
             )
@@ -427,10 +459,15 @@ class KeilToolGui:
                 connect_timeout=timeout_ms / 1000.0,
             )
             self.gate.begin(SessionState.RTT_SCAN)
+            try:
+                self._rtt_lifecycle.begin_start(session)
+            except Exception:
+                self.gate.finish()
+                raise
         except BusySessionError:
             self._show_busy()
             return
-        except (OSError, ValueError) as exc:
+        except Exception as exc:
             messagebox.showerror("无法启动 RTT", str(exc), parent=self.root)
             return
 
@@ -439,7 +476,6 @@ class KeilToolGui:
         self._rtt_started_at = None
         self._rtt_bytes = 0
         self._rtt_lines = 0
-        self._stop_requested = False
         self.elapsed_var.set("00:00:00")
         self.counts_var.set("0 字节 / 0 行")
         self._append_openocd(
@@ -451,29 +487,42 @@ class KeilToolGui:
         )
         self._set_status()
         self._refresh_controls()
-        self._start_worker("rtt-started", session.start)
+        self._start_worker("rtt-start-settled", session.start, owner=session)
 
     def _stop_rtt(self) -> None:
         session = self._rtt_session
-        if session is None or self.gate.state not in {SessionState.RTT_SCAN, SessionState.RTT}:
+        if session is None:
             return
-        try:
+        action = self._rtt_lifecycle.request_stop()
+        if action is LifecycleAction.STOP_SESSION:
+            self._dispatch_rtt_stop(session)
+        elif self._rtt_lifecycle.phase is RttPhase.STOP_PENDING:
+            self.status_var.set("RTT 启动完成后停止")
+            self._refresh_controls()
+
+    def _dispatch_rtt_stop(self, session: RttSession) -> None:
+        if session is not self._rtt_session:
+            return
+        if self.gate.state in {SessionState.RTT_SCAN, SessionState.RTT}:
             self.gate.begin_stopping()
-        except BusySessionError:
-            return
-        self._stop_requested = True
         self._set_status()
         self._refresh_controls()
-        self._start_worker("rtt-stop-returned", session.stop)
+        self._start_worker("rtt-stop-settled", session.stop, owner=session)
 
-    def _start_worker(self, success_kind: str, action: Callable[[], object]) -> None:
+    def _start_worker(
+        self,
+        success_kind: str,
+        action: Callable[[], object],
+        *,
+        owner: object | None = None,
+    ) -> None:
         def run() -> None:
             try:
                 value = action()
             except BaseException as exc:
-                self._events.put(_UiEvent("worker-error", (success_kind, exc)))
+                self._events.put(_UiEvent("worker-error", (success_kind, exc, owner)))
             else:
-                self._events.put(_UiEvent(success_kind, value))
+                self._events.put(_UiEvent(success_kind, (owner, value) if owner is not None else value))
 
         threading.Thread(target=run, name=f"keiltool-gui-{success_kind}", daemon=True).start()
 
@@ -504,14 +553,20 @@ class KeilToolGui:
         elif event.kind == "flash-result":
             self._finish_flash(event.value)
         elif event.kind == "worker-error":
-            operation, error = event.value
-            self._handle_worker_error(operation, error)
-        elif event.kind in {"rtt-started", "rtt-stop-returned"}:
+            operation, error, owner = event.value
+            self._handle_worker_error(operation, error, owner)
+        elif event.kind == "rtt-start-settled":
+            session, _value = event.value
+            action = self._rtt_lifecycle.start_settled(session)
+            if action is LifecycleAction.STOP_SESSION:
+                self._dispatch_rtt_stop(cast(RttSession, session))
+            self._finish_close_if_ready()
+        elif event.kind == "rtt-stop-settled":
             self._finish_close_if_ready()
 
     def _finish_connection(self, value: object) -> None:
         if not isinstance(value, ConnectionResult):
-            self._handle_worker_error("connection-result", RuntimeError("连接检查返回了无效结果。"))
+            self._handle_worker_error("connection-result", RuntimeError("连接检查返回了无效结果。"), None)
             return
         self._render_openocd_result("连接检查", value)
         if value.success:
@@ -529,7 +584,7 @@ class KeilToolGui:
 
     def _finish_flash(self, value: object) -> None:
         if not isinstance(value, FlashResult):
-            self._handle_worker_error("flash-result", RuntimeError("烧录返回了无效结果。"))
+            self._handle_worker_error("flash-result", RuntimeError("烧录返回了无效结果。"), None)
             return
         self._render_openocd_result("烧录并校验", value)
         if value.success:
@@ -545,15 +600,14 @@ class KeilToolGui:
         self._refresh_controls()
         self._finish_close_if_ready()
 
-    def _handle_worker_error(self, operation: object, error: object) -> None:
+    def _handle_worker_error(self, operation: object, error: object, owner: object | None) -> None:
         message = str(error)
         self._append_openocd(f"\n[后台任务失败] {operation}: {message}\n")
-        if str(operation).startswith("rtt"):
-            if self._rtt_session is not None and self.gate.state in {SessionState.RTT_SCAN, SessionState.RTT}:
-                self._stop_rtt()
-            elif self.gate.state is SessionState.STOPPING:
-                self.gate.fail()
-                self._rtt_session = None
+        if str(operation).startswith("rtt") and owner is not None:
+            operation_name = "start" if operation == "rtt-start-settled" else "stop"
+            action = self._rtt_lifecycle.worker_failed(owner, operation_name)
+            if action is LifecycleAction.STOP_SESSION:
+                self._dispatch_rtt_stop(cast(RttSession, owner))
         else:
             self.gate.fail()
         self.status_var.set(f"失败: {message}")
@@ -582,22 +636,34 @@ class KeilToolGui:
         elif event.kind in {"error", "eof"}:
             self._append_openocd(f"[RTT] {event.message}\n")
             self.status_var.set(f"RTT 异常: {event.message}")
-            if self.gate.state in {SessionState.RTT_SCAN, SessionState.RTT}:
-                self._stop_rtt()
+            self.root.after_idle(self._stop_rtt)
         elif event.kind == "stopped":
+            session = self._rtt_session
+            if session is None:
+                return
             self._append_openocd(f"[RTT] {event.message} ({event.outcome})\n\n")
-            if event.outcome == "incomplete":
-                self.gate.fail()
-                self.status_var.set("RTT 清理不完整")
-            elif event.outcome == "startup_failed":
-                self.gate.fail()
-                self.status_var.set("RTT 启动失败")
+            action = self._rtt_lifecycle.terminal(session, event.outcome)
+            if self._rtt_lifecycle.phase is RttPhase.INCOMPLETE:
+                if self.gate.state in {SessionState.RTT_SCAN, SessionState.RTT}:
+                    self.gate.begin_stopping()
+                self.status_var.set("RTT 清理不完整，请点击“停止采集”重试")
+                messagebox.showerror(
+                    "RTT 清理不完整",
+                    "OpenOCD 或 RTT 工作线程尚未完全退出。硬件操作和关闭已阻止，请点击“停止采集”重试清理。",
+                    parent=self.root,
+                )
+            elif action is LifecycleAction.RELEASE_SESSION:
+                if event.outcome == "startup_failed":
+                    self.gate.fail()
+                    self.status_var.set("RTT 启动失败")
+                else:
+                    self.gate.finish()
+                    self.status_var.set("RTT 已停止")
+                self._rtt_session = None
+                self._rtt_log_paths = None
             else:
-                self.gate.finish()
-                self.status_var.set("RTT 已停止")
-            self._rtt_session = None
+                return
             self._rtt_started_at = None
-            self._stop_requested = False
             self._refresh_controls()
             self._finish_close_if_ready()
 
@@ -649,7 +715,7 @@ class KeilToolGui:
         )
 
     def _refresh_controls(self) -> None:
-        busy = self.gate.state in _BUSY_STATES
+        busy = self._hardware_busy()
         controls = self.controls
         for widget, idle_state in controls.editable_widgets:
             state = "disabled" if busy else idle_state
@@ -664,7 +730,7 @@ class KeilToolGui:
             state="normal" if not busy and self.rtt_manual_var.get() else "disabled"
         )
 
-        ready = is_target_ready(self._facts)
+        ready = self._freshness.is_current(self._visible_fact_inputs()) and is_target_ready(self._facts)
         idle = not busy
         controls.connect_button.configure(state="normal" if idle and ready else "disabled")
         controls.flash_button.configure(
@@ -676,8 +742,15 @@ class KeilToolGui:
             state="normal" if idle and ready and rtt_fields_ready else "disabled"
         )
         controls.rtt_stop_button.configure(
-            state="normal" if self.gate.state in {SessionState.RTT_SCAN, SessionState.RTT} else "disabled"
+            state=(
+                "normal"
+                if self._rtt_lifecycle.phase in {RttPhase.STARTING, RttPhase.RUNNING, RttPhase.INCOMPLETE}
+                else "disabled"
+            )
         )
+
+    def _hardware_busy(self) -> bool:
+        return self.gate.state in _BUSY_STATES or self._rtt_lifecycle.owns_session
 
     def _set_status(self) -> None:
         self.status_var.set(_STATE_TEXT[self.gate.state])
@@ -712,8 +785,10 @@ class KeilToolGui:
 
     def _on_close(self) -> None:
         if self._closing:
+            if self._rtt_lifecycle.phase is RttPhase.INCOMPLETE:
+                self._stop_rtt()
             return
-        if self.gate.state in _BUSY_STATES:
+        if self._hardware_busy():
             confirmed = messagebox.askyesno(
                 "关闭 KeilTool",
                 "当前有硬件任务正在运行。停止或等待任务完成后关闭？",
@@ -724,24 +799,47 @@ class KeilToolGui:
             self._closing = True
             self.status_var.set("正在安全关闭")
             self._refresh_controls()
-            if self.gate.state in {SessionState.RTT_SCAN, SessionState.RTT}:
-                self._stop_rtt()
+            action = self._rtt_lifecycle.request_close()
+            if action is LifecycleAction.STOP_SESSION and self._rtt_session is not None:
+                self._dispatch_rtt_stop(self._rtt_session)
             return
         self._closing = True
-        self._destroy()
+        self._rtt_lifecycle.request_close()
+        self._finish_close_if_ready()
 
     def _finish_close_if_ready(self) -> None:
-        if self._closing and self.gate.state not in _BUSY_STATES and self._rtt_session is None:
+        if self._closing and self.gate.state not in _BUSY_STATES and self._rtt_lifecycle.can_destroy:
             self._destroy()
 
     def _destroy(self) -> None:
         if self._destroyed:
             return
-        try:
-            self.settings_store.save(self._current_settings())
-        except OSError as exc:
-            if not self._closing:
-                messagebox.showerror("设置保存失败", str(exc), parent=self.root)
+        if self._hardware_busy() or not self._rtt_lifecycle.can_destroy:
+            self.status_var.set("仍有硬件资源未释放，无法关闭")
+            return
+        while True:
+            try:
+                self.settings_store.save(self._current_settings())
+                break
+            except OSError as exc:
+                answer = messagebox.askyesnocancel(
+                    "设置保存失败",
+                    (
+                        f"无法保存 GUI 设置:\n{exc}\n\n"
+                        "选择“是”重试，选择“否”放弃保存并关闭，选择“取消”返回工作台。"
+                    ),
+                    parent=self.root,
+                )
+                decision = save_failure_action(answer)
+                if decision is SaveFailureAction.RETRY:
+                    continue
+                if decision is SaveFailureAction.STAY_OPEN:
+                    self._closing = False
+                    self._rtt_lifecycle.cancel_close()
+                    self.status_var.set("设置未保存，已取消关闭")
+                    self._refresh_controls()
+                    return
+                break
         self._destroyed = True
         self.root.destroy()
 

@@ -539,6 +539,86 @@ class FailingLog:
         raise OSError("log close failed")
 
 
+def test_start_reports_log_directory_failure_without_launching_openocd(tmp_path):
+    blocked_parent = tmp_path / "not-a-directory"
+    blocked_parent.write_text("blocked", encoding="utf-8")
+    launches: list[object] = []
+    session = RttSession(
+        CONFIG,
+        RttRequest(scan_address=0x20000000, scan_size=0x10000),
+        blocked_parent / "rtt.log",
+        popen_factory=lambda *args, **kwargs: launches.append(args),
+    )
+
+    session.start()
+
+    events = _drain_events(session)
+    stopped = [event for event in events if event.kind == "stopped"]
+    assert launches == []
+    assert any(event.kind == "error" and "directory" in event.message.lower() for event in events)
+    assert len(stopped) == 1
+    assert stopped[0].outcome == "startup_failed"
+    session.stop()
+    assert _drain_events(session) == []
+    with pytest.raises(RuntimeError, match="stopped"):
+        session.start()
+
+
+def test_start_reports_log_open_failure_without_launching_openocd(tmp_path):
+    launches: list[object] = []
+
+    def fail_to_open(path: Path):
+        raise OSError("log open failed")
+
+    session = RttSession(
+        CONFIG,
+        RttRequest(scan_address=0x20000000, scan_size=0x10000),
+        tmp_path / "rtt.log",
+        popen_factory=lambda *args, **kwargs: launches.append(args),
+        log_factory=fail_to_open,
+    )
+
+    session.start()
+
+    events = _drain_events(session)
+    stopped = [event for event in events if event.kind == "stopped"]
+    assert launches == []
+    assert any(event.kind == "error" and "open" in event.message.lower() for event in events)
+    assert len(stopped) == 1
+    assert stopped[0].outcome == "startup_failed"
+    session.stop()
+    assert _drain_events(session) == []
+
+
+def test_start_reports_popen_and_log_close_failures_with_one_incomplete_event(tmp_path):
+    log = FailingLog()
+    launches: list[object] = []
+
+    def fail_to_launch(*args, **kwargs):
+        launches.append(args)
+        raise OSError("OpenOCD launch failed")
+
+    session = RttSession(
+        CONFIG,
+        RttRequest(scan_address=0x20000000, scan_size=0x10000),
+        tmp_path / "rtt.log",
+        popen_factory=fail_to_launch,
+        log_factory=lambda path: log,
+    )
+
+    session.start()
+
+    events = _drain_events(session)
+    stopped = [event for event in events if event.kind == "stopped"]
+    assert len(launches) == 1
+    assert any(event.kind == "error" and "openocd" in event.message.lower() for event in events)
+    assert any(event.kind == "error" and "log close" in event.message.lower() for event in events)
+    assert len(stopped) == 1
+    assert stopped[0].outcome == "incomplete"
+    session.stop()
+    assert _drain_events(session) == []
+
+
 def test_stop_reports_log_close_error_and_continues_cleanup(tmp_path):
     process = FakeProcess(stdout_lines=("rtt: Found control block at 0x20000000\n",))
     connection = BlockingSocket()

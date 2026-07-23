@@ -136,8 +136,16 @@ class RttSession:
             if self._state != "new":
                 raise RuntimeError("RTT session has already been started.")
             self._state = "running"
-            self.log_path.parent.mkdir(parents=True, exist_ok=True)
-            self._log_file = self._log_factory(self.log_path)
+            try:
+                self.log_path.parent.mkdir(parents=True, exist_ok=True)
+            except OSError as exc:
+                self._finish_startup_failure(f"Unable to create RTT log directory: {exc}")
+                return
+            try:
+                self._log_file = self._log_factory(self.log_path)
+            except OSError as exc:
+                self._finish_startup_failure(f"Unable to open RTT log: {exc}")
+                return
             try:
                 self._process = self._popen_factory(
                     self.command,
@@ -148,10 +156,7 @@ class RttSession:
                     errors="replace",
                 )
             except OSError as exc:
-                self._emit("error", message=f"Unable to start OpenOCD: {exc}")
-                self._close_log()
-                self._state = "stopped"
-                self._lifecycle.notify_all()
+                self._finish_startup_failure(f"Unable to start OpenOCD: {exc}")
                 return
 
             if self._process.stdout is not None:
@@ -209,7 +214,7 @@ class RttSession:
                 self._emit("error", message="RTT worker threads did not finish during cleanup.")
         finally:
             outcome = "incomplete" if incomplete else "forced" if forced else "clean"
-            self._emit_cleanup(outcome, joined)
+            self._emit_terminal(outcome)
             with self._lifecycle:
                 self._state = "stopped"
                 self._lifecycle.notify_all()
@@ -371,7 +376,14 @@ class RttSession:
             self._emit("error", message=f"RTT log close during cleanup failed: {exc}")
         return closed
 
-    def _emit_cleanup(self, outcome: str, joined: bool) -> None:
+    def _finish_startup_failure(self, message: str) -> None:
+        self._emit("error", message=message)
+        outcome = "startup_failed" if self._close_log() else "incomplete"
+        self._emit_terminal(outcome)
+        self._state = "stopped"
+        self._lifecycle.notify_all()
+
+    def _emit_terminal(self, outcome: str) -> None:
         with self._lifecycle:
             if self._cleanup_emitted:
                 return
@@ -380,6 +392,8 @@ class RttSession:
             message = "RTT session stopped cleanly."
         elif outcome == "forced":
             message = "RTT session was forcefully terminated."
+        elif outcome == "startup_failed":
+            message = "RTT session startup failed."
         else:
             message = "RTT session cleanup is incomplete."
         self._emit("stopped", message=message, outcome=outcome)

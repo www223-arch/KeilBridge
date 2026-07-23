@@ -71,6 +71,11 @@ class RttProcess(Protocol):
 
 PopenFactory = Callable[..., RttProcess]
 SocketFactory = Callable[..., socket.socket]
+LogFactory = Callable[[Path], TextIO]
+
+
+def _open_rtt_log(path: Path) -> TextIO:
+    return path.open("w", encoding="utf-8", newline="")
 
 
 class RttSession:
@@ -84,6 +89,7 @@ class RttSession:
         *,
         popen_factory: PopenFactory = subprocess.Popen,
         socket_factory: SocketFactory = socket.create_connection,
+        log_factory: LogFactory = _open_rtt_log,
         monotonic: Callable[[], float] = time.monotonic,
         sleep: Callable[[float], None] = time.sleep,
         connect_timeout: float = 10.0,
@@ -102,6 +108,7 @@ class RttSession:
         self.log_path = Path(log_path)
         self._popen_factory = popen_factory
         self._socket_factory = socket_factory
+        self._log_factory = log_factory
         self._monotonic = monotonic
         self._sleep = sleep
         self._connect_timeout = connect_timeout
@@ -130,7 +137,7 @@ class RttSession:
                 raise RuntimeError("RTT session has already been started.")
             self._state = "running"
             self.log_path.parent.mkdir(parents=True, exist_ok=True)
-            self._log_file = self.log_path.open("w", encoding="utf-8", newline="")
+            self._log_file = self._log_factory(self.log_path)
             try:
                 self._process = self._popen_factory(
                     self.command,
@@ -168,30 +175,40 @@ class RttSession:
         self._stop_requested.set()
         forced = False
         joined = False
+        incomplete = False
         try:
-            self._close_socket()
-            self._close_log()
+            try:
+                self._close_socket()
+            except Exception as exc:
+                incomplete = True
+                self._emit("error", message=f"RTT socket cleanup failed: {exc}")
+            if not self._close_log():
+                incomplete = True
             process = self._process
-            if process is not None and self._process_running(process):
-                try:
-                    process.terminate()
-                except OSError:
-                    pass
-                if self._wait_for_process_exit(process):
-                    pass
-                else:
-                    forced = True
+            try:
+                if process is not None and self._process_running(process):
                     try:
-                        process.kill()
+                        process.terminate()
                     except OSError:
                         pass
-                    finally:
-                        self._reap_process(process)
+                    if not self._wait_for_process_exit(process):
+                        forced = True
+                        try:
+                            process.kill()
+                        except OSError:
+                            pass
+                        finally:
+                            if not self._reap_process(process):
+                                incomplete = True
+            except Exception as exc:
+                incomplete = True
+                self._emit("error", message=f"OpenOCD process cleanup failed: {exc}")
             joined = self._join_workers(timeout=self._stop_timeout)
             if not joined:
+                incomplete = True
                 self._emit("error", message="RTT worker threads did not finish during cleanup.")
         finally:
-            outcome = "forced" if forced else "clean"
+            outcome = "incomplete" if incomplete else "forced" if forced else "clean"
             self._emit_cleanup(outcome, joined)
             with self._lifecycle:
                 self._state = "stopped"
@@ -270,8 +287,11 @@ class RttSession:
             return
         with self._lock:
             if self._log_file is not None:
-                self._log_file.write(text)
-                self._log_file.flush()
+                try:
+                    self._log_file.write(text)
+                    self._log_file.flush()
+                except Exception as exc:
+                    self._emit("error", message=f"RTT log write failed: {exc}")
         self._emit("data", text=text)
 
     def _process_exited(self) -> bool:
@@ -291,11 +311,13 @@ class RttSession:
             self._sleep(min(self._retry_interval, max(0.0, deadline - self._monotonic())))
         return not self._process_running(process)
 
-    def _reap_process(self, process: RttProcess) -> None:
+    def _reap_process(self, process: RttProcess) -> bool:
         try:
             process.wait(timeout=self._stop_timeout)
-        except (OSError, subprocess.TimeoutExpired, TimeoutError):
-            pass
+        except (OSError, subprocess.TimeoutExpired, TimeoutError) as exc:
+            self._emit("error", message=f"OpenOCD could not be reaped after forced kill: {exc}")
+            return False
+        return True
 
     def _start_worker(self, name: str, target: Callable[..., None], *args: object) -> None:
         worker = threading.Thread(name=name, target=target, args=args, daemon=True)
@@ -330,21 +352,36 @@ class RttSession:
         except OSError:
             pass
 
-    def _close_log(self) -> None:
+    def _close_log(self) -> bool:
         with self._lock:
             log_file = self._log_file
             self._log_file = None
-        if log_file is not None:
+        if log_file is None:
+            return True
+        closed = True
+        try:
+            log_file.flush()
+        except Exception as exc:
+            closed = False
+            self._emit("error", message=f"RTT log flush during cleanup failed: {exc}")
+        try:
             log_file.close()
+        except Exception as exc:
+            closed = False
+            self._emit("error", message=f"RTT log close during cleanup failed: {exc}")
+        return closed
 
     def _emit_cleanup(self, outcome: str, joined: bool) -> None:
         with self._lifecycle:
             if self._cleanup_emitted:
                 return
             self._cleanup_emitted = True
-        message = "RTT session stopped cleanly." if outcome == "clean" else "RTT session was forcefully terminated."
-        if not joined:
-            message = f"{message} Worker cleanup is incomplete."
+        if outcome == "clean":
+            message = "RTT session stopped cleanly."
+        elif outcome == "forced":
+            message = "RTT session was forcefully terminated."
+        else:
+            message = "RTT session cleanup is incomplete."
         self._emit("stopped", message=message, outcome=outcome)
 
     def _emit(self, kind: str, *, text: str = "", message: str = "", stream: str = "", outcome: str = "") -> None:

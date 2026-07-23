@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 import queue
 import socket
+import subprocess
 import threading
 import time
 
@@ -276,16 +277,35 @@ class KillRaceProcess(FakeProcess):
         raise OSError("process exited during kill")
 
 
+class UnreapedKillProcess(FakeProcess):
+    def terminate(self) -> None:
+        self.terminated = True
+
+    def kill(self) -> None:
+        self.killed = True
+        self.returncode = -9
+
+    def wait(self, timeout: float | None = None) -> int:
+        self.wait_calls += 1
+        raise subprocess.TimeoutExpired("openocd", timeout)
+
+
 class RecordingSocket:
     def __init__(self, connection: socket.socket) -> None:
         self._connection = connection
         self.operations: list[str] = []
+        self.recv_entered = threading.Event()
+        self.recv_returned = threading.Event()
 
     def settimeout(self, value: float | None) -> None:
         self._connection.settimeout(value)
 
     def recv(self, size: int) -> bytes:
-        return self._connection.recv(size)
+        self.recv_entered.set()
+        try:
+            return self._connection.recv(size)
+        finally:
+            self.recv_returned.set()
 
     def shutdown(self, how: int) -> None:
         self.operations.append("shutdown")
@@ -340,10 +360,12 @@ def test_stop_shuts_down_real_blocking_socket_and_joins_worker(tmp_path):
 
     session.start()
     _next_event(session, "connected")
+    assert connections[0].recv_entered.wait(timeout=1)
     session.stop()
     server.join(timeout=1)
 
     assert connections[0].operations[:2] == ["shutdown", "close"]
+    assert connections[0].recv_returned.is_set()
     assert not server.is_alive()
     assert session.wait(timeout=0.2)
 
@@ -474,7 +496,72 @@ def test_stop_reports_join_failure_and_emits_one_cleanup_event(tmp_path):
     connection.release.set()
 
     assert any(event.kind == "error" and "worker" in event.message.lower() for event in events)
-    assert len([event for event in events if event.kind == "stopped"]) == 1
+    stopped = [event for event in events if event.kind == "stopped"]
+    assert len(stopped) == 1
+    assert stopped[0].outcome == "incomplete"
+    assert session.wait(timeout=1)
+
+
+def test_stop_reports_unreaped_forced_kill_as_incomplete(tmp_path):
+    clock = FakeClock()
+    process = UnreapedKillProcess()
+    session = RttSession(
+        CONFIG,
+        RttRequest(scan_address=0x20000000, scan_size=0x10000),
+        tmp_path / "rtt.log",
+        popen_factory=lambda *args, **kwargs: process,
+        monotonic=clock.monotonic,
+        sleep=clock.sleep,
+        stop_timeout=0.1,
+        retry_interval=0.05,
+    )
+    session.start()
+
+    session.stop()
+
+    events = _drain_events(session)
+    stopped = [event for event in events if event.kind == "stopped"]
+    assert process.killed is True
+    assert process.wait_calls == 1
+    assert any(event.kind == "error" and "reap" in event.message.lower() for event in events)
+    assert len(stopped) == 1
+    assert stopped[0].outcome == "incomplete"
+
+
+class FailingLog:
+    def write(self, text: str) -> int:
+        return len(text)
+
+    def flush(self) -> None:
+        pass
+
+    def close(self) -> None:
+        raise OSError("log close failed")
+
+
+def test_stop_reports_log_close_error_and_continues_cleanup(tmp_path):
+    process = FakeProcess(stdout_lines=("rtt: Found control block at 0x20000000\n",))
+    connection = BlockingSocket()
+    session = RttSession(
+        CONFIG,
+        RttRequest(scan_address=0x20000000, scan_size=0x10000),
+        tmp_path / "rtt.log",
+        popen_factory=lambda *args, **kwargs: process,
+        socket_factory=lambda *args, **kwargs: connection,
+        log_factory=lambda path: FailingLog(),
+    )
+    session.start()
+    _next_event(session, "connected")
+
+    session.stop()
+
+    events = _drain_events(session)
+    stopped = [event for event in events if event.kind == "stopped"]
+    assert connection.closed.is_set()
+    assert process.terminated is True
+    assert any(event.kind == "error" and "log" in event.message.lower() for event in events)
+    assert len(stopped) == 1
+    assert stopped[0].outcome == "incomplete"
     assert session.wait(timeout=1)
 
 

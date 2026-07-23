@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 import subprocess
-from time import strftime
 from typing import Protocol
 
 from .doctor import DoctorFinding, classify_openocd_log
@@ -93,14 +93,30 @@ def build_connection_command(config: OpenOcdConfig) -> list[str]:
 def build_flash_command(config: OpenOcdConfig, request: FlashRequest) -> list[str]:
     command = config.base_command()
     suffix = request.firmware.suffix.lower()
+    firmware = quote_tcl_word(request.firmware.resolve().as_posix())
     if suffix == ".hex":
-        program = f"program {request.firmware.resolve().as_posix()} verify reset exit"
+        program = f"program {firmware} verify reset exit"
     elif suffix == ".bin":
         base_address = parse_address(request.base_address)
-        program = f"program {request.firmware.resolve().as_posix()} 0x{base_address:08X} verify reset exit"
+        program = f"program {firmware} 0x{base_address:08X} verify reset exit"
     else:
         raise ValueError("Firmware must be a .hex or .bin file.")
     return [*command, "-c", program]
+
+
+def quote_tcl_word(value: str) -> str:
+    """Return a Tcl word that preserves a literal OpenOCD argument."""
+
+    if not any(character.isspace() or character in '\\\"$[]{};' for character in value):
+        return value
+    escaped = (
+        value.replace("\\", "\\\\")
+        .replace('"', '\\"')
+        .replace("$", "\\$")
+        .replace("[", "\\[")
+        .replace("]", "\\]")
+    )
+    return f'"{escaped}"'
 
 
 def run_connection_check(
@@ -182,7 +198,7 @@ def _run_with_logs(
     cwd: Path | None,
 ) -> tuple[subprocess.CompletedProcess[str], Path, Path]:
     log_dir.mkdir(parents=True, exist_ok=True)
-    stamp = strftime("%Y%m%d-%H%M%S")
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
     stdout_log = log_dir / f"{name}_{stamp}.out.log"
     stderr_log = log_dir / f"{name}_{stamp}.err.log"
     completed = runner(command, cwd=cwd, text=True, capture_output=True)

@@ -57,6 +57,16 @@ def test_build_bin_flash_command_includes_base_address(tmp_path):
     assert command[-1].endswith("full.bin 0x08004000 verify reset exit")
 
 
+def test_build_flash_command_quotes_tcl_metacharacters_in_firmware_path(tmp_path):
+    firmware = tmp_path / "firmware {release};$[slot one].hex"
+    request = FlashRequest(firmware)
+
+    command = build_flash_command(CONFIG, request)
+
+    path = firmware.resolve().as_posix()
+    assert command[-1] == f'program "{path.replace("$", "\\$").replace("[", "\\[").replace("]", "\\]")}" verify reset exit'
+
+
 def test_connection_check_does_not_reset_or_halt():
     command = build_connection_command(CONFIG)
 
@@ -106,6 +116,20 @@ def test_run_flash_fails_when_verify_evidence_is_missing(tmp_path):
 
     assert result.success is False
     assert result.returncode == 0
+
+
+def test_run_flash_uses_unique_log_paths_within_the_same_second(tmp_path):
+    firmware = tmp_path / "full.hex"
+    firmware.write_text(":00000001FF\n", encoding="utf-8")
+    runner = FakeRunner(returncode=0, stdout="Programming Finished\nVerified OK\n", stderr="")
+
+    first = run_flash(CONFIG, FlashRequest(firmware), tmp_path, runner=runner)
+    second = run_flash(CONFIG, FlashRequest(firmware), tmp_path, runner=runner)
+
+    assert first.stdout_log != second.stdout_log
+    assert first.stderr_log != second.stderr_log
+    assert first.stdout_log.exists()
+    assert second.stdout_log.exists()
 
 
 def test_run_connection_check_requires_target_and_core_evidence(tmp_path):

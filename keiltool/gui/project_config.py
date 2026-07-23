@@ -10,7 +10,12 @@ from keiltool.core.tool_finder import find_openocd, find_openocd_scripts
 
 
 INTERFACE_CFG = "interface/stlink.cfg"
-_PROJECT_ROOTS: dict[int, Path] = {}
+
+
+@dataclass(frozen=True, slots=True)
+class LoadedProjectTargets:
+    project_root: Path
+    targets: tuple[KeilTargetModel, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -43,24 +48,20 @@ class ProjectTargetFacts:
         return self.ram_size
 
 
-def load_project_targets(project_path: str | Path) -> list[KeilTargetModel]:
-    """Parse a Keil project and return its selectable Target models."""
+def load_project_targets(project_path: str | Path) -> LoadedProjectTargets:
+    """Parse a Keil project and retain its root with its selectable Targets."""
 
     project = parse_uvprojx(project_path)
-    root = Path(project.inferred_project_root)
-    _PROJECT_ROOTS.clear()
-    for target in project.targets:
-        _PROJECT_ROOTS[id(target)] = root
-    return project.targets
+    return LoadedProjectTargets(Path(project.inferred_project_root), tuple(project.targets))
 
 
 def resolve_target_facts(
     target: KeilTargetModel,
+    project_root: str | Path,
     *,
     openocd_path: str | Path = "",
     scripts_dir: str | Path = "",
     target_override: str | Path = "",
-    project_root: str | Path | None = None,
 ) -> ProjectTargetFacts:
     """Resolve GUI facts while refusing every unverified OpenOCD target cfg."""
 
@@ -83,15 +84,9 @@ def resolve_target_facts(
         target_cfg=target_cfg,
         resolution_status=status,
         resolution_reason=reason,
-        default_log_dir=str((Path(project_root) if project_root is not None else target_model_root(target)) / ".keilbridge" / "logs"),
+        default_log_dir=str(Path(project_root) / ".keilbridge" / "logs"),
         ready=status.endswith("_verified") and bool(target_cfg),
     )
-
-
-def target_model_root(target: KeilTargetModel) -> Path:
-    """Return the project root registered while parsing a selectable Target."""
-
-    return _PROJECT_ROOTS.get(id(target), Path.cwd())
 
 
 def _resolve_target_cfg(target: KeilTargetModel, scripts_dir: str, override: str | Path) -> tuple[str, str, str]:
@@ -107,6 +102,8 @@ def _resolve_target_cfg(target: KeilTargetModel, scripts_dir: str, override: str
 
 def _resolve_override(override: str, scripts_dir: str) -> tuple[str, str, str]:
     candidate = Path(override).expanduser()
+    if candidate.suffix.lower() != ".cfg":
+        return "", "override_invalid", "OpenOCD target override must be a .cfg file."
     if candidate.is_absolute():
         if candidate.is_file():
             return str(candidate), "override_verified", "OpenOCD target override was verified."

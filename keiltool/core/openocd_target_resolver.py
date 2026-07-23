@@ -64,7 +64,7 @@ def _with_script_check(target_cfg: str, openocd_scripts: str | Path, source_stat
             status=f"{source_status}_scripts_missing",
             reason=f"{reason} OpenOCD scripts directory was not found: {scripts}",
         )
-    if (scripts / target_cfg).exists():
+    if (scripts / target_cfg).is_file():
         return OpenOcdTargetResolution(
             target_cfg=target_cfg,
             status=f"{source_status}_verified",

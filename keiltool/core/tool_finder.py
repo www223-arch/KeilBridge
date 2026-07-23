@@ -136,9 +136,12 @@ def find_openocd_scripts(openocd_path: str) -> str:
     if not exe.exists():
         return ""
     for parent in [exe.parent, *exe.parents]:
-        candidate = parent / "share" / "openocd" / "scripts"
-        if candidate.exists():
-            return str(candidate)
+        for candidate in (
+            parent / "share" / "openocd" / "scripts",
+            parent / "openocd" / "scripts",
+        ):
+            if candidate.exists():
+                return str(candidate)
     return ""
 
 

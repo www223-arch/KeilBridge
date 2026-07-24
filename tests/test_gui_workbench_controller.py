@@ -182,7 +182,7 @@ def test_save_failure_decision_is_explicit(answer, expected_name):
 
 
 def test_window_close_cancels_active_one_shot_and_waits_for_completion():
-    from keiltool.gui.workbench_controller import OneShotLifecycleController
+    from keiltool.gui.workbench_controller import OneShotLifecycleController, OneShotPhase
 
     class Operation:
         def __init__(self):
@@ -199,8 +199,37 @@ def test_window_close_cancels_active_one_shot_and_waits_for_completion():
 
     assert operation.cancelled is True
     assert lifecycle.can_destroy is False
-    assert lifecycle.complete(operation) is True
+    assert lifecycle.result_settled(operation, "cancelled") is True
     assert lifecycle.can_destroy is True
+    assert lifecycle.phase is OneShotPhase.IDLE
+
+
+def test_incomplete_one_shot_cleanup_retains_ownership_until_retry_completes():
+    from keiltool.gui.workbench_controller import OneShotLifecycleController, OneShotPhase
+
+    class Operation:
+        def cancel(self):
+            pass
+
+    operation = Operation()
+    lifecycle = OneShotLifecycleController()
+    lifecycle.begin(operation)
+
+    assert lifecycle.result_settled(operation, "incomplete") is False
+    assert lifecycle.phase is OneShotPhase.INCOMPLETE
+    assert lifecycle.owns_operation is True
+    assert lifecycle.can_destroy is False
+
+    assert lifecycle.begin_cleanup(operation) is True
+    assert lifecycle.phase is OneShotPhase.CLEANING
+    assert lifecycle.cleanup_settled(operation, complete=False) is False
+    assert lifecycle.phase is OneShotPhase.INCOMPLETE
+    assert lifecycle.owns_operation is True
+
+    assert lifecycle.begin_cleanup(operation) is True
+    assert lifecycle.cleanup_settled(operation, complete=True) is True
+    assert lifecycle.phase is OneShotPhase.IDLE
+    assert lifecycle.owns_operation is False
 
 
 def test_bounded_event_poller_aggregates_adjacent_rtt_data_and_reports_backlog():

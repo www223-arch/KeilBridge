@@ -222,6 +222,54 @@ class HungProcess:
         return self.returncode
 
 
+class KillFailingProcess(HungProcess):
+    def communicate(self, timeout=None):
+        self.communicate_entered.set()
+        if self.returncode is not None:
+            return ("", "OpenOCD exited after cleanup retry\n")
+        raise subprocess.TimeoutExpired(self.command, timeout, output="", stderr="")
+
+    def kill(self):
+        self.killed = True
+        raise OSError("access denied")
+
+
+class UnreapedKilledProcess(HungProcess):
+    def communicate(self, timeout=None):
+        self.communicate_entered.set()
+        if self.returncode is not None:
+            return ("", "OpenOCD exit reaped\n")
+        raise subprocess.TimeoutExpired(self.command, timeout, output="", stderr="")
+
+    def kill(self):
+        self.killed = True
+
+
+@pytest.mark.parametrize("process_type", [KillFailingProcess, UnreapedKilledProcess])
+def test_incomplete_one_shot_cleanup_retains_process_until_retry_confirms_exit(tmp_path, process_type):
+    from keiltool.core.openocd_backend import OpenOcdOperation
+
+    process = process_type()
+    operation = OpenOcdOperation(
+        timeout=0.01,
+        terminate_timeout=0.01,
+        kill_timeout=0.01,
+        poll_interval=0.001,
+        popen_factory=lambda command, **kwargs: process,
+    )
+
+    result = run_connection_check(CONFIG, tmp_path, operation=operation)
+
+    assert result.outcome == "incomplete"
+    assert operation.cleanup_pending is True
+
+    process.returncode = -9
+    cleanup = operation.retry_cleanup()
+
+    assert cleanup.complete is True
+    assert operation.cleanup_pending is False
+
+
 def test_cancellable_operation_terminates_then_kills_and_returns_utf8_evidence(tmp_path):
     from keiltool.core.openocd_backend import OpenOcdOperation
 

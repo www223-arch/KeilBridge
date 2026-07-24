@@ -96,6 +96,12 @@ class _ExecutionResult:
     outcome: str
 
 
+@dataclass(frozen=True, slots=True)
+class OpenOcdCleanupResult:
+    complete: bool
+    message: str
+
+
 class OpenOcdOperation:
     """Run one OpenOCD command with bounded timeout and cancellation."""
 
@@ -123,12 +129,35 @@ class OpenOcdOperation:
         self._monotonic = monotonic
         self._cancelled = threading.Event()
         self._lock = threading.Lock()
+        self._cleanup_lock = threading.Lock()
         self._process: OpenOcdProcess | None = None
         self._terminate_requested = False
+        self._command_preview = ""
+
+    @property
+    def cleanup_pending(self) -> bool:
+        with self._lock:
+            return self._process is not None
 
     def cancel(self) -> None:
         self._cancelled.set()
         self._request_terminate()
+
+    def retry_cleanup(self) -> OpenOcdCleanupResult:
+        with self._cleanup_lock:
+            with self._lock:
+                process = self._process
+                command_preview = self._command_preview
+            if process is None:
+                return OpenOcdCleanupResult(True, "OpenOCD cleanup was already complete.")
+            complete, _stdout, _stderr, message = self._attempt_cleanup(
+                process,
+                command_preview,
+                "",
+                "",
+                "OpenOCD cleanup retry.",
+            )
+            return OpenOcdCleanupResult(complete, message)
 
     def execute(self, command: list[str], cwd: Path | None) -> _ExecutionResult:
         command_preview = subprocess.list2cmdline(command)
@@ -159,6 +188,7 @@ class OpenOcdOperation:
 
         with self._lock:
             self._process = process
+            self._command_preview = command_preview
         if self._cancelled.is_set():
             self._request_terminate()
 
@@ -177,6 +207,7 @@ class OpenOcdOperation:
                 stdout = _timeout_text(exc.output, stdout)
                 stderr = _timeout_text(exc.stderr, stderr)
                 continue
+            self._release_process(process)
             return _ExecutionResult(
                 process.returncode if process.returncode is not None else 0,
                 stdout or "",
@@ -192,8 +223,43 @@ class OpenOcdOperation:
         stderr: str,
         outcome: str,
     ) -> _ExecutionResult:
-        self._request_terminate()
         message = "OpenOCD operation was cancelled." if outcome == "cancelled" else "OpenOCD operation timed out."
+        with self._cleanup_lock:
+            complete, stdout, stderr, message = self._attempt_cleanup(
+                process,
+                command_preview,
+                stdout,
+                stderr,
+                message,
+            )
+        final_outcome = outcome if complete else "incomplete"
+        stderr = _append_text(stderr, _evidence(command_preview, message))
+        return _ExecutionResult(
+            process.returncode if process.returncode is not None else -1,
+            stdout,
+            stderr,
+            final_outcome,
+        )
+
+    def _attempt_cleanup(
+        self,
+        process: OpenOcdProcess,
+        command_preview: str,
+        stdout: str,
+        stderr: str,
+        message: str,
+    ) -> tuple[bool, str, str, str]:
+        try:
+            if process.poll() is not None:
+                self._release_process(process)
+                return True, stdout, stderr, message + " OpenOCD exit was confirmed."
+        except OSError as poll_error:
+            message += f" Exit check failed: {poll_error}"
+
+        try:
+            process.terminate()
+        except OSError as terminate_error:
+            message += f" Terminate failed: {terminate_error}"
         try:
             final_stdout, final_stderr = process.communicate(timeout=self._terminate_timeout)
             stdout = final_stdout or stdout
@@ -215,13 +281,24 @@ class OpenOcdOperation:
                 stdout = _timeout_text(kill_timeout.output, stdout)
                 stderr = _timeout_text(kill_timeout.stderr, stderr)
                 message += " OpenOCD did not report exit before the kill timeout."
-        stderr = _append_text(stderr, _evidence(command_preview, message))
-        return _ExecutionResult(
-            process.returncode if process.returncode is not None else -1,
-            stdout,
-            stderr,
-            outcome,
-        )
+        try:
+            complete = process.poll() is not None
+        except OSError as poll_error:
+            complete = False
+            message += f" Final exit check failed: {poll_error}"
+        if complete:
+            self._release_process(process)
+            message += " OpenOCD exit was confirmed."
+        else:
+            message += " OpenOCD cleanup is incomplete; ownership is retained."
+        return complete, stdout, stderr, message
+
+    def _release_process(self, process: OpenOcdProcess) -> None:
+        with self._lock:
+            if self._process is process:
+                self._process = None
+                self._command_preview = ""
+                self._terminate_requested = False
 
     def _request_terminate(self) -> None:
         with self._lock:
@@ -430,6 +507,7 @@ def _operation_finding(outcome: str, operation: str) -> DoctorFinding:
         "cancelled": "OpenOCD operation was cancelled",
         "timed_out": "OpenOCD operation timed out",
         "launch_failed": "OpenOCD could not be launched",
+        "incomplete": "OpenOCD process cleanup is incomplete",
     }
     return DoctorFinding(
         stage="flash",

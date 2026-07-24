@@ -15,6 +15,7 @@ from typing import Callable, cast
 from keiltool.core.openocd_backend import (
     ConnectionResult,
     FlashResult,
+    OpenOcdCleanupResult,
     OpenOcdConfig,
     OpenOcdOperation,
     run_connection_check,
@@ -34,6 +35,7 @@ from keiltool.gui.workbench_controller import (
     FreshnessController,
     LifecycleAction,
     OneShotLifecycleController,
+    OneShotPhase,
     RttLifecycleController,
     RttPhase,
     SaveFailureAction,
@@ -99,6 +101,7 @@ class KeilToolGui:
         self._rtt_started_at: float | None = None
         self._rtt_bytes = 0
         self._rtt_lines = 0
+        self._one_shot_cleanup_log: Path | None = None
         self._closing = False
         self._destroyed = False
 
@@ -579,12 +582,13 @@ class KeilToolGui:
     def _handle_ui_event(self, event: _UiEvent) -> None:
         if event.kind == "connection-result":
             operation, value = event.value
-            if self._one_shot_lifecycle.complete(operation):
-                self._finish_connection(value)
+            self._settle_one_shot_result(operation, value, self._finish_connection)
         elif event.kind == "flash-result":
             operation, value = event.value
-            if self._one_shot_lifecycle.complete(operation):
-                self._finish_flash(value)
+            self._settle_one_shot_result(operation, value, self._finish_flash)
+        elif event.kind == "one-shot-cleanup-settled":
+            operation, value = event.value
+            self._finish_one_shot_cleanup(operation, value)
         elif event.kind == "worker-error":
             operation, error, owner = event.value
             self._handle_worker_error(operation, error, owner)
@@ -596,6 +600,66 @@ class KeilToolGui:
             self._finish_close_if_ready()
         elif event.kind == "rtt-stop-settled":
             self._finish_close_if_ready()
+
+    def _settle_one_shot_result(
+        self,
+        operation: object,
+        value: object,
+        finish: Callable[[object], None],
+    ) -> None:
+        if not self._one_shot_lifecycle.owns(operation):
+            return
+        outcome = str(getattr(value, "outcome", "failed"))
+        self._one_shot_lifecycle.result_settled(operation, outcome)
+        finish(value)
+        if outcome == "incomplete" and self._one_shot_lifecycle.owns(operation):
+            log_path = getattr(value, "stderr_log", None)
+            self._one_shot_cleanup_log = log_path if isinstance(log_path, Path) else None
+            self._dispatch_one_shot_cleanup(cast(OpenOcdOperation, operation))
+
+    def _dispatch_one_shot_cleanup(self, operation: OpenOcdOperation) -> None:
+        if not self._one_shot_lifecycle.begin_cleanup(operation):
+            return
+        self.status_var.set("正在重试清理 OpenOCD 进程")
+        self._refresh_controls()
+        self._start_worker(
+            "one-shot-cleanup-settled",
+            operation.retry_cleanup,
+            owner=operation,
+        )
+
+    def _finish_one_shot_cleanup(self, operation: object, value: object) -> None:
+        if not self._one_shot_lifecycle.owns(operation):
+            return
+        if not isinstance(value, OpenOcdCleanupResult):
+            self._one_shot_lifecycle.cleanup_settled(operation, complete=False)
+            self._handle_worker_error(
+                "one-shot-cleanup-settled",
+                RuntimeError("OpenOCD 清理返回了无效结果。"),
+                operation,
+            )
+            return
+        self._append_openocd(f"\n[OpenOCD 清理] {value.message}\n")
+        if self._one_shot_cleanup_log is not None:
+            try:
+                with self._one_shot_cleanup_log.open("a", encoding="utf-8", newline="\n") as stream:
+                    stream.write(f"\n[KeilTool] {value.message}\n")
+            except OSError as exc:
+                self._append_openocd(f"[OpenOCD 清理日志写入失败] {exc}\n")
+        released = self._one_shot_lifecycle.cleanup_settled(operation, complete=value.complete)
+        if released:
+            self._one_shot_cleanup_log = None
+            self.status_var.set("OpenOCD 进程已确认退出")
+        else:
+            self.status_var.set("OpenOCD 清理仍不完整；再次关闭窗口可重试")
+            if not self._closing:
+                messagebox.showerror(
+                    "OpenOCD 清理不完整",
+                    "OpenOCD 进程尚未确认退出。硬件操作和窗口关闭已阻止；关闭窗口可再次重试清理。",
+                    parent=self.root,
+                )
+        self._refresh_controls()
+        self._finish_close_if_ready()
 
     def _finish_connection(self, value: object) -> None:
         if not isinstance(value, ConnectionResult):
@@ -636,8 +700,10 @@ class KeilToolGui:
     def _handle_worker_error(self, operation: object, error: object, owner: object | None) -> None:
         message = str(error)
         self._append_openocd(f"\n[后台任务失败] {operation}: {message}\n")
-        if owner is not None and self._one_shot_lifecycle.owns(owner):
-            self._one_shot_lifecycle.complete(owner)
+        if operation == "one-shot-cleanup-settled" and owner is not None:
+            self._one_shot_lifecycle.cleanup_settled(owner, complete=False)
+        elif owner is not None and self._one_shot_lifecycle.owns(owner):
+            self._one_shot_lifecycle.result_settled(owner, "worker_error")
             self.gate.fail()
         elif str(operation).startswith("rtt") and owner is not None:
             operation_name = "start" if operation == "rtt-start-settled" else "stop"
@@ -830,6 +896,10 @@ class KeilToolGui:
 
     def _on_close(self) -> None:
         if self._closing:
+            if self._one_shot_lifecycle.phase is OneShotPhase.INCOMPLETE:
+                operation = self._one_shot_lifecycle.owner
+                if isinstance(operation, OpenOcdOperation):
+                    self._dispatch_one_shot_cleanup(operation)
             if self._rtt_lifecycle.phase is RttPhase.INCOMPLETE:
                 self._stop_rtt()
             return
@@ -845,6 +915,10 @@ class KeilToolGui:
             self.status_var.set("正在安全关闭")
             self._refresh_controls()
             self._one_shot_lifecycle.request_close()
+            if self._one_shot_lifecycle.phase is OneShotPhase.INCOMPLETE:
+                operation = self._one_shot_lifecycle.owner
+                if isinstance(operation, OpenOcdOperation):
+                    self._dispatch_one_shot_cleanup(operation)
             action = self._rtt_lifecycle.request_close()
             if action is LifecycleAction.STOP_SESSION and self._rtt_session is not None:
                 self._dispatch_rtt_stop(self._rtt_session)

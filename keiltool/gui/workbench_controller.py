@@ -208,14 +208,26 @@ class CancellableOperation(Protocol):
     def cancel(self) -> None: ...
 
 
+class OneShotPhase(Enum):
+    IDLE = auto()
+    RUNNING = auto()
+    INCOMPLETE = auto()
+    CLEANING = auto()
+
+
 class OneShotLifecycleController:
     def __init__(self) -> None:
         self._owner: CancellableOperation | None = None
         self.close_requested = False
+        self.phase = OneShotPhase.IDLE
 
     @property
     def owns_operation(self) -> bool:
         return self._owner is not None
+
+    @property
+    def owner(self) -> CancellableOperation | None:
+        return self._owner
 
     @property
     def can_destroy(self) -> bool:
@@ -228,16 +240,37 @@ class OneShotLifecycleController:
         if self._owner is not None:
             raise RuntimeError("A one-shot OpenOCD operation is already owned.")
         self._owner = operation
+        self.phase = OneShotPhase.RUNNING
 
-    def complete(self, operation: object) -> bool:
+    def result_settled(self, operation: object, outcome: str) -> bool:
         if operation is not self._owner:
             return False
+        if outcome == "incomplete":
+            self.phase = OneShotPhase.INCOMPLETE
+            return False
+        self.phase = OneShotPhase.IDLE
+        self._owner = None
+        return True
+
+    def begin_cleanup(self, operation: object) -> bool:
+        if operation is not self._owner or self.phase is not OneShotPhase.INCOMPLETE:
+            return False
+        self.phase = OneShotPhase.CLEANING
+        return True
+
+    def cleanup_settled(self, operation: object, *, complete: bool) -> bool:
+        if operation is not self._owner or self.phase is not OneShotPhase.CLEANING:
+            return False
+        if not complete:
+            self.phase = OneShotPhase.INCOMPLETE
+            return False
+        self.phase = OneShotPhase.IDLE
         self._owner = None
         return True
 
     def request_close(self) -> None:
         self.close_requested = True
-        if self._owner is not None:
+        if self._owner is not None and self.phase is OneShotPhase.RUNNING:
             self._owner.cancel()
 
     def cancel_close(self) -> None:

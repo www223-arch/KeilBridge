@@ -424,6 +424,13 @@ def cmd_keil(args: argparse.Namespace) -> int:
     return result.returncode
 
 
+def cmd_gui(args: argparse.Namespace) -> int:
+    from .gui import launch_gui
+
+    launch_gui()
+    return 0
+
+
 def _write_backend_report(workspace_root: Path, target, armclang_root: str | None, arm_gcc_root: str | None):
     """写入后端推荐报告，供首次配置和独立 Doctor 共用。"""
 
@@ -547,6 +554,9 @@ def build_parser() -> argparse.ArgumentParser:
     flash_cmd.add_argument("--firmware", required=True, type=Path, help="Existing .hex or .bin firmware file")
     flash_cmd.add_argument("--base-address", type=parse_address, default=0x08000000, help="BIN flash base address (default: 0x08000000)")
     flash_cmd.set_defaults(func=cmd_flash)
+
+    gui_cmd = subparsers.add_parser("gui", help="Launch the ST-Link flash and RTT workbench")
+    gui_cmd.set_defaults(func=cmd_gui)
 
     doctor_parser = subparsers.add_parser("doctor", help="Run KeilBridge staged diagnostics")
     doctor_subparsers = doctor_parser.add_subparsers(dest="doctor_command", required=True)

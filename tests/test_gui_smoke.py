@@ -1,5 +1,8 @@
 import importlib
+import argparse
+import sys
 from types import SimpleNamespace
+from types import ModuleType
 
 import pytest
 
@@ -16,6 +19,38 @@ def test_gui_module_imports_without_creating_a_root_window(monkeypatch):
 
     assert callable(module.launch_gui)
     assert module.KeilToolGui is not None
+
+
+def test_cli_gui_parser_and_help_do_not_create_a_tk_root(monkeypatch, capsys):
+    import tkinter
+
+    from keiltool.cli import build_parser
+
+    def unexpected_root(*args, **kwargs):
+        raise AssertionError("Parsing GUI commands must not create a Tk root window.")
+
+    monkeypatch.setattr(tkinter, "Tk", unexpected_root)
+
+    args = build_parser().parse_args(["gui"])
+    assert args.command == "gui"
+
+    with pytest.raises(SystemExit) as exit_info:
+        build_parser().parse_args(["gui", "--help"])
+
+    assert exit_info.value.code == 0
+    assert "gui" in capsys.readouterr().out
+
+
+def test_cmd_gui_lazily_imports_launcher_and_returns_after_close(monkeypatch):
+    from keiltool import cli
+
+    calls: list[str] = []
+    gui = ModuleType("keiltool.gui")
+    gui.launch_gui = lambda: calls.append("closed")
+    monkeypatch.setitem(sys.modules, "keiltool.gui", gui)
+
+    assert cli.cmd_gui(argparse.Namespace()) == 0
+    assert calls == ["closed"]
 
 
 def test_build_flash_request_accepts_hex_without_parsing_bin_address(tmp_path):

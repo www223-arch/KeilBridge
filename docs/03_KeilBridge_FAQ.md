@@ -173,6 +173,8 @@ python -m keiltool.cli doctor flash --project "xxx.uvprojx" --target App --probe
 
 如果找不到 RTT 控制块，确认当前固件已经包含并初始化 SEGGER RTT，检查 Target 的 RAM 解析结果，或填写明确的控制块地址。RTT 文本会自动以 UTF-8 写入日志；默认目录为 `<keil-project-root>\.keilbridge\logs\`，也可在 GUI 中修改。
 
+RTT 页的“显示等级”使用固件现有的 EasyLogger/SEGGER RTT 等级语义。默认 `VERBOSE` 显示全部；选择 `INFO` 会显示 `ASSERT`、`ERROR`、`WARN` 和 `INFO`。筛选和“清空显示”只处理最近 20,000 行 GUI 缓存，完整 UTF-8 日志仍持续记录所有等级。
+
 ## 10. GUI 提示 target 未验证或 target override 无效怎么办？
 
 GUI 只会在 OpenOCD target cfg 已验证时启用“检查连接”“烧录并校验”和 RTT。自动解析失败时，不会猜测 target cfg。可在高级设置填写 override，但它必须是存在的 `.cfg` 文件：相对路径必须位于 OpenOCD scripts 目录内，绝对路径必须指向存在的文件。

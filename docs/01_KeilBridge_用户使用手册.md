@@ -280,6 +280,8 @@ python -m keiltool.cli gui
 
 RTT 也是独立动作。点击“开始 RTT”后，工作台在 Target 的 RAM 范围中寻找 `SEGGER RTT` 控制块并附着到 RTT TCP 通道；该流程不包含 reset、halt 或 resume，因此不会为了采集 RTT 主动改变 MCU 运行状态。自动扫描使用 Target 的 RAM 范围；选择手动地址时只搜索该地址起始的 `0x100` 字节窗口。
 
+RTT 页会解析 SEGGER 虚拟 Terminal，并优先使用 EasyLogger 已有的 `ASSERT`、`ERROR`、`WARN`、`INFO`、`DEBUG`、`VERBOSE` 等级，不由 GUI 重新定义日志等级。“显示等级”是严重度阈值：例如选择 `INFO` 时显示 `ASSERT` 到 `INFO`，隐藏 `DEBUG` 和 `VERBOSE`。默认值为 `VERBOSE`，关闭工作台时会记住当前阈值；切换阈值会立即重绘最近 20,000 行 GUI 缓存，不会中断 RTT。
+
 Flash、连接检查和 RTT 共享同一支 ST-Link，但任何时刻只允许一个操作拥有它。RTT 正在扫描、采集或停止清理时，烧录和连接检查会禁用；烧录或连接检查进行时，RTT 启动和配置编辑会禁用。先停止 RTT 并等待其清理完成，才能进行烧录。
 
 默认日志目录为：
@@ -288,7 +290,7 @@ Flash、连接检查和 RTT 共享同一支 ST-Link，但任何时刻只允许�
 <keil-project-root>\.keilbridge\logs\
 ```
 
-可以在工作台中改为其他目录。连接/烧录会写入对应的 OpenOCD `stdout`、`stderr` 日志；RTT 会自动把通道文本写为 UTF-8 `rtt_<target>_<time>.log`，并同时保存 OpenOCD 的 `stdout` 和 `stderr`。右侧“打开日志目录”可直接定位这些文件。
+可以在工作台中改为其他目录。连接/烧录会写入对应的 OpenOCD `stdout`、`stderr` 日志；RTT 会自动把所有等级的通道文本写为 UTF-8 `rtt_<target>_<time>.log`，并同时保存 OpenOCD 的 `stdout` 和 `stderr`。等级过滤和“清空显示”只影响 GUI，不删除或截断完整日志。右侧“打开日志目录”可直接定位这些文件。
 
 ## 5. VS Code 使用方式
 

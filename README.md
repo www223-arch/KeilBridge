@@ -31,7 +31,7 @@ python -m keiltool.cli doctor flash --project "C:\Path\To\Project\MDK-ARM\App.uv
 k2c gui
 ```
 
-`k2c gui` launches the ST-Link/OpenOCD workbench for programming an existing HEX/BIN package or attaching to SEGGER RTT. It restores its last non-sensitive settings, performs no hardware operation at startup, and keeps Flash and RTT as separate mutually exclusive ST-Link actions. See the user guide for target verification, RTT no-reset behavior, and log locations.
+`k2c gui` launches the ST-Link/OpenOCD workbench for programming an existing HEX/BIN package or attaching to SEGGER RTT. It restores its last non-sensitive settings, performs no hardware operation at startup, and keeps Flash and RTT as separate mutually exclusive ST-Link actions. The RTT view recognizes SEGGER virtual terminals and EasyLogger levels, supports remembered severity filtering, and still writes the complete UTF-8 log. See the user guide for target verification, RTT no-reset behavior, and log locations.
 
 ## Required Environment
 

@@ -699,11 +699,15 @@ class KeilToolGui:
 
     def _handle_worker_error(self, operation: object, error: object, owner: object | None) -> None:
         message = str(error)
+        retry_operation: OpenOcdOperation | None = None
         self._append_openocd(f"\n[后台任务失败] {operation}: {message}\n")
         if operation == "one-shot-cleanup-settled" and owner is not None:
             self._one_shot_lifecycle.cleanup_settled(owner, complete=False)
         elif owner is not None and self._one_shot_lifecycle.owns(owner):
-            self._one_shot_lifecycle.result_settled(owner, "worker_error")
+            cleanup_pending = isinstance(owner, OpenOcdOperation) and owner.cleanup_pending
+            self._one_shot_lifecycle.worker_failed(owner, cleanup_pending=cleanup_pending)
+            if cleanup_pending:
+                retry_operation = cast(OpenOcdOperation, owner)
             self.gate.fail()
         elif str(operation).startswith("rtt") and owner is not None:
             operation_name = "start" if operation == "rtt-start-settled" else "stop"
@@ -716,6 +720,8 @@ class KeilToolGui:
         self._refresh_controls()
         if not self._closing:
             messagebox.showerror("任务失败", message, parent=self.root)
+        if retry_operation is not None:
+            self._dispatch_one_shot_cleanup(retry_operation)
         self._finish_close_if_ready()
 
     def _handle_rtt_event(self, event: RttEvent) -> None:

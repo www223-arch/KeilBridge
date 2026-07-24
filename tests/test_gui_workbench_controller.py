@@ -232,6 +232,25 @@ def test_incomplete_one_shot_cleanup_retains_ownership_until_retry_completes():
     assert lifecycle.owns_operation is False
 
 
+def test_one_shot_worker_error_retains_ownership_when_process_cleanup_is_pending():
+    from keiltool.gui.workbench_controller import OneShotLifecycleController, OneShotPhase
+
+    class Operation:
+        def cancel(self):
+            pass
+
+    operation = Operation()
+    lifecycle = OneShotLifecycleController()
+    lifecycle.begin(operation)
+
+    assert lifecycle.worker_failed(operation, cleanup_pending=True) is False
+    assert lifecycle.phase is OneShotPhase.INCOMPLETE
+    assert lifecycle.owns_operation is True
+
+    assert lifecycle.begin_cleanup(operation) is True
+    assert lifecycle.cleanup_settled(operation, complete=True) is True
+
+
 def test_bounded_event_poller_aggregates_adjacent_rtt_data_and_reports_backlog():
     import queue
 

@@ -268,6 +268,12 @@ class OneShotLifecycleController:
         self._owner = None
         return True
 
+    def worker_failed(self, operation: object, *, cleanup_pending: bool) -> bool:
+        return self.result_settled(
+            operation,
+            "incomplete" if cleanup_pending else "worker_error",
+        )
+
     def request_close(self) -> None:
         self.close_requested = True
         if self._owner is not None and self.phase is OneShotPhase.RUNNING:

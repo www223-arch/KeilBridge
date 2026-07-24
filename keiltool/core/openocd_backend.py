@@ -369,6 +369,8 @@ def run_connection_check(
     cwd: Path | None = None,
     target: KeilTargetModel | None = None,
     target_name: str = "",
+    stdout_log_path: Path | None = None,
+    stderr_log_path: Path | None = None,
 ) -> ConnectionResult:
     command = build_connection_command(config)
     completed, stdout_log, stderr_log = _run_with_logs(
@@ -379,6 +381,8 @@ def run_connection_check(
         operation or OpenOcdOperation(timeout=30.0),
         cwd,
         target_name,
+        stdout_log_path,
+        stderr_log_path,
     )
     findings = _classify(completed.stdout, completed.stderr, config.executable, target)
     success = (
@@ -421,6 +425,8 @@ def run_flash(
     cwd: Path | None = None,
     target: KeilTargetModel | None = None,
     target_name: str = "",
+    stdout_log_path: Path | None = None,
+    stderr_log_path: Path | None = None,
 ) -> FlashResult:
     if not request.firmware.is_file():
         raise ValueError(f"Firmware file does not exist: {request.firmware}")
@@ -433,6 +439,8 @@ def run_flash(
         operation or OpenOcdOperation(),
         cwd,
         target_name,
+        stdout_log_path,
+        stderr_log_path,
     )
     findings = _classify(completed.stdout, completed.stderr, config.executable, target)
     success = (
@@ -473,12 +481,14 @@ def _run_with_logs(
     operation: OpenOcdOperation,
     cwd: Path | None,
     target_name: str,
+    stdout_log_path: Path | None,
+    stderr_log_path: Path | None,
 ) -> tuple[_ExecutionResult, Path, Path]:
     log_dir.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
     target_component = f"_{_safe_log_component(target_name)}" if target_name else ""
-    stdout_log = log_dir / f"{name}{target_component}_{stamp}.out.log"
-    stderr_log = log_dir / f"{name}{target_component}_{stamp}.err.log"
+    stdout_log = stdout_log_path or log_dir / f"{name}{target_component}_{stamp}.out.log"
+    stderr_log = stderr_log_path or log_dir / f"{name}{target_component}_{stamp}.err.log"
     if runner is None:
         completed = operation.execute(command, cwd)
     else:
@@ -497,9 +507,16 @@ def _run_with_logs(
                 _evidence(subprocess.list2cmdline(command), f"Unable to launch OpenOCD: {exc}"),
                 "launch_failed",
             )
-    stdout_log.write_text(completed.stdout, encoding="utf-8", newline="\n")
-    stderr_log.write_text(completed.stderr, encoding="utf-8", newline="\n")
+    _write_operation_log(stdout_log, completed.stdout, append=stdout_log_path is not None)
+    _write_operation_log(stderr_log, completed.stderr, append=stderr_log_path is not None)
     return completed, stdout_log, stderr_log
+
+
+def _write_operation_log(path: Path, text: str, *, append: bool) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    mode = "a" if append else "w"
+    with path.open(mode, encoding="utf-8", newline="\n") as stream:
+        stream.write(text)
 
 
 def _operation_finding(outcome: str, operation: str) -> DoctorFinding:

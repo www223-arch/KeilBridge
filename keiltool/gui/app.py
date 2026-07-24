@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
 import os
 from pathlib import Path
 import queue
@@ -23,6 +22,7 @@ from keiltool.core.openocd_backend import (
 )
 from keiltool.core.rtt import RttEvent, RttSession
 from keiltool.core.rtt_log import RttLevel, RttLogRecord
+from keiltool.core.session_logs import SessionLogContext, create_session_logs
 from keiltool.gui.project_config import (
     ProjectTargetFacts,
     load_project_targets,
@@ -50,7 +50,6 @@ from keiltool.gui.workbench_model import (
     RttLogPaths,
     TargetFactsDisplay,
     build_flash_request,
-    build_rtt_log_paths,
     build_rtt_request,
     int_or_default,
     is_firmware_ready,
@@ -101,11 +100,13 @@ class KeilToolGui:
         self._facts: ProjectTargetFacts | None = None
         self._rtt_session: RttSession | None = None
         self._rtt_log_paths: RttLogPaths | None = None
+        self._rtt_log_context: SessionLogContext | None = None
         self._rtt_started_at: float | None = None
         self._rtt_bytes = 0
         self._rtt_lines = 0
         self._rtt_display = RttDisplayBuffer(max_records=20_000)
         self._one_shot_cleanup_log: Path | None = None
+        self._operation_logs: dict[object, SessionLogContext] = {}
         self._closing = False
         self._destroyed = False
 
@@ -394,8 +395,24 @@ class KeilToolGui:
             config = self._build_openocd_config(snapshot)
             log_dir = self._log_dir()
             target = snapshot.target
+            facts = cast(ProjectTargetFacts, snapshot.facts)
+            log_context = create_session_logs(
+                log_dir,
+                device=facts.device,
+                task="CONNECT",
+                metadata={
+                    "probe": "ST-Link",
+                    "target_cfg": config.target_cfg,
+                    "interface_cfg": config.interface_cfg,
+                },
+            )
             operation = OpenOcdOperation(timeout=30.0)
-            self._begin_one_shot(SessionState.CONNECT, operation)
+            try:
+                self._begin_one_shot(SessionState.CONNECT, operation)
+            except Exception:
+                log_context.finalize("not_started")
+                raise
+            self._operation_logs[operation] = log_context
         except BusySessionError:
             self._show_busy()
             return
@@ -408,10 +425,12 @@ class KeilToolGui:
             "connection-result",
             lambda: run_connection_check(
                 config,
-                log_dir,
+                log_context.directory,
                 operation=operation,
-                target=target,
+                target=target if hasattr(target, "name") else None,
                 target_name=str(getattr(target, "name", "")),
+                stdout_log_path=log_context.stdout_log,
+                stderr_log_path=log_context.stderr_log,
             ),
             owner=operation,
         )
@@ -449,10 +468,30 @@ class KeilToolGui:
         if not confirmed:
             return
         try:
+            log_context = create_session_logs(
+                log_dir,
+                device=facts.device,
+                task="FLASH",
+                metadata={
+                    "probe": "ST-Link",
+                    "target_cfg": config.target_cfg,
+                    "interface_cfg": config.interface_cfg,
+                    "firmware": str(request.firmware.resolve()),
+                    "base_address": request.base_address,
+                },
+            )
             operation = OpenOcdOperation(timeout=300.0)
-            self._begin_one_shot(SessionState.FLASH, operation)
+            try:
+                self._begin_one_shot(SessionState.FLASH, operation)
+            except Exception:
+                log_context.finalize("not_started")
+                raise
+            self._operation_logs[operation] = log_context
         except BusySessionError:
             self._show_busy()
+            return
+        except Exception as exc:
+            messagebox.showerror("无法创建烧录日志", str(exc), parent=self.root)
             return
         self._set_status()
         self._refresh_controls()
@@ -461,10 +500,12 @@ class KeilToolGui:
             lambda: run_flash(
                 config,
                 request,
-                log_dir,
+                log_context.directory,
                 operation=operation,
-                target=target,
+                target=target if hasattr(target, "name") else None,
                 target_name=str(getattr(target, "name", "")),
+                stdout_log_path=log_context.stdout_log,
+                stderr_log_path=log_context.stderr_log,
             ),
             owner=operation,
         )
@@ -486,11 +527,25 @@ class KeilToolGui:
             if timeout_ms <= 0:
                 raise ValueError("RTT 扫描超时必须大于 0。")
             log_dir = self._log_dir()
-            stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
-            log_paths = build_rtt_log_paths(log_dir, self.target_var.get() or "target", stamp)
-            log_dir.mkdir(parents=True, exist_ok=True)
-            log_paths.stdout.write_text("", encoding="utf-8", newline="\n")
-            log_paths.stderr.write_text("", encoding="utf-8", newline="\n")
+            log_context = create_session_logs(
+                log_dir,
+                device=facts.device,
+                task="RTT",
+                metadata={
+                    "probe": "ST-Link",
+                    "target_cfg": config.target_cfg,
+                    "interface_cfg": config.interface_cfg,
+                    "scan_address": f"0x{request.scan_address:08X}",
+                    "scan_size": request.scan_size,
+                    "channel": request.channel,
+                    "port": request.port,
+                },
+            )
+            log_paths = RttLogPaths(
+                channel=log_context.primary_log,
+                stdout=log_context.stdout_log,
+                stderr=log_context.stderr_log,
+            )
             session = RttSession(
                 config,
                 request,
@@ -502,6 +557,7 @@ class KeilToolGui:
                 self._rtt_lifecycle.begin_start(session)
             except Exception:
                 self.gate.finish()
+                log_context.finalize("not_started")
                 raise
         except BusySessionError:
             self._show_busy()
@@ -512,6 +568,7 @@ class KeilToolGui:
 
         self._rtt_session = session
         self._rtt_log_paths = log_paths
+        self._rtt_log_context = log_context
         self._rtt_started_at = None
         self._rtt_bytes = 0
         self._rtt_lines = 0
@@ -622,6 +679,8 @@ class KeilToolGui:
             return
         outcome = str(getattr(value, "outcome", "failed"))
         self._one_shot_lifecycle.result_settled(operation, outcome)
+        if outcome != "incomplete":
+            self._finalize_operation_log(operation, outcome)
         finish(value)
         if outcome == "incomplete" and self._one_shot_lifecycle.owns(operation):
             log_path = getattr(value, "stderr_log", None)
@@ -659,6 +718,7 @@ class KeilToolGui:
                 self._append_openocd(f"[OpenOCD 清理日志写入失败] {exc}\n")
         released = self._one_shot_lifecycle.cleanup_settled(operation, complete=value.complete)
         if released:
+            self._finalize_operation_log(operation, "incomplete_cleaned")
             self._one_shot_cleanup_log = None
             self.status_var.set("OpenOCD 进程已确认退出")
         else:
@@ -719,6 +779,8 @@ class KeilToolGui:
             self._one_shot_lifecycle.worker_failed(owner, cleanup_pending=cleanup_pending)
             if cleanup_pending:
                 retry_operation = cast(OpenOcdOperation, owner)
+            else:
+                self._finalize_operation_log(owner, "worker_error")
             self.gate.fail()
         elif str(operation).startswith("rtt") and owner is not None:
             operation_name = "start" if operation == "rtt-start-settled" else "stop"
@@ -789,8 +851,14 @@ class KeilToolGui:
                 else:
                     self.gate.finish()
                     self.status_var.set("RTT 已停止")
+                if self._rtt_log_context is not None:
+                    try:
+                        self._rtt_log_context.finalize(event.outcome)
+                    except OSError as exc:
+                        self._append_openocd(f"[RTT 日志结束信息写入失败] {exc}\n")
                 self._rtt_session = None
                 self._rtt_log_paths = None
+                self._rtt_log_context = None
             else:
                 return
             self._rtt_started_at = None
@@ -821,6 +889,15 @@ class KeilToolGui:
                 log_file.write(event.text)
         except OSError as exc:
             self.status_var.set(f"OpenOCD 日志写入失败: {exc}")
+
+    def _finalize_operation_log(self, owner: object, outcome: str) -> None:
+        context = self._operation_logs.pop(owner, None)
+        if context is None:
+            return
+        try:
+            context.finalize(outcome)
+        except OSError as exc:
+            self._append_openocd(f"[日志结束信息写入失败] {exc}\n")
 
     def _render_openocd_result(self, title: str, result: ConnectionResult | FlashResult) -> None:
         command = subprocess.list2cmdline(result.command)

@@ -160,6 +160,30 @@ def test_run_connection_check_rejects_a_clean_exit_without_target_evidence(tmp_p
     assert result.success is False
 
 
+def test_connection_uses_explicit_session_log_paths_and_preserves_headers(tmp_path):
+    from keiltool.core.openocd_backend import OpenOcdConfig, run_connection_check
+
+    stdout = tmp_path / "openocd.stdout.log"
+    stderr = tmp_path / "openocd.stderr.log"
+    stdout.write_text("header\n", encoding="utf-8")
+    stderr.write_text("header\n", encoding="utf-8")
+
+    def runner(*args, **kwargs):
+        return subprocess.CompletedProcess(args[0], 0, "Info : Cortex-M4 detected\n", "")
+
+    result = run_connection_check(
+        OpenOcdConfig(Path("openocd"), None, "interface/stlink.cfg", "target/stm32f3x.cfg"),
+        tmp_path,
+        runner=runner,
+        stdout_log_path=stdout,
+        stderr_log_path=stderr,
+    )
+
+    assert result.stdout_log == stdout
+    assert stdout.read_text(encoding="utf-8").startswith("header\n")
+    assert "Cortex-M4" in stdout.read_text(encoding="utf-8")
+
+
 def test_connection_and_flash_evidence_stems_include_sanitized_target_and_microseconds(tmp_path):
     firmware = tmp_path / "full.hex"
     firmware.write_text(":00000001FF\n", encoding="ascii")

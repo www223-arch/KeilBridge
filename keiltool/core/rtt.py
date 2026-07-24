@@ -77,7 +77,7 @@ LogFactory = Callable[[Path], TextIO]
 
 
 def _open_rtt_log(path: Path) -> TextIO:
-    return path.open("w", encoding="utf-8", newline="")
+    return path.open("a", encoding="utf-8", newline="")
 
 
 class RttSession:

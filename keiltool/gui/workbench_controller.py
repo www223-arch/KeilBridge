@@ -356,6 +356,8 @@ class BoundedEventPoller:
             and items
             and items[-1].source == "rtt"
             and getattr(items[-1].event, "kind", "") == "data"
+            and getattr(items[-1].event, "level", None) == getattr(event, "level", None)
+            and getattr(items[-1].event, "terminal", None) == getattr(event, "terminal", None)
         ):
             previous = items[-1]
             merged = replace(

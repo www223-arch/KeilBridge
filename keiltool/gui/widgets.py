@@ -4,6 +4,10 @@ import tkinter as tk
 from tkinter import ttk
 from typing import Callable, Protocol
 
+from keiltool.core.rtt_log import RttLogRecord
+from keiltool.gui.rtt_display import RTT_LEVEL_NAMES
+from keiltool.gui.theme import configure_log_text
+
 
 def path_row(
     parent: ttk.Frame,
@@ -245,6 +249,10 @@ class OutputNotebook(ttk.Frame):
         *,
         elapsed_var: tk.StringVar,
         counts_var: tk.StringVar,
+        rtt_level_var: tk.StringVar,
+        rtt_visible_counts_var: tk.StringVar,
+        on_level_changed: Callable[[], None],
+        on_clear_rtt: Callable[[], None],
         open_logs_dir: Callable[[], None],
     ) -> None:
         super().__init__(parent)
@@ -259,13 +267,13 @@ class OutputNotebook(ttk.Frame):
         notebook.add(openocd_tab, text="OpenOCD 输出")
 
         rtt_tab.columnconfigure(0, weight=1)
-        rtt_tab.rowconfigure(1, weight=1)
+        rtt_tab.rowconfigure(2, weight=1)
         rtt_toolbar = ttk.Frame(rtt_tab)
         rtt_toolbar.grid(row=0, column=0, sticky="ew", pady=(0, 6))
         ttk.Label(rtt_toolbar, textvariable=elapsed_var, width=10).grid(row=0, column=0, sticky="w")
         ttk.Label(rtt_toolbar, textvariable=counts_var, width=22).grid(row=0, column=1, sticky="w")
         rtt_toolbar.columnconfigure(2, weight=1)
-        ttk.Button(rtt_toolbar, text="清空显示", command=self.clear_rtt).grid(
+        ttk.Button(rtt_toolbar, text="清空显示", command=on_clear_rtt).grid(
             row=0,
             column=3,
             padx=(6, 0),
@@ -275,7 +283,26 @@ class OutputNotebook(ttk.Frame):
             column=4,
             padx=(6, 0),
         )
-        self._rtt_text = _text_with_scrollbar(rtt_tab, row=1)
+
+        filter_bar = ttk.Frame(rtt_tab)
+        filter_bar.grid(row=1, column=0, sticky="ew", pady=(0, 6))
+        ttk.Label(filter_bar, text="显示等级").grid(row=0, column=0, sticky="w")
+        self.rtt_level_combo = ttk.Combobox(
+            filter_bar,
+            textvariable=rtt_level_var,
+            values=RTT_LEVEL_NAMES,
+            state="readonly",
+            width=10,
+        )
+        self.rtt_level_combo.grid(row=0, column=1, sticky="w", padx=(6, 12))
+        self.rtt_level_combo.bind("<<ComboboxSelected>>", lambda _event: on_level_changed())
+        ttk.Label(
+            filter_bar,
+            textvariable=rtt_visible_counts_var,
+            style="Muted.TLabel",
+        ).grid(row=0, column=2, sticky="w")
+        filter_bar.columnconfigure(3, weight=1)
+        self._rtt_text = _text_with_scrollbar(rtt_tab, row=2, rtt=True)
 
         openocd_tab.columnconfigure(0, weight=1)
         openocd_tab.rowconfigure(1, weight=1)
@@ -296,6 +323,22 @@ class OutputNotebook(ttk.Frame):
     def append_rtt(self, text: str) -> None:
         _append_text(self._rtt_text, text)
 
+    def append_rtt_record(self, record: RttLogRecord) -> None:
+        _append_text(self._rtt_text, record.text, tag=record.level.name)
+
+    def render_rtt_records(self, records: tuple[RttLogRecord, ...]) -> None:
+        self._rtt_text.configure(state="normal")
+        self._rtt_text.delete("1.0", "end")
+        for record in records:
+            self._rtt_text.insert("end", record.text, record.level.name)
+        self._rtt_text.see("end")
+        self._rtt_text.configure(state="disabled")
+
+    def remove_first_rtt_record(self, record: RttLogRecord) -> None:
+        self._rtt_text.configure(state="normal")
+        self._rtt_text.delete("1.0", f"1.0 + {len(record.text)} chars")
+        self._rtt_text.configure(state="disabled")
+
     def append_openocd(self, text: str) -> None:
         _append_text(self._openocd_text, text)
 
@@ -306,7 +349,7 @@ class OutputNotebook(ttk.Frame):
         _clear_text(self._openocd_text)
 
 
-def _text_with_scrollbar(parent: ttk.Frame, *, row: int) -> tk.Text:
+def _text_with_scrollbar(parent: ttk.Frame, *, row: int, rtt: bool = False) -> tk.Text:
     frame = ttk.Frame(parent)
     frame.grid(row=row, column=0, sticky="nsew")
     frame.rowconfigure(0, weight=1)
@@ -319,9 +362,10 @@ def _text_with_scrollbar(parent: ttk.Frame, *, row: int) -> tk.Text:
         font=("Consolas", 10),
         undo=False,
         state="disabled",
-        borderwidth=1,
-        relief="solid",
+        borderwidth=0,
+        relief="flat",
     )
+    configure_log_text(text, rtt=rtt)
     yscroll = ttk.Scrollbar(frame, orient="vertical", command=text.yview)
     xscroll = ttk.Scrollbar(frame, orient="horizontal", command=text.xview)
     text.configure(yscrollcommand=yscroll.set, xscrollcommand=xscroll.set)
@@ -331,11 +375,11 @@ def _text_with_scrollbar(parent: ttk.Frame, *, row: int) -> tk.Text:
     return text
 
 
-def _append_text(widget: tk.Text, text: str) -> None:
+def _append_text(widget: tk.Text, text: str, *, tag: str | None = None) -> None:
     if not text:
         return
     widget.configure(state="normal")
-    widget.insert("end", text)
+    widget.insert("end", text, tag)
     widget.see("end")
     widget.configure(state="disabled")
 

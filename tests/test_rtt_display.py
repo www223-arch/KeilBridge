@@ -34,11 +34,12 @@ def test_display_buffer_discards_oldest_records_at_limit():
     from keiltool.gui.rtt_display import RttDisplayBuffer
 
     model = RttDisplayBuffer(max_records=2)
-    model.append(RttLogRecord(RttLevel.INFO, "one\n", 0))
+    assert model.append(RttLogRecord(RttLevel.INFO, "one\n", 0)) is None
     model.append(RttLogRecord(RttLevel.INFO, "two\n", 0))
-    model.append(RttLogRecord(RttLevel.INFO, "three\n", 0))
+    evicted = model.append(RttLogRecord(RttLevel.INFO, "three\n", 0))
 
     assert [item.text for item in model.records] == ["two\n", "three\n"]
+    assert evicted == RttLogRecord(RttLevel.INFO, "one\n", 0)
 
 
 def test_display_buffer_clear_removes_only_cached_records():
@@ -59,3 +60,15 @@ def test_parse_rtt_level_falls_back_to_verbose():
     assert parse_rtt_level("WARN") is RttLevel.WARN
     assert parse_rtt_level("invalid") is RttLevel.VERBOSE
 
+
+def test_build_rtt_view_filters_records_and_formats_counts():
+    from keiltool.gui.rtt_display import RttDisplayBuffer, build_rtt_view
+
+    model = RttDisplayBuffer()
+    model.append(RttLogRecord(RttLevel.INFO, "I/ready\n", 0))
+    model.append(RttLogRecord(RttLevel.DEBUG, "D/loop\n", 1))
+
+    view = build_rtt_view(model, "INFO")
+
+    assert [item.text for item in view.records] == ["I/ready\n"]
+    assert view.label == "1 可见 / 2 缓存"

@@ -22,12 +22,15 @@ from keiltool.core.openocd_backend import (
     run_flash,
 )
 from keiltool.core.rtt import RttEvent, RttSession
+from keiltool.core.rtt_log import RttLevel, RttLogRecord
 from keiltool.gui.project_config import (
     ProjectTargetFacts,
     load_project_targets,
 )
+from keiltool.gui.rtt_display import RttDisplayBuffer, build_rtt_view, parse_rtt_level
 from keiltool.gui.settings import GuiSettings, SettingsDiagnostic, SettingsStore
 from keiltool.gui.state import BusySessionError, SessionState, TaskGate
+from keiltool.gui.theme import configure_theme
 from keiltool.gui.widgets import ConfigurationPane, OutputNotebook
 from keiltool.gui.workbench_controller import (
     BoundedEventPoller,
@@ -101,6 +104,7 @@ class KeilToolGui:
         self._rtt_started_at: float | None = None
         self._rtt_bytes = 0
         self._rtt_lines = 0
+        self._rtt_display = RttDisplayBuffer(max_records=20_000)
         self._one_shot_cleanup_log: Path | None = None
         self._closing = False
         self._destroyed = False
@@ -142,6 +146,8 @@ class KeilToolGui:
         self.status_var = tk.StringVar(value=_STATE_TEXT[SessionState.IDLE])
         self.elapsed_var = tk.StringVar(value="00:00:00")
         self.counts_var = tk.StringVar(value="0 字节 / 0 行")
+        self.rtt_display_level_var = tk.StringVar(value=settings.rtt_display_level)
+        self.rtt_visible_counts_var = tk.StringVar(value="0 可见 / 0 缓存")
 
     def _configure_window(self) -> None:
         self.root.title("KeilTool ST-Link 工作台")
@@ -150,19 +156,15 @@ class KeilToolGui:
         self.root.columnconfigure(0, minsize=420, weight=0)
         self.root.columnconfigure(1, weight=1)
         self.root.rowconfigure(0, weight=1)
-        style = ttk.Style(self.root)
-        if "vista" in style.theme_names():
-            style.theme_use("vista")
-        style.configure(".", font=("Microsoft YaHei UI", 9))
-        style.configure("Primary.TButton", font=("Microsoft YaHei UI", 9, "bold"))
+        configure_theme(self.root)
 
     def _build_layout(self) -> None:
-        left = ttk.Frame(self.root, padding=(10, 10, 8, 8))
+        left = ttk.Frame(self.root, padding=(10, 10, 8, 8), style="Background.TFrame")
         left.grid(row=0, column=0, sticky="nsew")
         left.rowconfigure(0, weight=1)
         left.columnconfigure(0, weight=1)
 
-        right = ttk.Frame(self.root, padding=(0, 10, 10, 8))
+        right = ttk.Frame(self.root, padding=(0, 10, 10, 8), style="Background.TFrame")
         right.grid(row=0, column=1, sticky="nsew")
         right.rowconfigure(0, weight=1)
         right.columnconfigure(0, weight=1)
@@ -174,15 +176,24 @@ class KeilToolGui:
             right,
             elapsed_var=self.elapsed_var,
             counts_var=self.counts_var,
+            rtt_level_var=self.rtt_display_level_var,
+            rtt_visible_counts_var=self.rtt_visible_counts_var,
+            on_level_changed=self._on_rtt_level_changed,
+            on_clear_rtt=self._clear_rtt_display,
             open_logs_dir=self._open_logs_dir,
         )
         self.output.grid(row=0, column=0, sticky="nsew")
 
-        status = ttk.Frame(self.root, padding=(10, 4, 10, 6))
+        status = ttk.Frame(self.root, padding=(10, 4, 10, 6), style="Status.TFrame")
         status.grid(row=1, column=0, columnspan=2, sticky="ew")
         ttk.Separator(status).grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 5))
-        ttk.Label(status, text="状态").grid(row=1, column=0, sticky="w")
-        ttk.Label(status, textvariable=self.status_var).grid(row=1, column=1, sticky="w", padx=(10, 0))
+        ttk.Label(status, text="状态", style="Status.TLabel").grid(row=1, column=0, sticky="w")
+        ttk.Label(status, textvariable=self.status_var, style="Status.TLabel").grid(
+            row=1,
+            column=1,
+            sticky="w",
+            padx=(10, 0),
+        )
         status.columnconfigure(1, weight=1)
 
     def _bind_updates(self) -> None:
@@ -729,7 +740,18 @@ class KeilToolGui:
             self._append_openocd(event.text)
             self._persist_rtt_openocd_event(event)
         elif event.kind == "data":
-            self.output.append_rtt(event.text)
+            level = event.level if event.level is not None else RttLevel.INFO
+            terminal = event.terminal if event.terminal is not None else 0
+            threshold = parse_rtt_level(self.rtt_display_level_var.get())
+            chunks = event.text.splitlines(keepends=True) or ([event.text] if event.text else [])
+            for text in chunks:
+                record = RttLogRecord(level=level, text=text, terminal=terminal)
+                evicted = self._rtt_display.append(record)
+                if evicted is not None and evicted.level <= threshold:
+                    self.output.remove_first_rtt_record(evicted)
+                if record.level <= threshold:
+                    self.output.append_rtt_record(record)
+            self._update_rtt_visible_counts()
             self._rtt_bytes += len(event.text.encode("utf-8", errors="replace"))
             self._rtt_lines += event.text.count("\n")
             self.counts_var.set(f"{self._rtt_bytes:,} 字节 / {self._rtt_lines:,} 行")
@@ -774,6 +796,20 @@ class KeilToolGui:
             self._rtt_started_at = None
             self._refresh_controls()
             self._finish_close_if_ready()
+
+    def _on_rtt_level_changed(self) -> None:
+        view = build_rtt_view(self._rtt_display, self.rtt_display_level_var.get())
+        self.output.render_rtt_records(view.records)
+        self.rtt_visible_counts_var.set(view.label)
+
+    def _update_rtt_visible_counts(self) -> None:
+        view = build_rtt_view(self._rtt_display, self.rtt_display_level_var.get())
+        self.rtt_visible_counts_var.set(view.label)
+
+    def _clear_rtt_display(self) -> None:
+        self._rtt_display.clear()
+        self.output.clear_rtt()
+        self._update_rtt_visible_counts()
 
     def _persist_rtt_openocd_event(self, event: RttEvent) -> None:
         paths = self._rtt_log_paths
@@ -993,6 +1029,7 @@ class KeilToolGui:
             rtt_channel=int_or_default(self.rtt_channel_var.get(), 0),
             rtt_port=int_or_default(self.rtt_port_var.get(), 19021),
             rtt_timeout_ms=int_or_default(self.rtt_timeout_var.get(), 5000),
+            rtt_display_level=self.rtt_display_level_var.get(),
             logs_dir=self.logs_dir_var.get().strip(),
         )
 

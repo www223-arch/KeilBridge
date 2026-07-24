@@ -1,11 +1,18 @@
 from __future__ import annotations
 
 from collections import deque
+from dataclasses import dataclass
 
 from keiltool.core.rtt_log import RttLevel, RttLogRecord
 
 
 RTT_LEVEL_NAMES = tuple(level.name for level in reversed(tuple(RttLevel)))
+
+
+@dataclass(frozen=True, slots=True)
+class RttViewState:
+    records: tuple[RttLogRecord, ...]
+    label: str
 
 
 class RttDisplayBuffer:
@@ -22,8 +29,10 @@ class RttDisplayBuffer:
     def total_count(self) -> int:
         return len(self._records)
 
-    def append(self, record: RttLogRecord) -> None:
+    def append(self, record: RttLogRecord) -> RttLogRecord | None:
+        evicted = self._records[0] if len(self._records) == self._records.maxlen else None
         self._records.append(record)
+        return evicted
 
     def clear(self) -> None:
         self._records.clear()
@@ -44,4 +53,18 @@ def parse_rtt_level(value: object) -> RttLevel:
     return RttLevel.VERBOSE
 
 
-__all__ = ["RTT_LEVEL_NAMES", "RttDisplayBuffer", "parse_rtt_level"]
+def build_rtt_view(buffer: RttDisplayBuffer, level_name: object) -> RttViewState:
+    records = buffer.visible(parse_rtt_level(level_name))
+    return RttViewState(
+        records=records,
+        label=f"{len(records):,} 可见 / {buffer.total_count:,} 缓存",
+    )
+
+
+__all__ = [
+    "RTT_LEVEL_NAMES",
+    "RttDisplayBuffer",
+    "RttViewState",
+    "build_rtt_view",
+    "parse_rtt_level",
+]

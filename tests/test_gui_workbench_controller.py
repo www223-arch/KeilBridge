@@ -269,3 +269,20 @@ def test_bounded_event_poller_aggregates_adjacent_rtt_data_and_reports_backlog()
     assert len(batch.items) == 1
     assert batch.items[0].source == "rtt"
     assert batch.items[0].event.text == "onetwothreefour"
+
+
+def test_bounded_event_poller_does_not_merge_different_rtt_levels():
+    import queue
+
+    from keiltool.core.rtt import RttEvent
+    from keiltool.core.rtt_log import RttLevel
+    from keiltool.gui.workbench_controller import BoundedEventPoller
+
+    rtt_events = queue.Queue()
+    rtt_events.put(RttEvent("data", text="I/ready\n", level=RttLevel.INFO, terminal=0))
+    rtt_events.put(RttEvent("data", text="D/loop\n", level=RttLevel.DEBUG, terminal=1))
+
+    batch = BoundedEventPoller(max_events=4, time_budget=1.0).drain(queue.Queue(), rtt_events)
+
+    assert len(batch.items) == 2
+    assert [item.event.level for item in batch.items] == [RttLevel.INFO, RttLevel.DEBUG]

@@ -239,3 +239,67 @@ def test_high_rate_rtt_poll_yields_to_unrelated_tk_callback():
     assert root.callbacks[-1][0] == 0
     root.run_next()
     assert unrelated_ran == [True]
+
+
+def test_gui_applies_theme_and_filters_structured_rtt_records(tmp_path):
+    import tkinter as tk
+
+    from keiltool.core.rtt import RttEvent
+    from keiltool.core.rtt_log import RttLevel
+    from keiltool.gui.app import KeilToolGui
+    from keiltool.gui.settings import SettingsStore
+    from keiltool.gui.theme import PALETTE
+
+    root = tk.Tk()
+    root.withdraw()
+    gui = KeilToolGui(root, settings_store=SettingsStore(tmp_path / "settings.json"))
+    try:
+        assert gui.rtt_display_level_var.get() == "VERBOSE"
+        assert tuple(gui.output.rtt_level_combo.cget("values")) == (
+            "VERBOSE",
+            "DEBUG",
+            "INFO",
+            "WARN",
+            "ERROR",
+            "ASSERT",
+        )
+        assert root.cget("background") == PALETTE["background"]
+        assert gui.output._rtt_text.tag_cget("ERROR", "foreground") == PALETTE["error"]
+
+        gui._handle_rtt_event(RttEvent("data", text="I/ready\n", level=RttLevel.INFO, terminal=0))
+        gui._handle_rtt_event(RttEvent("data", text="D/loop\n", level=RttLevel.DEBUG, terminal=1))
+        gui.rtt_display_level_var.set("INFO")
+        gui._on_rtt_level_changed()
+
+        assert gui.output._rtt_text.get("1.0", "end-1c") == "I/ready\n"
+        assert gui.rtt_visible_counts_var.get() == "1 可见 / 2 缓存"
+    finally:
+        if not gui._destroyed:
+            gui._on_close()
+
+
+def test_gui_removes_visible_record_evicted_from_rtt_cache(tmp_path):
+    import tkinter as tk
+
+    from keiltool.core.rtt import RttEvent
+    from keiltool.core.rtt_log import RttLevel
+    from keiltool.gui.app import KeilToolGui
+    from keiltool.gui.rtt_display import RttDisplayBuffer
+    from keiltool.gui.settings import SettingsStore
+
+    root = tk.Tk()
+    root.withdraw()
+    gui = KeilToolGui(root, settings_store=SettingsStore(tmp_path / "settings.json"))
+    try:
+        gui._rtt_display = RttDisplayBuffer(max_records=2)
+        gui._clear_rtt_display()
+        for text in ("I/one\n", "I/two\n", "I/three\n"):
+            gui._handle_rtt_event(
+                RttEvent("data", text=text, level=RttLevel.INFO, terminal=0)
+            )
+
+        assert gui.output._rtt_text.get("1.0", "end-1c") == "I/two\nI/three\n"
+        assert gui.rtt_visible_counts_var.get() == "2 可见 / 2 缓存"
+    finally:
+        if not gui._destroyed:
+            gui._on_close()

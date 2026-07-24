@@ -123,6 +123,10 @@ def default_settings_path() -> Path:
     return base_dir / "KeilTool" / "gui-settings.json"
 
 
+def default_devices_path() -> Path:
+    return default_settings_path().parent / "devices"
+
+
 def _string(value: Any, default: str) -> str:
     return value if isinstance(value, str) else default
 

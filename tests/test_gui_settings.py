@@ -1,7 +1,7 @@
 import json
 from pathlib import Path
 
-from keiltool.gui.settings import GuiSettings, SettingsStore
+from keiltool.gui.settings import GuiSettings, SettingsStore, default_devices_path
 
 
 def test_settings_round_trip(tmp_path):
@@ -118,3 +118,9 @@ def test_settings_diagnostic_renders_in_openocd_output():
     assert rendered
     assert "settings_corrupt" in rendered[0]
     assert "Settings JSON is invalid." in rendered[0]
+
+
+def test_default_devices_path_uses_appdata(monkeypatch, tmp_path):
+    monkeypatch.setenv("APPDATA", str(tmp_path))
+
+    assert default_devices_path() == tmp_path / "KeilTool" / "devices"

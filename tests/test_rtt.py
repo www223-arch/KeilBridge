@@ -11,6 +11,7 @@ import pytest
 
 from keiltool.core.openocd_backend import OpenOcdConfig
 from keiltool.core.rtt import RttRequest, RttSession, build_rtt_command
+from keiltool.core.rtt_log import RttLevel
 
 
 CONFIG = OpenOcdConfig(
@@ -157,6 +158,44 @@ def test_session_decodes_fragmented_utf8_and_writes_log(tmp_path):
     assert log_path.read_text(encoding="utf-8") == expected
     assert not server.is_alive()
     assert session.wait(timeout=1)
+
+
+def test_session_emits_structured_levels_and_persists_all_text(tmp_path):
+    payload = (
+        b"\xff0\x1b[36;22mI/ready\x1b[0m\n"
+        b"\xff1D/control loop\n"
+        b"\xff2V/sample\n"
+    )
+    port, server = _start_rtt_server(payload)
+    process = FakeProcess(stdout_lines=("Info : rtt: Found control block at 0x20000000\n",))
+    log_path = tmp_path / "rtt.log"
+    session = RttSession(
+        CONFIG,
+        RttRequest(scan_address=0x20000000, scan_size=0x10000, port=port),
+        log_path,
+        popen_factory=lambda *args, **kwargs: process,
+        connect_timeout=0.5,
+    )
+
+    session.start()
+    events = []
+    while True:
+        event = session.events.get(timeout=1)
+        events.append(event)
+        if event.kind == "eof":
+            break
+        if event.kind == "error":
+            raise AssertionError(event.message)
+    server.join(timeout=1)
+    session.stop()
+
+    data = [event for event in events if event.kind == "data"]
+    assert [(event.level, event.terminal, event.text) for event in data] == [
+        (RttLevel.INFO, 0, "I/ready\n"),
+        (RttLevel.DEBUG, 1, "D/control loop\n"),
+        (RttLevel.VERBOSE, 2, "V/sample\n"),
+    ]
+    assert log_path.read_text(encoding="utf-8") == "I/ready\nD/control loop\nV/sample\n"
 
 
 class FakeClock:

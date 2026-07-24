@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import codecs
 from dataclasses import dataclass
 from pathlib import Path
 import queue
@@ -11,6 +10,7 @@ import time
 from typing import Callable, Protocol, TextIO
 
 from .openocd_backend import OpenOcdConfig
+from .rtt_log import RttLevel, RttLogRecord, SeggerRttLogParser
 
 
 @dataclass(frozen=True, slots=True)
@@ -54,6 +54,8 @@ class RttEvent:
     message: str = ""
     stream: str = ""
     outcome: str = ""
+    level: RttLevel | None = None
+    terminal: int | None = None
 
 
 class RttProcess(Protocol):
@@ -273,38 +275,49 @@ class RttSession:
                 self._control_block_found.set()
 
     def _read_rtt_socket(self, connection: socket.socket) -> None:
-        decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
-        decoder_finalized = False
+        parser = SeggerRttLogParser()
+        parser_finalized = False
         try:
             while not self._stop_requested.is_set():
                 data = connection.recv(4096)
                 if not data:
-                    self._write_decoded(decoder.decode(b"", final=True))
-                    decoder_finalized = True
+                    for record in parser.finish():
+                        self._write_record(record)
+                    parser_finalized = True
                     self._emit("eof", message="RTT TCP connection closed.")
                     return
-                self._write_decoded(decoder.decode(data, final=False))
+                for record in parser.feed(data):
+                    self._write_record(record)
         except OSError as exc:
             if not self._stop_requested.is_set():
                 self._emit("error", message=f"RTT TCP receive failed: {exc}")
         finally:
-            if not decoder_finalized:
-                self._write_decoded(decoder.decode(b"", final=True))
+            if not parser_finalized:
+                for record in parser.finish():
+                    self._write_record(record)
             self._close_socket(connection)
 
-    def _write_decoded(self, text: str) -> None:
-        if not text:
+    def _write_record(self, record: RttLogRecord) -> None:
+        if not record.text:
             return
         with self._log_lock:
             if self._log_file is None:
                 return
             try:
-                self._log_file.write(text)
+                self._log_file.write(record.text)
                 self._log_file.flush()
             except Exception as exc:
                 self._emit("error", message=f"RTT log write failed: {exc}")
                 return
-        self._emit("data", text=text)
+        self._emit(
+            "data",
+            text=record.text,
+            level=record.level,
+            terminal=record.terminal,
+        )
+
+    def _write_decoded(self, text: str) -> None:
+        self._write_record(RttLogRecord(RttLevel.INFO, text, 0))
 
     def _process_exited(self) -> bool:
         process = self._process
@@ -405,5 +418,25 @@ class RttSession:
             message = "RTT session cleanup is incomplete."
         self._emit("stopped", message=message, outcome=outcome)
 
-    def _emit(self, kind: str, *, text: str = "", message: str = "", stream: str = "", outcome: str = "") -> None:
-        self.events.put(RttEvent(kind=kind, text=text, message=message, stream=stream, outcome=outcome))
+    def _emit(
+        self,
+        kind: str,
+        *,
+        text: str = "",
+        message: str = "",
+        stream: str = "",
+        outcome: str = "",
+        level: RttLevel | None = None,
+        terminal: int | None = None,
+    ) -> None:
+        self.events.put(
+            RttEvent(
+                kind=kind,
+                text=text,
+                message=message,
+                stream=stream,
+                outcome=outcome,
+                level=level,
+                terminal=terminal,
+            )
+        )

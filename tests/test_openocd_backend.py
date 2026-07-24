@@ -263,6 +263,11 @@ def test_incomplete_one_shot_cleanup_retains_process_until_retry_confirms_exit(t
     assert result.outcome == "incomplete"
     assert operation.cleanup_pending is True
 
+    still_incomplete = operation.retry_cleanup()
+
+    assert still_incomplete.complete is False
+    assert operation.cleanup_pending is True
+
     process.returncode = -9
     cleanup = operation.retry_cleanup()
 

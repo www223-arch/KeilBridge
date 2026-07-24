@@ -216,10 +216,7 @@ class RttSession:
                 self._emit("error", message="RTT worker threads did not finish during cleanup.")
         finally:
             outcome = "incomplete" if incomplete else "forced" if forced else "clean"
-            self._emit_terminal(outcome)
-            with self._lifecycle:
-                self._state = "cleanup_incomplete" if incomplete else "stopped"
-                self._lifecycle.notify_all()
+            self._finish_cleanup(outcome)
 
     def wait(self, timeout: float | None = None) -> bool:
         """Wait for started worker threads to finish, returning whether they did."""
@@ -362,10 +359,10 @@ class RttSession:
     def _close_log(self) -> bool:
         with self._lock:
             log_file = self._log_file
+            self._log_file = None
         if log_file is None:
             return True
         closed = True
-        close_succeeded = False
         try:
             log_file.flush()
         except Exception as exc:
@@ -373,28 +370,23 @@ class RttSession:
             self._emit("error", message=f"RTT log flush during cleanup failed: {exc}")
         try:
             log_file.close()
-            close_succeeded = True
         except Exception as exc:
             closed = False
             self._emit("error", message=f"RTT log close during cleanup failed: {exc}")
-        if close_succeeded:
-            with self._lock:
-                if self._log_file is log_file:
-                    self._log_file = None
         return closed
 
     def _finish_startup_failure(self, message: str) -> None:
         self._emit("error", message=message)
         outcome = "startup_failed" if self._close_log() else "incomplete"
-        self._emit_terminal(outcome)
-        self._state = "cleanup_incomplete" if outcome == "incomplete" else "stopped"
-        self._lifecycle.notify_all()
+        self._finish_cleanup(outcome)
 
-    def _emit_terminal(self, outcome: str) -> None:
+    def _finish_cleanup(self, outcome: str) -> None:
         with self._lifecycle:
             if self._cleanup_emitted:
                 return
+            self._state = "cleanup_incomplete" if outcome == "incomplete" else "stopped"
             self._cleanup_emitted = True
+            self._lifecycle.notify_all()
         if outcome == "clean":
             message = "RTT session stopped cleanly."
         elif outcome == "forced":

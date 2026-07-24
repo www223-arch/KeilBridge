@@ -476,6 +476,36 @@ class UnresponsiveSocket:
         pass
 
 
+class ObservedCondition(threading.Condition):
+    def __init__(self) -> None:
+        super().__init__(threading.RLock())
+        self.wait_entered = threading.Event()
+
+    def wait(self, timeout: float | None = None) -> bool:
+        self.wait_entered.set()
+        return super().wait(timeout)
+
+
+class FirstTerminalBlockingQueue(queue.Queue):
+    def __init__(self) -> None:
+        super().__init__()
+        self.first_terminal_published = threading.Event()
+        self.second_terminal_published = threading.Event()
+        self.release_first_publisher = threading.Event()
+        self._terminal_count = 0
+
+    def put(self, item, block: bool = True, timeout: float | None = None) -> None:
+        super().put(item, block=block, timeout=timeout)
+        if getattr(item, "kind", "") != "stopped":
+            return
+        self._terminal_count += 1
+        if self._terminal_count == 1:
+            self.first_terminal_published.set()
+            self.release_first_publisher.wait(timeout=1)
+        else:
+            self.second_terminal_published.set()
+
+
 def test_stop_reports_join_failure_and_emits_one_cleanup_event(tmp_path):
     process = FakeProcess(stdout_lines=("rtt: Found control block at 0x20000000\n",))
     connection = UnresponsiveSocket()
@@ -528,6 +558,65 @@ def test_incomplete_cleanup_can_be_retried_until_complete(tmp_path):
     assert [event.outcome for event in second] == ["clean"]
 
 
+def test_incomplete_cleanup_can_be_retried_from_terminal_event_consumer(tmp_path):
+    process = FakeProcess(stdout_lines=("rtt: Found control block at 0x20000000\n",))
+    connection = UnresponsiveSocket()
+    session = RttSession(
+        CONFIG,
+        RttRequest(scan_address=0x20000000, scan_size=0x10000),
+        tmp_path / "rtt.log",
+        popen_factory=lambda *args, **kwargs: process,
+        socket_factory=lambda *args, **kwargs: connection,
+        stop_timeout=0.01,
+    )
+    lifecycle = ObservedCondition()
+    events = FirstTerminalBlockingQueue()
+    session._lifecycle = lifecycle
+    session.events = events
+    session.start()
+    _next_event(session, "connected")
+    assert connection.recv_entered.wait(timeout=1)
+
+    outcomes: list[str] = []
+    retry_started = threading.Event()
+
+    def retry_on_incomplete() -> None:
+        try:
+            while len(outcomes) < 2:
+                event = session.events.get(timeout=1)
+                if event.kind != "stopped":
+                    continue
+                outcomes.append(event.outcome)
+                if event.outcome == "incomplete":
+                    connection.release.set()
+                    retry_started.set()
+                    session.stop()
+        except queue.Empty:
+            pass
+
+    consumer = threading.Thread(target=retry_on_incomplete)
+    consumer.start()
+    initial_stop = threading.Thread(target=session.stop)
+    initial_stop.start()
+    assert events.first_terminal_published.wait(timeout=1)
+    assert retry_started.wait(timeout=1)
+    deadline = time.monotonic() + 1
+    while (
+        not lifecycle.wait_entered.is_set()
+        and not events.second_terminal_published.is_set()
+        and time.monotonic() < deadline
+    ):
+        time.sleep(0.001)
+    events.release_first_publisher.set()
+    initial_stop.join(timeout=2)
+    consumer.join(timeout=2)
+    connection.release.set()
+
+    assert not initial_stop.is_alive()
+    assert not consumer.is_alive()
+    assert outcomes == ["incomplete", "clean"]
+
+
 def test_stop_reports_unreaped_forced_kill_as_incomplete(tmp_path):
     clock = FakeClock()
     process = UnreapedKillProcess()
@@ -573,6 +662,108 @@ class FlakyCloseLog(FailingLog):
         self.close_calls += 1
         if self.close_calls == 1:
             raise OSError("log close failed")
+
+
+class OverlappingCloseLog:
+    def __init__(self) -> None:
+        self.writes: list[str] = []
+        self.closed = False
+        self.write_after_close = False
+        self.writer_entered = threading.Event()
+        self.release_writer = threading.Event()
+        self.close_flush_entered = threading.Event()
+        self.release_close_flush = threading.Event()
+        self.close_called = threading.Event()
+
+    def write(self, text: str) -> int:
+        self.writer_entered.set()
+        self.release_writer.wait(timeout=1)
+        if self.closed:
+            self.write_after_close = True
+        self.writes.append(text)
+        return len(text)
+
+    def flush(self) -> None:
+        if threading.current_thread().name == "rtt-log-closer":
+            self.close_flush_entered.set()
+            self.release_close_flush.wait(timeout=1)
+
+    def close(self) -> None:
+        self.closed = True
+        self.close_called.set()
+
+
+class CloseFailingRecordingLog:
+    def __init__(self) -> None:
+        self.writes: list[str] = []
+
+    def write(self, text: str) -> int:
+        self.writes.append(text)
+        return len(text)
+
+    def flush(self) -> None:
+        pass
+
+    def close(self) -> None:
+        raise OSError("log close failed")
+
+
+def test_close_log_detaches_handle_before_overlapping_writer(tmp_path):
+    log = OverlappingCloseLog()
+    session = RttSession(
+        CONFIG,
+        RttRequest(scan_address=0x20000000, scan_size=0x10000),
+        tmp_path / "rtt.log",
+    )
+    session._log_file = log
+    close_results: list[bool] = []
+    writer_finished = threading.Event()
+
+    closer = threading.Thread(
+        name="rtt-log-closer",
+        target=lambda: close_results.append(session._close_log()),
+    )
+
+    def write_during_close() -> None:
+        session._write_decoded("during-close")
+        writer_finished.set()
+
+    closer.start()
+    assert log.close_flush_entered.wait(timeout=1)
+    writer = threading.Thread(target=write_during_close)
+    writer.start()
+    deadline = time.monotonic() + 1
+    while not writer_finished.is_set() and not log.writer_entered.is_set() and time.monotonic() < deadline:
+        time.sleep(0.001)
+    assert writer_finished.is_set() or log.writer_entered.is_set()
+
+    log.release_close_flush.set()
+    assert log.close_called.wait(timeout=1)
+    log.release_writer.set()
+    writer.join(timeout=1)
+    closer.join(timeout=1)
+
+    assert not writer.is_alive()
+    assert not closer.is_alive()
+    assert close_results == [True]
+    assert log.writes == []
+    assert log.write_after_close is False
+
+
+def test_close_log_failure_does_not_republish_detached_handle(tmp_path):
+    log = CloseFailingRecordingLog()
+    session = RttSession(
+        CONFIG,
+        RttRequest(scan_address=0x20000000, scan_size=0x10000),
+        tmp_path / "rtt.log",
+    )
+    session._log_file = log
+
+    assert session._close_log() is False
+    session._write_decoded("after-close-failure")
+
+    assert session._log_file is None
+    assert log.writes == []
 
 
 def test_start_reports_log_directory_failure_without_launching_openocd(tmp_path):
@@ -654,11 +845,11 @@ def test_start_reports_one_incomplete_terminal_per_cleanup_attempt(tmp_path):
     session.stop()
     retry_events = _drain_events(session)
     retry_stopped = [event for event in retry_events if event.kind == "stopped"]
-    assert any(event.kind == "error" and "log close" in event.message.lower() for event in retry_events)
-    assert [event.outcome for event in retry_stopped] == ["incomplete"]
+    assert not any(event.kind == "error" and "log close" in event.message.lower() for event in retry_events)
+    assert [event.outcome for event in retry_stopped] == ["clean"]
 
 
-def test_incomplete_startup_cleanup_can_be_retried_until_complete(tmp_path):
+def test_incomplete_startup_cleanup_retry_does_not_reuse_failed_log_handle(tmp_path):
     log = FlakyCloseLog()
 
     def fail_to_launch(*args, **kwargs):
@@ -679,7 +870,7 @@ def test_incomplete_startup_cleanup_can_be_retried_until_complete(tmp_path):
 
     assert [event.outcome for event in first] == ["incomplete"]
     assert [event.outcome for event in second] == ["clean"]
-    assert log.close_calls == 2
+    assert log.close_calls == 1
 
 
 def test_stop_reports_log_close_error_and_continues_cleanup(tmp_path):

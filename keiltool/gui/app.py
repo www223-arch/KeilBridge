@@ -11,6 +11,8 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 from typing import Callable, cast
 
+from keiltool.core.device_catalog import CatalogDevice, DeviceCatalog, load_embedded_catalog
+from keiltool.core.device_import import import_device_file, load_user_catalog
 from keiltool.core.openocd_backend import (
     ConnectionResult,
     FlashResult,
@@ -28,7 +30,12 @@ from keiltool.gui.project_config import (
     load_project_targets,
 )
 from keiltool.gui.rtt_display import RttDisplayBuffer, build_rtt_view, parse_rtt_level
-from keiltool.gui.settings import GuiSettings, SettingsDiagnostic, SettingsStore
+from keiltool.gui.settings import (
+    GuiSettings,
+    SettingsDiagnostic,
+    SettingsStore,
+    default_devices_path,
+)
 from keiltool.gui.state import BusySessionError, SessionState, TaskGate
 from keiltool.gui.theme import configure_theme
 from keiltool.gui.widgets import ConfigurationPane, OutputNotebook
@@ -112,11 +119,17 @@ class KeilToolGui:
 
         settings_result = self.settings_store.load_result()
         settings = settings_result.settings
+        self._catalog_diagnostics: tuple[str, ...] = ()
+        self._catalog = DeviceCatalog()
+        self._device_by_label: dict[str, CatalogDevice] = {}
+        self._reload_device_catalog()
         self._create_variables(settings)
         self._configure_window()
         self._build_layout()
         if settings_result.diagnostic is not None:
             self._render_settings_diagnostic(settings_result.diagnostic)
+        for diagnostic in self._catalog_diagnostics:
+            self._append_openocd(f"[设备目录] {diagnostic}\n")
         self._bind_updates()
         self._refresh_controls()
 
@@ -124,11 +137,44 @@ class KeilToolGui:
         self.root.after(50, self._poll_events)
         if settings.project:
             self.root.after_idle(lambda: self._load_project(Path(settings.project), restored=True))
+        elif settings.device_vendor and settings.device_name:
+            self.root.after_idle(self._resolve_selected_target)
+
+    def _reload_device_catalog(self) -> None:
+        embedded = load_embedded_catalog()
+        user = load_user_catalog(default_devices_path())
+        self._catalog = DeviceCatalog(embedded=embedded.devices, user=user.devices)
+        self._catalog_diagnostics = user.diagnostics
+        self._device_by_label = {
+            self._device_label(device): device
+            for device in self._catalog.devices
+        }
+
+    @staticmethod
+    def _device_label(device: CatalogDevice) -> str:
+        return f"{device.device}  [{device.vendor}]"
+
+    @staticmethod
+    def _device_source_text(device: CatalogDevice | None) -> str:
+        if device is None:
+            return "未选择"
+        source = device.source
+        kind = {
+            "embedded": "内置官方目录",
+            "imported_pdsc": "用户 PDSC",
+            "imported_pack": "用户 PACK",
+            "user": "用户 JSON",
+        }.get(source.kind, source.kind or "未知来源")
+        version = f" {source.pack_version}" if source.pack_version else ""
+        return f"{kind} · {source.pack}{version}"
 
     def _create_variables(self, settings: GuiSettings) -> None:
+        selected = self._catalog.lookup(settings.device_vendor, settings.device_name)
         self.project_var = tk.StringVar(value=settings.project)
         self.target_var = tk.StringVar(value=settings.target)
-        self.device_var = tk.StringVar(value="—")
+        self.device_var = tk.StringVar(value=selected.device if selected else "—")
+        self.device_choice_var = tk.StringVar(value=self._device_label(selected) if selected else "")
+        self.device_source_var = tk.StringVar(value=self._device_source_text(selected))
         self.flash_summary_var = tk.StringVar(value="—")
         self.ram_summary_var = tk.StringVar(value="—")
         self.target_cfg_var = tk.StringVar(value="—")
@@ -160,18 +206,19 @@ class KeilToolGui:
         configure_theme(self.root)
 
     def _build_layout(self) -> None:
-        left = ttk.Frame(self.root, padding=(10, 10, 8, 8), style="Background.TFrame")
+        left = ttk.Frame(self.root, padding=(10, 6, 8, 4), style="Background.TFrame")
         left.grid(row=0, column=0, sticky="nsew")
         left.rowconfigure(0, weight=1)
         left.columnconfigure(0, weight=1)
 
-        right = ttk.Frame(self.root, padding=(0, 10, 10, 8), style="Background.TFrame")
+        right = ttk.Frame(self.root, padding=(0, 6, 10, 4), style="Background.TFrame")
         right.grid(row=0, column=1, sticky="nsew")
         right.rowconfigure(0, weight=1)
         right.columnconfigure(0, weight=1)
 
         self.controls = ConfigurationPane(left, self)
         self.controls.grid(row=0, column=0, sticky="nsew")
+        self.controls.device_combo.configure(values=tuple(self._device_by_label))
 
         self.output = OutputNotebook(
             right,
@@ -185,9 +232,9 @@ class KeilToolGui:
         )
         self.output.grid(row=0, column=0, sticky="nsew")
 
-        status = ttk.Frame(self.root, padding=(10, 4, 10, 6), style="Status.TFrame")
+        status = ttk.Frame(self.root, padding=(10, 2, 10, 3), style="Status.TFrame")
         status.grid(row=1, column=0, columnspan=2, sticky="ew")
-        ttk.Separator(status).grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 5))
+        ttk.Separator(status).grid(row=0, column=0, columnspan=2, sticky="ew", pady=(0, 3))
         ttk.Label(status, text="状态", style="Status.TLabel").grid(row=1, column=0, sticky="w")
         ttk.Label(status, textvariable=self.status_var, style="Status.TLabel").grid(
             row=1,
@@ -200,6 +247,7 @@ class KeilToolGui:
     def _bind_updates(self) -> None:
         controls = self.controls
         controls.project_button.configure(command=self._choose_project)
+        controls.device_import_button.configure(command=self._import_device)
         controls.firmware_button.configure(command=self._choose_firmware)
         controls.logs_button.configure(command=self._choose_logs_dir)
         controls.openocd_button.configure(command=self._choose_openocd)
@@ -212,6 +260,9 @@ class KeilToolGui:
         controls.auto_radio.configure(command=self._refresh_controls)
         controls.manual_radio.configure(command=self._refresh_controls)
         controls.target_combo.bind("<<ComboboxSelected>>", lambda _event: self._resolve_selected_target())
+        controls.device_combo.bind("<<ComboboxSelected>>", lambda _event: self._select_catalog_device())
+        controls.device_combo.bind("<KeyRelease>", self._filter_device_choices)
+        controls.device_combo.bind("<Return>", lambda _event: self._select_catalog_device())
         self.firmware_var.trace_add("write", lambda *_args: self._refresh_controls())
         for variable in (
             self.project_var,
@@ -219,6 +270,7 @@ class KeilToolGui:
             self.openocd_var,
             self.scripts_var,
             self.target_override_var,
+            self.device_choice_var,
         ):
             variable.trace_add("write", self._on_fact_input_changed)
         controls.project_entry.bind("<FocusOut>", lambda _event: self._load_project(Path(self.project_var.get().strip())))
@@ -227,13 +279,82 @@ class KeilToolGui:
             entry.bind("<FocusOut>", lambda _event: self._resolve_selected_target())
             entry.bind("<Return>", lambda _event: self._resolve_selected_target())
 
+    def _selected_catalog_device(self) -> CatalogDevice | None:
+        value = self.device_choice_var.get().strip()
+        selected = self._device_by_label.get(value)
+        if selected is not None:
+            return selected
+        return self._catalog.lookup_any_vendor(value)
+
+    def _filter_device_choices(self, _event: tk.Event | None = None) -> None:
+        if self.project_var.get().strip():
+            return
+        query = self.device_choice_var.get().strip().lower()
+        values = tuple(
+            label
+            for label in self._device_by_label
+            if not query or query in label.lower()
+        )
+        self.controls.device_combo.configure(values=values[:300])
+
+    def _select_catalog_device(self) -> None:
+        if self.project_var.get().strip() or self._hardware_busy():
+            return
+        device = self._selected_catalog_device()
+        if device is None:
+            self.device_source_var.set("未找到精确型号")
+            self._facts = None
+            self._clear_facts("请选择设备目录中的精确型号")
+            self._refresh_controls()
+            return
+        self.device_choice_var.set(self._device_label(device))
+        self.device_source_var.set(self._device_source_text(device))
+        self.controls.device_combo.configure(values=tuple(self._device_by_label))
+        self._resolve_selected_target()
+
+    def _import_device(self) -> None:
+        path = filedialog.askopenfilename(
+            parent=self.root,
+            title="导入设备定义",
+            filetypes=[
+                ("设备定义", "*.pdsc *.pack *.json"),
+                ("CMSIS-Pack", "*.pack"),
+                ("PDSC", "*.pdsc"),
+                ("JSON", "*.json"),
+            ],
+        )
+        if not path:
+            return
+        try:
+            result = import_device_file(path, default_devices_path())
+            self._reload_device_catalog()
+            self.controls.device_combo.configure(values=tuple(self._device_by_label))
+            selected = self._catalog.lookup(
+                result.devices[0].vendor,
+                result.devices[0].device,
+            )
+            if selected is None:
+                raise ValueError("导入成功，但刷新目录后找不到设备。")
+            if not self.project_var.get().strip():
+                self.device_choice_var.set(self._device_label(selected))
+                self.device_source_var.set(self._device_source_text(selected))
+                self._resolve_selected_target()
+            self._append_openocd(
+                f"[设备目录] 已导入 {len(result.devices)} 个型号: {result.output_path}\n"
+            )
+        except Exception as exc:
+            messagebox.showerror("设备导入失败", str(exc), parent=self.root)
+
     def _visible_fact_inputs(self) -> FactInputs:
+        selected = None if self.project_var.get().strip() else self._selected_catalog_device()
         return FactInputs(
             project=self.project_var.get().strip(),
             target=self.target_var.get().strip(),
             openocd=self.openocd_var.get().strip(),
             scripts=self.scripts_var.get().strip(),
             target_override=self.target_override_var.get().strip(),
+            device_vendor=selected.vendor if selected else "",
+            device_name=selected.device if selected else "",
         )
 
     def _on_fact_input_changed(self, *_args: object) -> None:
@@ -296,6 +417,18 @@ class KeilToolGui:
         if self._hardware_busy():
             self._show_busy()
             return
+        if not self.project_var.get().strip():
+            self.controls.target_combo.configure(values=())
+            self.target_var.set("")
+            selected = self._selected_catalog_device()
+            self.device_source_var.set(self._device_source_text(selected))
+            if selected is None:
+                self._facts = None
+                self._clear_facts("请选择设备型号")
+                self._refresh_controls()
+            else:
+                self._resolve_selected_target()
+            return
         try:
             loaded = load_project_targets(path)
         except Exception as exc:
@@ -352,6 +485,16 @@ class KeilToolGui:
         self._freshness.observe(current)
         self._freshness.accept(snapshot)
         self._facts = facts
+        if current.project:
+            catalog_device = self._catalog.lookup_any_vendor(facts.device)
+            if catalog_device is not None:
+                self.device_choice_var.set(self._device_label(catalog_device))
+                self.device_source_var.set(
+                    f"Keil 工程 · {self._device_source_text(catalog_device)}"
+                )
+            else:
+                self.device_choice_var.set(facts.device)
+                self.device_source_var.set("Keil 工程（设备目录无精确匹配）")
         self._apply_facts_display(target_facts_display(facts))
         if not self.logs_dir_var.get().strip():
             self.logs_dir_var.set(facts.default_log_dir)
@@ -946,6 +1089,9 @@ class KeilToolGui:
                 pass
 
         firmware_is_hex = Path(self.firmware_var.get().strip()).suffix.lower() == ".hex"
+        controls.device_combo.configure(
+            state="disabled" if busy else ("readonly" if self.project_var.get().strip() else "normal")
+        )
         controls.bin_address_entry.configure(state="disabled" if busy or firmware_is_hex else "normal")
         controls.rtt_address_entry.configure(
             state="normal" if not busy and self.rtt_manual_var.get() else "disabled"
@@ -1094,6 +1240,7 @@ class KeilToolGui:
         self.root.destroy()
 
     def _current_settings(self) -> GuiSettings:
+        selected = self._selected_catalog_device()
         return GuiSettings(
             project=self.project_var.get().strip(),
             target=self.target_var.get().strip(),
@@ -1108,6 +1255,8 @@ class KeilToolGui:
             rtt_timeout_ms=int_or_default(self.rtt_timeout_var.get(), 5000),
             rtt_display_level=self.rtt_display_level_var.get(),
             logs_dir=self.logs_dir_var.get().strip(),
+            device_vendor=selected.vendor if selected else "",
+            device_name=selected.device if selected else "",
         )
 
 

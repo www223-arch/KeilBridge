@@ -7,22 +7,26 @@ from keiltool.core.rtt_log import RttLevel
 
 
 PALETTE = {
-    "background": "#F3F5F7",
-    "surface": "#FFFFFF",
-    "surface_alt": "#E9EEF2",
-    "border": "#D7DEE5",
-    "text": "#202A33",
-    "muted": "#657481",
+    "background": "#DCE5E9",
+    "surface": "#F9FBFC",
+    "surface_alt": "#DFEAEC",
+    "border": "#B8C8CE",
+    "text": "#17313B",
+    "muted": "#5B6F77",
     "primary": "#087F8C",
     "primary_active": "#066B75",
-    "selection": "#CDE8EB",
-    "success": "#15803D",
-    "warning": "#B36B00",
-    "error": "#B42318",
-    "assert": "#8B2C83",
-    "info": "#087F8C",
-    "debug": "#15803D",
-    "verbose": "#315A8C",
+    "selection": "#245766",
+    "console": "#0B1C23",
+    "console_chrome": "#102730",
+    "console_border": "#17313B",
+    "console_text": "#DFECEF",
+    "success": "#5FD28A",
+    "warning": "#F4C15D",
+    "error": "#FF7770",
+    "assert": "#F29BEA",
+    "info": "#67D5E0",
+    "debug": "#72D99B",
+    "verbose": "#9ABEF4",
 }
 
 RTT_LEVEL_COLORS = {
@@ -51,6 +55,8 @@ def configure_theme(root: tk.Tk) -> ttk.Style:
         font=("Microsoft YaHei UI", 9),
     )
     style.configure("TFrame", background=PALETTE["surface"])
+    style.configure("Console.TFrame", background=PALETTE["console_chrome"])
+    style.configure("Console.TLabel", background=PALETTE["console_chrome"], foreground=PALETTE["console_text"])
     style.configure("Surface.TFrame", background=PALETTE["surface"])
     style.configure("Background.TFrame", background=PALETTE["background"])
     style.configure("TLabel", background=PALETTE["surface"], foreground=PALETTE["text"])
@@ -139,6 +145,18 @@ def configure_theme(root: tk.Tk) -> ttk.Style:
         background=[("selected", PALETTE["surface"])],
         foreground=[("selected", PALETTE["primary"])],
     )
+    style.configure("Console.TNotebook", background=PALETTE["console_chrome"], borderwidth=0)
+    style.configure(
+        "Console.TNotebook.Tab",
+        background=PALETTE["console_border"],
+        foreground="#AFC4CA",
+        padding=(14, 7),
+    )
+    style.map(
+        "Console.TNotebook.Tab",
+        background=[("selected", PALETTE["console_chrome"])],
+        foreground=[("selected", "#FFFFFF")],
+    )
     style.configure("Status.TFrame", background=PALETTE["surface"])
     style.configure("Status.TLabel", background=PALETTE["surface"], foreground=PALETTE["text"])
     style.configure(
@@ -150,12 +168,12 @@ def configure_theme(root: tk.Tk) -> ttk.Style:
 
 def configure_log_text(widget: tk.Text, *, rtt: bool = False) -> None:
     widget.configure(
-        background=PALETTE["surface"],
-        foreground=PALETTE["text"],
-        insertbackground=PALETTE["text"],
+        background=PALETTE["console"],
+        foreground=PALETTE["console_text"],
+        insertbackground=PALETTE["console_text"],
         selectbackground=PALETTE["selection"],
-        selectforeground=PALETTE["text"],
-        highlightbackground=PALETTE["border"],
+        selectforeground="#FFFFFF",
+        highlightbackground=PALETTE["console_border"],
         highlightcolor=PALETTE["primary"],
         highlightthickness=1,
         borderwidth=0,

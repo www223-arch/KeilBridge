@@ -265,6 +265,26 @@ def test_gui_applies_theme_and_filters_structured_rtt_records(tmp_path):
         )
         assert root.cget("background") == PALETTE["background"]
         assert gui.output._rtt_text.tag_cget("ERROR", "foreground") == PALETTE["error"]
+        label = next(
+            value
+            for value in gui.controls.device_combo.cget("values")
+            if value.startswith("GD32F303CC ")
+        )
+        gui.device_choice_var.set(label)
+        gui._select_catalog_device()
+        assert gui._current_settings().device_name == "GD32F303CC"
+        assert "官方目录" in gui.device_source_var.get()
+
+        gui.output.append_openocd("alpha\nbeta\n")
+        view = gui.output.openocd_view
+        view.text.tag_add("sel", "1.0", "1.5")
+        assert view.copy_selected() == "alpha"
+        assert view.copy_all() == "alpha\nbeta\n"
+        assert tuple(view.menu.entrycget(index, "label") for index in range(3)) == (
+            "复制",
+            "全选",
+            "复制全部",
+        )
 
         gui._handle_rtt_event(RttEvent("data", text="I/ready\n", level=RttLevel.INFO, terminal=0))
         gui._handle_rtt_event(RttEvent("data", text="D/loop\n", level=RttLevel.DEBUG, terminal=1))

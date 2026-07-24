@@ -1,8 +1,10 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum, auto
-from typing import Callable
+import queue
+import time
+from typing import Callable, Protocol
 
 
 @dataclass(frozen=True, slots=True)
@@ -202,10 +204,138 @@ def save_failure_action(answer: bool | None) -> SaveFailureAction:
     return SaveFailureAction.STAY_OPEN
 
 
+class CancellableOperation(Protocol):
+    def cancel(self) -> None: ...
+
+
+class OneShotLifecycleController:
+    def __init__(self) -> None:
+        self._owner: CancellableOperation | None = None
+        self.close_requested = False
+
+    @property
+    def owns_operation(self) -> bool:
+        return self._owner is not None
+
+    @property
+    def can_destroy(self) -> bool:
+        return self.close_requested and self._owner is None
+
+    def owns(self, operation: object) -> bool:
+        return operation is self._owner
+
+    def begin(self, operation: CancellableOperation) -> None:
+        if self._owner is not None:
+            raise RuntimeError("A one-shot OpenOCD operation is already owned.")
+        self._owner = operation
+
+    def complete(self, operation: object) -> bool:
+        if operation is not self._owner:
+            return False
+        self._owner = None
+        return True
+
+    def request_close(self) -> None:
+        self.close_requested = True
+        if self._owner is not None:
+            self._owner.cancel()
+
+    def cancel_close(self) -> None:
+        self.close_requested = False
+
+
+@dataclass(frozen=True, slots=True)
+class PolledEvent:
+    source: str
+    event: object
+
+
+@dataclass(frozen=True, slots=True)
+class EventPollBatch:
+    items: tuple[PolledEvent, ...]
+    raw_count: int
+    backlog: bool
+
+
+class EventQueue(Protocol):
+    def get_nowait(self) -> object: ...
+
+    def empty(self) -> bool: ...
+
+
+class BoundedEventPoller:
+    def __init__(
+        self,
+        *,
+        max_events: int = 200,
+        time_budget: float = 0.01,
+        monotonic: Callable[[], float] = time.monotonic,
+    ) -> None:
+        if max_events <= 0:
+            raise ValueError("Event poll count must be positive.")
+        if time_budget <= 0:
+            raise ValueError("Event poll time budget must be positive.")
+        self._max_events = max_events
+        self._time_budget = time_budget
+        self._monotonic = monotonic
+
+    def drain(
+        self,
+        ui_events: EventQueue,
+        rtt_events: EventQueue | None,
+    ) -> EventPollBatch:
+        started = self._monotonic()
+        items: list[PolledEvent] = []
+        raw_count = 0
+        queues = (("ui", ui_events), ("rtt", rtt_events))
+        while raw_count < self._max_events:
+            if raw_count and self._monotonic() - started >= self._time_budget:
+                break
+            pulled = False
+            for source, event_queue in queues:
+                if event_queue is None or raw_count >= self._max_events:
+                    continue
+                if raw_count and self._monotonic() - started >= self._time_budget:
+                    break
+                try:
+                    event = event_queue.get_nowait()
+                except queue.Empty:
+                    continue
+                raw_count += 1
+                pulled = True
+                self._append(items, source, event)
+            if not pulled:
+                break
+        backlog = not ui_events.empty() or bool(rtt_events is not None and not rtt_events.empty())
+        return EventPollBatch(tuple(items), raw_count, backlog)
+
+    @staticmethod
+    def _append(items: list[PolledEvent], source: str, event: object) -> None:
+        if (
+            source == "rtt"
+            and getattr(event, "kind", "") == "data"
+            and items
+            and items[-1].source == "rtt"
+            and getattr(items[-1].event, "kind", "") == "data"
+        ):
+            previous = items[-1]
+            merged = replace(
+                previous.event,
+                text=str(getattr(previous.event, "text", "")) + str(getattr(event, "text", "")),
+            )
+            items[-1] = PolledEvent(source, merged)
+            return
+        items.append(PolledEvent(source, event))
+
+
 __all__ = [
+    "BoundedEventPoller",
+    "EventPollBatch",
     "FactInputs",
     "FreshnessController",
     "LifecycleAction",
+    "OneShotLifecycleController",
+    "PolledEvent",
     "RttLifecycleController",
     "RttPhase",
     "SaveFailureAction",

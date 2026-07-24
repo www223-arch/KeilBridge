@@ -33,12 +33,21 @@ def _project_file(tmp_path: Path, name: str = "motor") -> Path:
 
 def _scripts_dir(tmp_path: Path) -> Path:
     scripts = tmp_path / "scripts"
+    (scripts / "interface").mkdir(parents=True)
     (scripts / "target").mkdir(parents=True)
+    (scripts / "interface" / "stlink.cfg").write_text("# interface\n", encoding="utf-8")
     (scripts / "target" / "stm32f3x.cfg").write_text("# target\n", encoding="utf-8")
     (scripts / "target" / "custom.cfg").write_text("# custom\n", encoding="utf-8")
     (scripts / "target" / "custom.CFG").write_text("# custom\n", encoding="utf-8")
     (scripts / "target" / "not-a-config.txt").write_text("# not a config\n", encoding="utf-8")
     return scripts
+
+
+def _openocd_file(tmp_path: Path) -> Path:
+    executable = tmp_path / "openocd.exe"
+    executable.parent.mkdir(parents=True, exist_ok=True)
+    executable.write_bytes(b"fake")
+    return executable
 
 
 def test_load_project_targets_returns_an_immutable_project_context(tmp_path):
@@ -57,7 +66,7 @@ def test_resolve_target_facts_uses_verified_family_mapping(tmp_path):
     facts = resolve_target_facts(
         loaded.targets[0],
         loaded.project_root,
-        openocd_path="D:/tools/openocd.exe",
+        openocd_path=_openocd_file(tmp_path),
         scripts_dir=scripts,
     )
 
@@ -75,8 +84,21 @@ def test_resolve_target_facts_accepts_verified_relative_and_absolute_overrides(t
     absolute_cfg = tmp_path / "outside.CFG"
     absolute_cfg.write_text("# target\n", encoding="utf-8")
 
-    relative = resolve_target_facts(loaded.targets[0], loaded.project_root, scripts_dir=scripts, target_override="target/custom.CFG")
-    absolute = resolve_target_facts(loaded.targets[0], loaded.project_root, scripts_dir=scripts, target_override=absolute_cfg)
+    openocd = _openocd_file(tmp_path)
+    relative = resolve_target_facts(
+        loaded.targets[0],
+        loaded.project_root,
+        openocd_path=openocd,
+        scripts_dir=scripts,
+        target_override="target/custom.CFG",
+    )
+    absolute = resolve_target_facts(
+        loaded.targets[0],
+        loaded.project_root,
+        openocd_path=openocd,
+        scripts_dir=scripts,
+        target_override=absolute_cfg,
+    )
 
     assert relative.ready is True
     assert relative.target_cfg == "target/custom.CFG"
@@ -91,7 +113,12 @@ def test_unavailable_target_cfg_fails_closed_and_missing_ram_is_reported(tmp_pat
     scripts = _scripts_dir(tmp_path)
 
     unavailable = resolve_target_facts(loaded.targets[0], loaded.project_root, scripts_dir=tmp_path / "empty-scripts")
-    missing_ram = resolve_target_facts(loaded.targets[1], loaded.project_root, scripts_dir=scripts)
+    missing_ram = resolve_target_facts(
+        loaded.targets[1],
+        loaded.project_root,
+        openocd_path=_openocd_file(tmp_path),
+        scripts_dir=scripts,
+    )
 
     assert unavailable.ready is False
     assert unavailable.resolution_reason
@@ -150,3 +177,47 @@ def test_resolve_target_facts_requires_project_root(tmp_path):
 
     with pytest.raises(TypeError):
         resolve_target_facts(loaded.targets[0])
+
+
+def test_hardware_readiness_validates_executable_scripts_interface_and_target_cfg(tmp_path):
+    loaded = load_project_targets(_project_file(tmp_path / "project"))
+    target = loaded.targets[0]
+    openocd = _openocd_file(tmp_path / "valid")
+    scripts = _scripts_dir(tmp_path / "valid")
+
+    valid = resolve_target_facts(
+        target,
+        loaded.project_root,
+        openocd_path=openocd,
+        scripts_dir=scripts,
+    )
+    missing_executable = resolve_target_facts(
+        target,
+        loaded.project_root,
+        openocd_path=tmp_path / "missing-openocd.exe",
+        scripts_dir=scripts,
+    )
+    missing_interface_scripts = _scripts_dir(tmp_path / "missing-interface")
+    (missing_interface_scripts / "interface" / "stlink.cfg").unlink()
+    missing_interface = resolve_target_facts(
+        target,
+        loaded.project_root,
+        openocd_path=openocd,
+        scripts_dir=missing_interface_scripts,
+    )
+    missing_target_scripts = _scripts_dir(tmp_path / "missing-target")
+    (missing_target_scripts / "target" / "stm32f3x.cfg").unlink()
+    missing_target = resolve_target_facts(
+        target,
+        loaded.project_root,
+        openocd_path=openocd,
+        scripts_dir=missing_target_scripts,
+    )
+
+    assert valid.ready is True
+    assert missing_executable.ready is False
+    assert "executable" in missing_executable.resolution_reason.lower()
+    assert missing_interface.ready is False
+    assert "interface" in missing_interface.resolution_reason.lower()
+    assert missing_target.ready is False
+    assert "target" in missing_target.resolution_reason.lower()

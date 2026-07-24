@@ -16,6 +16,7 @@ from keiltool.core.openocd_backend import (
     ConnectionResult,
     FlashResult,
     OpenOcdConfig,
+    OpenOcdOperation,
     run_connection_check,
     run_flash,
 )
@@ -24,13 +25,15 @@ from keiltool.gui.project_config import (
     ProjectTargetFacts,
     load_project_targets,
 )
-from keiltool.gui.settings import GuiSettings, SettingsStore
+from keiltool.gui.settings import GuiSettings, SettingsDiagnostic, SettingsStore
 from keiltool.gui.state import BusySessionError, SessionState, TaskGate
 from keiltool.gui.widgets import ConfigurationPane, OutputNotebook
 from keiltool.gui.workbench_controller import (
+    BoundedEventPoller,
     FactInputs,
     FreshnessController,
     LifecycleAction,
+    OneShotLifecycleController,
     RttLifecycleController,
     RttPhase,
     SaveFailureAction,
@@ -86,7 +89,9 @@ class KeilToolGui:
         self.settings_store = settings_store or SettingsStore()
         self.gate = TaskGate()
         self._freshness = FreshnessController()
+        self._one_shot_lifecycle = OneShotLifecycleController()
         self._rtt_lifecycle = RttLifecycleController()
+        self._event_poller = BoundedEventPoller()
         self._events: queue.Queue[_UiEvent] = queue.Queue()
         self._facts: ProjectTargetFacts | None = None
         self._rtt_session: RttSession | None = None
@@ -97,10 +102,13 @@ class KeilToolGui:
         self._closing = False
         self._destroyed = False
 
-        settings = self.settings_store.load()
+        settings_result = self.settings_store.load_result()
+        settings = settings_result.settings
         self._create_variables(settings)
         self._configure_window()
         self._build_layout()
+        if settings_result.diagnostic is not None:
+            self._render_settings_diagnostic(settings_result.diagnostic)
         self._bind_updates()
         self._refresh_controls()
 
@@ -372,7 +380,8 @@ class KeilToolGui:
             config = self._build_openocd_config(snapshot)
             log_dir = self._log_dir()
             target = snapshot.target
-            self.gate.begin(SessionState.CONNECT)
+            operation = OpenOcdOperation(timeout=30.0)
+            self._begin_one_shot(SessionState.CONNECT, operation)
         except BusySessionError:
             self._show_busy()
             return
@@ -383,7 +392,14 @@ class KeilToolGui:
         self._refresh_controls()
         self._start_worker(
             "connection-result",
-            lambda: run_connection_check(config, log_dir, target=target),
+            lambda: run_connection_check(
+                config,
+                log_dir,
+                operation=operation,
+                target=target,
+                target_name=str(getattr(target, "name", "")),
+            ),
+            owner=operation,
         )
 
     def _flash(self) -> None:
@@ -419,7 +435,8 @@ class KeilToolGui:
         if not confirmed:
             return
         try:
-            self.gate.begin(SessionState.FLASH)
+            operation = OpenOcdOperation(timeout=300.0)
+            self._begin_one_shot(SessionState.FLASH, operation)
         except BusySessionError:
             self._show_busy()
             return
@@ -427,7 +444,15 @@ class KeilToolGui:
         self._refresh_controls()
         self._start_worker(
             "flash-result",
-            lambda: run_flash(config, request, log_dir, target=target),
+            lambda: run_flash(
+                config,
+                request,
+                log_dir,
+                operation=operation,
+                target=target,
+                target_name=str(getattr(target, "name", "")),
+            ),
+            owner=operation,
         )
 
     def _start_rtt(self) -> None:
@@ -526,32 +551,40 @@ class KeilToolGui:
 
         threading.Thread(target=run, name=f"keiltool-gui-{success_kind}", daemon=True).start()
 
+    def _begin_one_shot(self, state: SessionState, operation: OpenOcdOperation) -> None:
+        self.gate.begin(state)
+        try:
+            self._one_shot_lifecycle.begin(operation)
+        except Exception:
+            self.gate.finish()
+            raise
+
     def _poll_events(self) -> None:
         if self._destroyed:
             return
-        while True:
-            try:
-                event = self._events.get_nowait()
-            except queue.Empty:
-                break
-            self._handle_ui_event(event)
         session = self._rtt_session
-        if session is not None:
-            while True:
-                try:
-                    event = session.events.get_nowait()
-                except queue.Empty:
-                    break
-                self._handle_rtt_event(event)
+        batch = self._event_poller.drain(
+            self._events,
+            session.events if session is not None else None,
+        )
+        for item in batch.items:
+            if item.source == "ui":
+                self._handle_ui_event(cast(_UiEvent, item.event))
+            else:
+                self._handle_rtt_event(cast(RttEvent, item.event))
         self._update_elapsed()
         if not self._destroyed:
-            self.root.after(50, self._poll_events)
+            self.root.after(0 if batch.backlog else 50, self._poll_events)
 
     def _handle_ui_event(self, event: _UiEvent) -> None:
         if event.kind == "connection-result":
-            self._finish_connection(event.value)
+            operation, value = event.value
+            if self._one_shot_lifecycle.complete(operation):
+                self._finish_connection(value)
         elif event.kind == "flash-result":
-            self._finish_flash(event.value)
+            operation, value = event.value
+            if self._one_shot_lifecycle.complete(operation):
+                self._finish_flash(value)
         elif event.kind == "worker-error":
             operation, error, owner = event.value
             self._handle_worker_error(operation, error, owner)
@@ -603,7 +636,10 @@ class KeilToolGui:
     def _handle_worker_error(self, operation: object, error: object, owner: object | None) -> None:
         message = str(error)
         self._append_openocd(f"\n[后台任务失败] {operation}: {message}\n")
-        if str(operation).startswith("rtt") and owner is not None:
+        if owner is not None and self._one_shot_lifecycle.owns(owner):
+            self._one_shot_lifecycle.complete(owner)
+            self.gate.fail()
+        elif str(operation).startswith("rtt") and owner is not None:
             operation_name = "start" if operation == "rtt-start-settled" else "stop"
             action = self._rtt_lifecycle.worker_failed(owner, operation_name)
             if action is LifecycleAction.STOP_SESSION:
@@ -750,7 +786,11 @@ class KeilToolGui:
         )
 
     def _hardware_busy(self) -> bool:
-        return self.gate.state in _BUSY_STATES or self._rtt_lifecycle.owns_session
+        return (
+            self.gate.state in _BUSY_STATES
+            or self._one_shot_lifecycle.owns_operation
+            or self._rtt_lifecycle.owns_session
+        )
 
     def _set_status(self) -> None:
         self.status_var.set(_STATE_TEXT[self.gate.state])
@@ -772,6 +812,11 @@ class KeilToolGui:
 
     def _append_openocd(self, text: str) -> None:
         self.output.append_openocd(text)
+
+    def _render_settings_diagnostic(self, diagnostic: SettingsDiagnostic) -> None:
+        self._append_openocd(
+            f"[Settings warning] {diagnostic.code}: {diagnostic.message}\n\n"
+        )
 
     def _open_logs_dir(self) -> None:
         try:
@@ -799,22 +844,33 @@ class KeilToolGui:
             self._closing = True
             self.status_var.set("正在安全关闭")
             self._refresh_controls()
+            self._one_shot_lifecycle.request_close()
             action = self._rtt_lifecycle.request_close()
             if action is LifecycleAction.STOP_SESSION and self._rtt_session is not None:
                 self._dispatch_rtt_stop(self._rtt_session)
             return
         self._closing = True
+        self._one_shot_lifecycle.request_close()
         self._rtt_lifecycle.request_close()
         self._finish_close_if_ready()
 
     def _finish_close_if_ready(self) -> None:
-        if self._closing and self.gate.state not in _BUSY_STATES and self._rtt_lifecycle.can_destroy:
+        if (
+            self._closing
+            and self.gate.state not in _BUSY_STATES
+            and self._one_shot_lifecycle.can_destroy
+            and self._rtt_lifecycle.can_destroy
+        ):
             self._destroy()
 
     def _destroy(self) -> None:
         if self._destroyed:
             return
-        if self._hardware_busy() or not self._rtt_lifecycle.can_destroy:
+        if (
+            self._hardware_busy()
+            or not self._one_shot_lifecycle.can_destroy
+            or not self._rtt_lifecycle.can_destroy
+        ):
             self.status_var.set("仍有硬件资源未释放，无法关闭")
             return
         while True:
@@ -835,6 +891,7 @@ class KeilToolGui:
                     continue
                 if decision is SaveFailureAction.STAY_OPEN:
                     self._closing = False
+                    self._one_shot_lifecycle.cancel_close()
                     self._rtt_lifecycle.cancel_close()
                     self.status_var.set("设置未保存，已取消关闭")
                     self._refresh_controls()

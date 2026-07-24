@@ -116,7 +116,9 @@ class RttSession:
         self._retry_interval = retry_interval
         self._host = host
         self._port = request.port
-        self._lock = threading.RLock()
+        self._socket_lock = threading.Lock()
+        self._log_lock = threading.Lock()
+        self._workers_lock = threading.Lock()
         self._lifecycle = threading.Condition(threading.RLock())
         self._stop_requested = threading.Event()
         self._control_block_found = threading.Event()
@@ -189,8 +191,6 @@ class RttSession:
             except Exception as exc:
                 incomplete = True
                 self._emit("error", message=f"RTT socket cleanup failed: {exc}")
-            if not self._close_log():
-                incomplete = True
             process = self._process
             try:
                 if process is not None and self._process_running(process):
@@ -214,6 +214,8 @@ class RttSession:
             if not joined:
                 incomplete = True
                 self._emit("error", message="RTT worker threads did not finish during cleanup.")
+            elif not self._close_log():
+                incomplete = True
         finally:
             outcome = "incomplete" if incomplete else "forced" if forced else "clean"
             self._finish_cleanup(outcome)
@@ -251,7 +253,7 @@ class RttSession:
                 self._sleep(self._retry_interval)
                 continue
             connection.settimeout(None)
-            with self._lock:
+            with self._socket_lock:
                 if self._stop_requested.is_set():
                     connection.close()
                     return
@@ -272,11 +274,13 @@ class RttSession:
 
     def _read_rtt_socket(self, connection: socket.socket) -> None:
         decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+        decoder_finalized = False
         try:
             while not self._stop_requested.is_set():
                 data = connection.recv(4096)
                 if not data:
                     self._write_decoded(decoder.decode(b"", final=True))
+                    decoder_finalized = True
                     self._emit("eof", message="RTT TCP connection closed.")
                     return
                 self._write_decoded(decoder.decode(data, final=False))
@@ -284,18 +288,22 @@ class RttSession:
             if not self._stop_requested.is_set():
                 self._emit("error", message=f"RTT TCP receive failed: {exc}")
         finally:
+            if not decoder_finalized:
+                self._write_decoded(decoder.decode(b"", final=True))
             self._close_socket(connection)
 
     def _write_decoded(self, text: str) -> None:
         if not text:
             return
-        with self._lock:
-            if self._log_file is not None:
-                try:
-                    self._log_file.write(text)
-                    self._log_file.flush()
-                except Exception as exc:
-                    self._emit("error", message=f"RTT log write failed: {exc}")
+        with self._log_lock:
+            if self._log_file is None:
+                return
+            try:
+                self._log_file.write(text)
+                self._log_file.flush()
+            except Exception as exc:
+                self._emit("error", message=f"RTT log write failed: {exc}")
+                return
         self._emit("data", text=text)
 
     def _process_exited(self) -> bool:
@@ -325,14 +333,14 @@ class RttSession:
 
     def _start_worker(self, name: str, target: Callable[..., None], *args: object) -> None:
         worker = threading.Thread(name=name, target=target, args=args, daemon=True)
-        with self._lock:
+        with self._workers_lock:
             self._workers.append(worker)
         worker.start()
 
     def _join_workers(self, timeout: float | None) -> bool:
         deadline = None if timeout is None else self._monotonic() + timeout
         current = threading.current_thread()
-        with self._lock:
+        with self._workers_lock:
             workers = tuple(self._workers)
         for worker in workers:
             if worker is current:
@@ -342,7 +350,7 @@ class RttSession:
         return all(not worker.is_alive() or worker is current for worker in workers)
 
     def _close_socket(self, expected: socket.socket | None = None) -> None:
-        with self._lock:
+        with self._socket_lock:
             connection = self._socket
             if connection is None or (expected is not None and connection is not expected):
                 return
@@ -357,7 +365,7 @@ class RttSession:
             pass
 
     def _close_log(self) -> bool:
-        with self._lock:
+        with self._log_lock:
             log_file = self._log_file
             self._log_file = None
         if log_file is None:

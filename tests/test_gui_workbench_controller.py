@@ -179,3 +179,45 @@ def test_save_failure_decision_is_explicit(answer, expected_name):
     from keiltool.gui.workbench_controller import save_failure_action
 
     assert save_failure_action(answer).name == expected_name
+
+
+def test_window_close_cancels_active_one_shot_and_waits_for_completion():
+    from keiltool.gui.workbench_controller import OneShotLifecycleController
+
+    class Operation:
+        def __init__(self):
+            self.cancelled = False
+
+        def cancel(self):
+            self.cancelled = True
+
+    operation = Operation()
+    lifecycle = OneShotLifecycleController()
+    lifecycle.begin(operation)
+
+    lifecycle.request_close()
+
+    assert operation.cancelled is True
+    assert lifecycle.can_destroy is False
+    assert lifecycle.complete(operation) is True
+    assert lifecycle.can_destroy is True
+
+
+def test_bounded_event_poller_aggregates_adjacent_rtt_data_and_reports_backlog():
+    import queue
+
+    from keiltool.core.rtt import RttEvent
+    from keiltool.gui.workbench_controller import BoundedEventPoller
+
+    ui_events = queue.Queue()
+    rtt_events = queue.Queue()
+    for text in ("one", "two", "three", "four", "five"):
+        rtt_events.put(RttEvent("data", text=text))
+
+    batch = BoundedEventPoller(max_events=4, time_budget=1.0).drain(ui_events, rtt_events)
+
+    assert batch.raw_count == 4
+    assert batch.backlog is True
+    assert len(batch.items) == 1
+    assert batch.items[0].source == "rtt"
+    assert batch.items[0].event.text == "onetwothreefour"

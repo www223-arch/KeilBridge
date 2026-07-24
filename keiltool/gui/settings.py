@@ -51,18 +51,56 @@ class GuiSettings:
         )
 
 
+@dataclass(frozen=True, slots=True)
+class SettingsDiagnostic:
+    code: str
+    message: str
+
+
+@dataclass(frozen=True, slots=True)
+class SettingsLoadResult:
+    settings: GuiSettings
+    diagnostic: SettingsDiagnostic | None = None
+
+
 class SettingsStore:
     def __init__(self, path: str | Path | None = None) -> None:
         self.path = Path(path) if path is not None else default_settings_path()
 
     def load(self) -> GuiSettings:
+        return self.load_result().settings
+
+    def load_result(self) -> SettingsLoadResult:
         try:
-            data = json.loads(self.path.read_text(encoding="utf-8"))
-        except (OSError, UnicodeDecodeError, json.JSONDecodeError):
-            return GuiSettings()
+            text = self.path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return SettingsLoadResult(GuiSettings())
+        except OSError as exc:
+            return SettingsLoadResult(
+                GuiSettings(),
+                SettingsDiagnostic("settings_unreadable", f"Unable to read settings from {self.path}: {exc}"),
+            )
+        except UnicodeDecodeError as exc:
+            return SettingsLoadResult(
+                GuiSettings(),
+                SettingsDiagnostic("settings_corrupt", f"Settings are not valid UTF-8: {exc}"),
+            )
+        try:
+            data = json.loads(text)
+        except json.JSONDecodeError as exc:
+            return SettingsLoadResult(
+                GuiSettings(),
+                SettingsDiagnostic("settings_corrupt", f"Settings JSON is invalid: {exc}"),
+            )
         if not isinstance(data, dict) or data.get("version") != SETTINGS_VERSION:
-            return GuiSettings()
-        return GuiSettings.from_dict(data)
+            return SettingsLoadResult(
+                GuiSettings(),
+                SettingsDiagnostic(
+                    "settings_incompatible",
+                    f"Settings format is incompatible with version {SETTINGS_VERSION}.",
+                ),
+            )
+        return SettingsLoadResult(GuiSettings.from_dict(data))
 
     def save(self, settings: GuiSettings) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)

@@ -285,25 +285,55 @@ def cmd_flash(args: argparse.Namespace) -> int:
     model = parse_uvprojx(args.project)
     target = _pick_target(model, args.target)
     probe = _resolve_probe(target, args.probe)
-    if probe != "stlink":
-        raise SystemExit("Only the ST-Link OpenOCD probe is supported for flash.")
     workspace_root = Path(args.workspace_root).resolve() if args.workspace_root else Path(model.inferred_project_root)
+    project_name = _sanitize_name(target.name)
+    generated_dir = workspace_root / ".keilbridge" / "generated"
+    firmware_arg = getattr(args, "firmware", None)
+    elf_arg = getattr(args, "elf", None)
     openocd = find_openocd(args.openocd)
     scripts = find_openocd_scripts(openocd)
-    target_resolution = resolve_openocd_target(target, scripts)
-    if not target_resolution.target_cfg or not target_resolution.status.endswith("_verified"):
-        raise SystemExit(f"OpenOCD target could not be resolved: {target_resolution.reason}")
-    firmware = Path(args.firmware).resolve()
-    config = OpenOcdConfig(
-        executable=Path(openocd),
-        scripts_dir=Path(scripts),
-        interface_cfg="interface/stlink.cfg",
-        target_cfg=target_resolution.target_cfg,
-    )
+
+    if firmware_arg is None:
+        cfg = generated_dir / "openocd" / f"{project_name}_{probe}.cfg"
+        build_dir = workspace_root / ".keilbridge" / "build" / "gcc-debug"
+        firmware = Path(elf_arg).resolve() if elf_arg else build_dir / f"{project_name}.elf"
+        if not cfg.exists():
+            raise SystemExit(f"OpenOCD config not found: {cfg}. Run configure first.")
+        if not firmware.exists():
+            raise SystemExit(f"ELF not found: {firmware}. Run build first.")
+        config = OpenOcdConfig(
+            executable=Path(openocd),
+            scripts_dir=Path(scripts) if scripts else None,
+            interface_cfg=None,
+            target_cfg=str(cfg),
+        )
+        cwd = generated_dir
+    else:
+        if probe != "stlink":
+            raise SystemExit("HEX/BIN flash supports only the ST-Link OpenOCD probe.")
+        target_resolution = resolve_openocd_target(target, scripts)
+        if not target_resolution.target_cfg or not target_resolution.status.endswith("_verified"):
+            raise SystemExit(f"OpenOCD target could not be resolved: {target_resolution.reason}")
+        firmware = Path(firmware_arg).resolve()
+        config = OpenOcdConfig(
+            executable=Path(openocd),
+            scripts_dir=Path(scripts) if scripts else None,
+            interface_cfg="interface/stlink.cfg",
+            target_cfg=target_resolution.target_cfg,
+        )
+        cwd = workspace_root
+
     request = FlashRequest(firmware=firmware, base_address=args.base_address)
     logs_dir = workspace_root / ".keilbridge" / "logs"
     try:
-        result = run_flash(config, request, logs_dir, cwd=workspace_root, target=target)
+        result = run_flash(
+            config,
+            request,
+            logs_dir,
+            cwd=cwd,
+            target=target,
+            target_name=target.name,
+        )
     except ValueError as exc:
         raise SystemExit(str(exc)) from exc
     print(" ".join(f'"{item}"' if " " in item else item for item in result.command))
@@ -545,13 +575,15 @@ def build_parser() -> argparse.ArgumentParser:
     openocd_cmd.add_argument("--run", action="store_true", help="Run OpenOCD instead of only printing the command")
     openocd_cmd.set_defaults(func=cmd_openocd)
 
-    flash_cmd = subparsers.add_parser("flash", help="Program an existing HEX or BIN file with OpenOCD")
+    flash_cmd = subparsers.add_parser("flash", help="Program the generated ELF or an existing HEX/BIN file with OpenOCD")
     flash_cmd.add_argument("--project", required=True, type=Path, help="Path to .uvprojx")
     flash_cmd.add_argument("--target", help="Keil target name")
-    flash_cmd.add_argument("--probe", choices=["stlink"], help="ST-Link probe profile. Defaults to uvoptx inference, then stlink.")
+    flash_cmd.add_argument("--probe", help="Probe profile for legacy generated ELF; HEX/BIN supports ST-Link.")
     flash_cmd.add_argument("--workspace-root", help="Override .keilbridge location; defaults to inferred Keil project root")
     flash_cmd.add_argument("--openocd", help="Path to openocd executable")
-    flash_cmd.add_argument("--firmware", required=True, type=Path, help="Existing .hex or .bin firmware file")
+    image_group = flash_cmd.add_mutually_exclusive_group()
+    image_group.add_argument("--elf", type=Path, help="Override ELF path; defaults to .keilbridge/build/gcc-debug/<target>.elf")
+    image_group.add_argument("--firmware", type=Path, help="Existing .hex or .bin firmware file")
     flash_cmd.add_argument("--base-address", type=parse_address, default=0x08000000, help="BIN flash base address (default: 0x08000000)")
     flash_cmd.set_defaults(func=cmd_flash)
 

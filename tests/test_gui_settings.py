@@ -1,4 +1,5 @@
 import json
+from pathlib import Path
 
 from keiltool.gui.settings import GuiSettings, SettingsStore
 
@@ -47,3 +48,66 @@ def test_incompatible_settings_version_falls_back_to_defaults(tmp_path):
     path.write_text('{"version": 99, "project": "D:/fw/motor.uvprojx"}', encoding="utf-8")
 
     assert SettingsStore(path).load() == GuiSettings()
+
+
+def test_missing_settings_is_normal_and_has_no_diagnostic(tmp_path):
+    result = SettingsStore(tmp_path / "missing.json").load_result()
+
+    assert result.settings == GuiSettings()
+    assert result.diagnostic is None
+
+
+def test_corrupt_settings_returns_a_diagnostic(tmp_path):
+    path = tmp_path / "gui-settings.json"
+    path.write_text("{broken", encoding="utf-8")
+
+    result = SettingsStore(path).load_result()
+
+    assert result.settings == GuiSettings()
+    assert result.diagnostic is not None
+    assert result.diagnostic.code == "settings_corrupt"
+
+
+def test_unreadable_settings_returns_a_diagnostic(tmp_path, monkeypatch):
+    path = tmp_path / "gui-settings.json"
+    path.write_text("{}", encoding="utf-8")
+    original_read_text = Path.read_text
+
+    def unreadable(candidate, *args, **kwargs):
+        if candidate == path:
+            raise PermissionError("access denied")
+        return original_read_text(candidate, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", unreadable)
+
+    result = SettingsStore(path).load_result()
+
+    assert result.settings == GuiSettings()
+    assert result.diagnostic is not None
+    assert result.diagnostic.code == "settings_unreadable"
+
+
+def test_incompatible_settings_returns_a_diagnostic(tmp_path):
+    path = tmp_path / "gui-settings.json"
+    path.write_text('{"version": 99}', encoding="utf-8")
+
+    result = SettingsStore(path).load_result()
+
+    assert result.settings == GuiSettings()
+    assert result.diagnostic is not None
+    assert result.diagnostic.code == "settings_incompatible"
+
+
+def test_settings_diagnostic_renders_in_openocd_output():
+    from keiltool.gui.app import KeilToolGui
+    from keiltool.gui.settings import SettingsDiagnostic
+
+    rendered = []
+    gui = object.__new__(KeilToolGui)
+    gui._append_openocd = rendered.append
+
+    gui._render_settings_diagnostic(SettingsDiagnostic("settings_corrupt", "Settings JSON is invalid."))
+
+    assert rendered
+    assert "settings_corrupt" in rendered[0]
+    assert "Settings JSON is invalid." in rendered[0]

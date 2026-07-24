@@ -1,5 +1,6 @@
 import importlib
 import argparse
+import queue
 import sys
 from types import SimpleNamespace
 from types import ModuleType
@@ -194,3 +195,47 @@ def test_build_rtt_request_rejects_invalid_scan_settings(kwargs, message):
 
     with pytest.raises(ValueError, match=message):
         build_rtt_request(**kwargs)
+
+
+def test_high_rate_rtt_poll_yields_to_unrelated_tk_callback():
+    from keiltool.core.rtt import RttEvent
+    from keiltool.gui.app import KeilToolGui
+    from keiltool.gui.workbench_controller import BoundedEventPoller
+
+    class FakeRoot:
+        def __init__(self):
+            self.callbacks = []
+
+        def after(self, delay, callback):
+            self.callbacks.append((delay, callback))
+
+        def run_next(self):
+            _delay, callback = self.callbacks.pop(0)
+            callback()
+
+    root = FakeRoot()
+    unrelated_ran = []
+    root.after(0, lambda: unrelated_ran.append(True))
+    rtt_events = queue.Queue()
+    for _index in range(5000):
+        rtt_events.put(RttEvent("data", text="x"))
+    handled = []
+    gui = SimpleNamespace(
+        _destroyed=False,
+        _events=queue.Queue(),
+        _rtt_session=SimpleNamespace(events=rtt_events),
+        _event_poller=BoundedEventPoller(max_events=64, time_budget=1.0),
+        _handle_ui_event=lambda event: None,
+        _handle_rtt_event=handled.append,
+        _update_elapsed=lambda: None,
+        _poll_events=lambda: None,
+        root=root,
+    )
+
+    KeilToolGui._poll_events(gui)
+
+    assert len(handled) == 1
+    assert handled[0].text == "x" * 64
+    assert root.callbacks[-1][0] == 0
+    root.run_next()
+    assert unrelated_ran == [True]

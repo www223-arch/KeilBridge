@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+import shutil
 
 from keiltool.core.keil_parser import parse_uvprojx
 from keiltool.core.openocd_target_resolver import resolve_openocd_target
@@ -68,6 +69,8 @@ def resolve_target_facts(
     executable = str(openocd_path) if openocd_path else find_openocd()
     scripts = str(scripts_dir) if scripts_dir else find_openocd_scripts(executable)
     target_cfg, status, reason = _resolve_target_cfg(target, scripts, target_override)
+    readiness_diagnostics = _validate_hardware_paths(executable, scripts, INTERFACE_CFG, target_cfg)
+    resolution_reason = "; ".join(item for item in (reason, *readiness_diagnostics) if item)
     flash_regions = _regions_named(target.memory, "FLASH")
     ram_regions = _regions_named(target.memory, "RAM")
     main_ram = ram_regions[0] if ram_regions else None
@@ -83,9 +86,9 @@ def resolve_target_facts(
         interface_cfg=INTERFACE_CFG,
         target_cfg=target_cfg,
         resolution_status=status,
-        resolution_reason=reason,
+        resolution_reason=resolution_reason,
         default_log_dir=str(Path(project_root) / ".keilbridge" / "logs"),
-        ready=status.endswith("_verified") and bool(target_cfg),
+        ready=status.endswith("_verified") and bool(target_cfg) and not readiness_diagnostics,
     )
 
 
@@ -120,6 +123,39 @@ def _resolve_override(override: str, scripts_dir: str) -> tuple[str, str, str]:
     if resolved.is_file():
         return candidate.as_posix(), "override_verified", "OpenOCD target override was verified."
     return "", "override_missing", f"OpenOCD target override was not found: {resolved}"
+
+
+def _validate_hardware_paths(
+    executable: str,
+    scripts_dir: str,
+    interface_cfg: str,
+    target_cfg: str,
+) -> tuple[str, ...]:
+    diagnostics: list[str] = []
+    executable_path = Path(executable).expanduser()
+    if not executable_path.is_file() and not shutil.which(executable):
+        diagnostics.append(f"OpenOCD executable was not found: {executable}")
+
+    scripts_path = Path(scripts_dir).expanduser() if scripts_dir else None
+    if scripts_path is None or not scripts_path.is_dir():
+        diagnostics.append(f"OpenOCD scripts directory was not found: {scripts_dir or '(empty)'}")
+        return tuple(diagnostics)
+
+    interface_path = Path(interface_cfg).expanduser()
+    if not interface_path.is_absolute():
+        interface_path = scripts_path / interface_path
+    if not interface_path.is_file():
+        diagnostics.append(f"OpenOCD interface cfg was not found: {interface_path}")
+
+    if target_cfg:
+        target_path = Path(target_cfg).expanduser()
+        if not target_path.is_absolute():
+            target_path = scripts_path / target_path
+        if not target_path.is_file():
+            diagnostics.append(f"OpenOCD target cfg was not found: {target_path}")
+    else:
+        diagnostics.append("OpenOCD target cfg is not resolved.")
+    return tuple(diagnostics)
 
 
 def _regions_named(regions: list[MemoryRegion], name: str) -> list[MemoryRegion]:

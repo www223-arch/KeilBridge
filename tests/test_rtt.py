@@ -664,16 +664,13 @@ class FlakyCloseLog(FailingLog):
             raise OSError("log close failed")
 
 
-class OverlappingCloseLog:
+class BlockingFinalWriteLog:
     def __init__(self) -> None:
         self.writes: list[str] = []
         self.closed = False
         self.write_after_close = False
         self.writer_entered = threading.Event()
         self.release_writer = threading.Event()
-        self.close_flush_entered = threading.Event()
-        self.release_close_flush = threading.Event()
-        self.close_called = threading.Event()
 
     def write(self, text: str) -> int:
         self.writer_entered.set()
@@ -684,13 +681,10 @@ class OverlappingCloseLog:
         return len(text)
 
     def flush(self) -> None:
-        if threading.current_thread().name == "rtt-log-closer":
-            self.close_flush_entered.set()
-            self.release_close_flush.wait(timeout=1)
+        pass
 
     def close(self) -> None:
         self.closed = True
-        self.close_called.set()
 
 
 class CloseFailingRecordingLog:
@@ -708,45 +702,40 @@ class CloseFailingRecordingLog:
         raise OSError("log close failed")
 
 
-def test_close_log_detaches_handle_before_overlapping_writer(tmp_path):
-    log = OverlappingCloseLog()
+def test_stop_retains_log_until_final_data_writer_quiesces_and_retry_closes_it(tmp_path):
+    log = BlockingFinalWriteLog()
     session = RttSession(
         CONFIG,
         RttRequest(scan_address=0x20000000, scan_size=0x10000),
         tmp_path / "rtt.log",
+        stop_timeout=0.01,
     )
+    session._state = "running"
     session._log_file = log
-    close_results: list[bool] = []
-    writer_finished = threading.Event()
+    session._start_worker("rtt-final-writer", session._write_decoded, "final chunk\n")
+    assert log.writer_entered.wait(timeout=1)
+    stopper = threading.Thread(target=session.stop)
+    stopper.start()
+    stopper.join(timeout=0.5)
 
-    closer = threading.Thread(
-        name="rtt-log-closer",
-        target=lambda: close_results.append(session._close_log()),
-    )
+    first_events = _drain_events(session)
+    first_stopped = [event for event in first_events if event.kind == "stopped"]
+    assert not stopper.is_alive()
+    assert [event.outcome for event in first_stopped] == ["incomplete"]
+    assert session._log_file is log
+    assert log.closed is False
 
-    def write_during_close() -> None:
-        session._write_decoded("during-close")
-        writer_finished.set()
-
-    closer.start()
-    assert log.close_flush_entered.wait(timeout=1)
-    writer = threading.Thread(target=write_during_close)
-    writer.start()
-    deadline = time.monotonic() + 1
-    while not writer_finished.is_set() and not log.writer_entered.is_set() and time.monotonic() < deadline:
-        time.sleep(0.001)
-    assert writer_finished.is_set() or log.writer_entered.is_set()
-
-    log.release_close_flush.set()
-    assert log.close_called.wait(timeout=1)
     log.release_writer.set()
-    writer.join(timeout=1)
-    closer.join(timeout=1)
+    assert session.wait(timeout=1)
+    session.stop()
+    second_events = _drain_events(session)
+    data_events = [event.text for event in first_events + second_events if event.kind == "data"]
+    second_stopped = [event for event in second_events if event.kind == "stopped"]
 
-    assert not writer.is_alive()
-    assert not closer.is_alive()
-    assert close_results == [True]
-    assert log.writes == []
+    assert data_events == ["final chunk\n"]
+    assert log.writes == data_events
+    assert [event.outcome for event in second_stopped] == ["clean"]
+    assert log.closed is True
     assert log.write_after_close is False
 
 

@@ -161,6 +161,12 @@ python -m keiltool.cli doctor flash --project "xxx.uvprojx" --target App --probe
 - 板子没供电、SWD 接线异常、复位线异常。
 - 芯片读保护或处于异常低功耗/锁死状态。
 
+## 7A. 只想采集 RTT，为什么还要导入 Keil 工程？
+
+现在不需要。打开 `k2c gui` 后，可直接在 Device 输入框搜索内置设备目录中的精确型号，再启动 RTT。内置目录来自官方 CMSIS-Pack/PDSC；也可点击“导入”添加 `.pdsc`、`.pack` 或自定义 JSON。Keil 工程仍可用于自动带入 Target、芯片和内存信息，但不再是 GUI 硬件操作的前提。
+
+如果芯片存在于目录中但按钮仍禁用，请查看“来源”和“解析”字段。CMSIS-Pack 不包含 OpenOCD target cfg；KeilBridge 只使用明确维护或用户显式提供的映射。没有映射、cfg 不存在或没有可写 RAM 时会明确报告缺失信息，不会根据相似型号猜一个 target。
+
 ## 8. GUI 中 RTT 与烧录为什么不能同时进行？
 
 `k2c gui` 把“烧录并校验”和“开始 RTT”设计为两个独立操作，但它们都需要独占同一支 ST-Link/OpenOCD 会话。RTT 扫描、采集或停止清理期间，烧录和连接检查会禁用；烧录或连接检查期间，RTT 启动会禁用。
@@ -171,7 +177,7 @@ python -m keiltool.cli doctor flash --project "xxx.uvprojx" --target App --probe
 
 不会。GUI RTT 仅通过 `rtt setup`、`rtt start` 和 RTT TCP server 附着到 `SEGGER RTT` 控制块，不发送 reset、halt 或 resume 命令。自动模式扫描当前 Target 的 RAM；手动模式使用填写地址起始的 `0x100` 字节窗口。
 
-如果找不到 RTT 控制块，确认当前固件已经包含并初始化 SEGGER RTT，检查 Target 的 RAM 解析结果，或填写明确的控制块地址。RTT 文本会自动以 UTF-8 写入日志；默认目录为 `<keil-project-root>\.keilbridge\logs\`，也可在 GUI 中修改。
+如果找不到 RTT 控制块，确认当前固件已经包含并初始化 SEGGER RTT，检查所选设备或 Target 的 RAM 解析结果，或填写明确的控制块地址。RTT 文本会自动以 UTF-8 写入日志；有工程时默认根目录为 `<keil-project-root>\.keilbridge\logs\`，无工程时为 `%APPDATA%\KeilTool\logs\`，也可在 GUI 中修改并记忆。
 
 RTT 页的“显示等级”使用固件现有的 EasyLogger/SEGGER RTT 等级语义。默认 `VERBOSE` 显示全部；选择 `INFO` 会显示 `ASSERT`、`ERROR`、`WARN` 和 `INFO`。筛选和“清空显示”只处理最近 20,000 行 GUI 缓存，完整 UTF-8 日志仍持续记录所有等级。
 
@@ -185,7 +191,7 @@ GUI 只会在 OpenOCD target cfg 已验证时启用“检查连接”“烧录�
 
 先停止 GUI 内的 RTT 或烧录任务，并等待状态回到空闲。随后关闭 Keil、STM32CubeProgrammer、VS Code/Cortex-Debug、串口监视器，以及可能持有探针的其他 OpenOCD/GDB 会话。必要时在任务管理器结束确认不再使用的 `openocd.exe` 和 `arm-none-eabi-gdb.exe`，重新插拔 ST-Link，再使用 GUI 的“检查连接”。
 
-不要在 RTT 采集期间手工启动第二个 OpenOCD，也不要用多个 GUI 实例连接同一支 ST-Link。连接或烧录失败时，先查看 GUI 输出中的命令和日志路径；日志默认位于 `<keil-project-root>\.keilbridge\logs\`。
+不要在 RTT 采集期间手工启动第二个 OpenOCD，也不要用多个 GUI 实例连接同一支 ST-Link。连接或烧录失败时，先查看 GUI 输出中的命令和日志路径。每个任务都保存在 `时间_芯片_任务` 独立目录中，`session.json` 可用于确认 target、开始/结束时间和执行结果。
 
 ## 12. `CMSIS-DAP command mismatch` 怎么办？
 

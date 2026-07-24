@@ -268,7 +268,11 @@ python -m keiltool.cli gui
 %APPDATA%\KeilTool\gui-settings.json
 ```
 
-选择 Keil `.uvprojx` 工程和 Target 后，工作台显示设备、Flash/RAM 摘要和 OpenOCD target cfg 解析结果。可在高级设置中指定 OpenOCD、scripts 目录和 target override。自动解析只有得到已验证的 target cfg 才允许硬件操作；override 也必须是实际存在的 `.cfg` 文件。相对 override 必须位于 scripts 目录内，绝对 override 必须指向现有文件。任何无法验证、文件缺失或越出 scripts 目录的 override 都会让“检查连接”“烧录并校验”和 RTT 保持阻止状态，而不是猜测芯片类型继续执行。
+Keil 工程在图形工作台中是可选的。只想连接、烧录现有 HEX/BIN 或采集 RTT 时，可直接在 Device 输入框搜索并选择精确芯片型号；选择 Keil `.uvprojx` 工程和 Target 后，Device 会自动切换为工程里的芯片并锁定。清空工程路径后恢复手动选择。芯片选择、OpenOCD 路径和自定义日志根目录都会在关闭时记住。
+
+内置设备目录由仓库中的官方 GigaDevice、STMicroelectronics CMSIS-Pack/PDSC 快照生成，记录来源、版本、core、FPU、Flash/RAM 和 flash algorithm。点击 Device 旁的“导入”可添加 `.pdsc`、`.pack` 或自定义 JSON；用户文件保存在 `%APPDATA%\KeilTool\devices\`，同厂商同型号的用户条目优先于内置条目。PACK 只读取其中的 PDSC，不解压到磁盘。损坏或不安全的导入会被拒绝，不影响已有目录。
+
+CMSIS-Pack 本身不提供 OpenOCD target cfg。KeilBridge 只为已明确维护的兼容系列填写 target；没有映射的芯片仍可查看信息，但硬件按钮保持禁用。可在高级设置中指定 OpenOCD、scripts 目录和 target override。override 必须是实际存在的 `.cfg` 文件：相对路径必须位于 scripts 目录内，绝对路径必须指向现有文件。任何无法验证、文件缺失或越出 scripts 目录的配置都会阻止“检查连接”“烧录并校验”和 RTT，而不是猜测芯片类型继续执行。
 
 烧录区只接受已经生成的 `.hex` 或 `.bin` 文件，不负责编译、合并或从 `.axf/.elf` 转换固件：
 
@@ -278,7 +282,7 @@ python -m keiltool.cli gui
 
 “检查连接”和“烧录并校验”是独立动作。“检查连接”不下载固件；“烧录并校验”会改写 Flash，且完成后会按 OpenOCD 烧录命令复位目标。
 
-RTT 也是独立动作。点击“开始 RTT”后，工作台在 Target 的 RAM 范围中寻找 `SEGGER RTT` 控制块并附着到 RTT TCP 通道；该流程不包含 reset、halt 或 resume，因此不会为了采集 RTT 主动改变 MCU 运行状态。自动扫描使用 Target 的 RAM 范围；选择手动地址时只搜索该地址起始的 `0x100` 字节窗口。
+RTT 也是独立动作。点击“开始 RTT”后，工作台在 Keil Target 或所选目录芯片的可写 RAM 范围中寻找 `SEGGER RTT` 控制块并附着到 RTT TCP 通道；该流程不包含 reset、halt 或 resume，因此不会为了采集 RTT 主动改变 MCU 运行状态。自动扫描使用已验证的 RAM 范围；选择手动地址时只搜索该地址起始的 `0x100` 字节窗口。
 
 RTT 页会解析 SEGGER 虚拟 Terminal，并优先使用 EasyLogger 已有的 `ASSERT`、`ERROR`、`WARN`、`INFO`、`DEBUG`、`VERBOSE` 等级，不由 GUI 重新定义日志等级。“显示等级”是严重度阈值：例如选择 `INFO` 时显示 `ASSERT` 到 `INFO`，隐藏 `DEBUG` 和 `VERBOSE`。默认值为 `VERBOSE`，关闭工作台时会记住当前阈值；切换阈值会立即重绘最近 20,000 行 GUI 缓存，不会中断 RTT。
 
@@ -290,7 +294,13 @@ Flash、连接检查和 RTT 共享同一支 ST-Link，但任何时刻只允许�
 <keil-project-root>\.keilbridge\logs\
 ```
 
-可以在工作台中改为其他目录。连接/烧录会写入对应的 OpenOCD `stdout`、`stderr` 日志；RTT 会自动把所有等级的通道文本写为 UTF-8 `rtt_<target>_<time>.log`，并同时保存 OpenOCD 的 `stdout` 和 `stderr`。等级过滤和“清空显示”只影响 GUI，不删除或截断完整日志。右侧“打开日志目录”可直接定位这些文件。
+无工程时默认使用 `%APPDATA%\KeilTool\logs\`。可以在工作台中改为其他根目录，修改会被记住。每次连接、烧录和 RTT 都创建独立目录：
+
+```text
+YYYYMMDD-HHMMSS-fff_<device>_<CONNECT|FLASH|RTT>\
+```
+
+目录中包含任务日志、`openocd.stdout.log`、`openocd.stderr.log` 和 `session.json`；元数据写明开始/结束时间、芯片、任务、target cfg 和结果。RTT 通道完整内容保存在 `rtt.log`。等级过滤和“清空显示”只影响 GUI，不删除或截断完整日志。RTT 和 OpenOCD 文本区支持 `Ctrl+C`、右键复制/全选/复制全部，工具栏也可直接复制全部可见文本。
 
 ## 5. VS Code 使用方式
 

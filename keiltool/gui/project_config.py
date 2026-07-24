@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import os
 from pathlib import Path
 import shutil
 
+from keiltool.core.device_catalog import CatalogDevice, CatalogMemory
 from keiltool.core.keil_parser import parse_uvprojx
 from keiltool.core.openocd_target_resolver import resolve_openocd_target
 from keiltool.core.project_model import KeilTargetModel, MemoryRegion
@@ -92,6 +94,59 @@ def resolve_target_facts(
     )
 
 
+def facts_from_catalog_device(
+    device: CatalogDevice,
+    *,
+    openocd_path: str | Path = "",
+    scripts_dir: str | Path = "",
+    target_override: str | Path = "",
+    default_log_dir: str | Path = "",
+) -> ProjectTargetFacts:
+    """Resolve exact catalog facts without requiring a Keil project."""
+
+    executable = str(openocd_path) if openocd_path else find_openocd()
+    scripts = str(scripts_dir) if scripts_dir else find_openocd_scripts(executable)
+    override_text = str(target_override).strip()
+    if override_text:
+        target_cfg, status, reason = _resolve_override(override_text, scripts)
+    elif device.openocd_target:
+        target_cfg, override_status, reason = _resolve_override(device.openocd_target, scripts)
+        status = "catalog_verified" if override_status == "override_verified" else f"catalog_{override_status}"
+    else:
+        target_cfg = ""
+        status = "catalog_unresolved"
+        reason = (
+            f"{device.device} has no explicit OpenOCD target mapping; "
+            "select a verified target override to enable hardware actions."
+        )
+
+    readiness_diagnostics = _validate_hardware_paths(executable, scripts, INTERFACE_CFG, target_cfg)
+    flash_regions = [item for item in device.memory if "x" in item.access.lower()]
+    ram_regions = [item for item in device.memory if "w" in item.access.lower()]
+    ordered_ram = sorted(ram_regions, key=lambda item: (not item.default, item.start))
+    main_ram = ordered_ram[0] if ordered_ram else None
+    informational = () if main_ram else ("Device catalog does not provide writable RAM for automatic RTT scanning.",)
+    resolution_reason = "; ".join(
+        item for item in (reason, *readiness_diagnostics, *informational) if item
+    )
+    return ProjectTargetFacts(
+        target_name="",
+        device=device.device,
+        flash_summary=_catalog_summary(flash_regions),
+        ram_summary=_catalog_summary(ram_regions),
+        ram_origin=main_ram.start if main_ram else None,
+        ram_size=main_ram.size if main_ram else None,
+        openocd_executable=executable,
+        openocd_scripts=scripts,
+        interface_cfg=INTERFACE_CFG,
+        target_cfg=target_cfg,
+        resolution_status=status,
+        resolution_reason=resolution_reason,
+        default_log_dir=str(default_log_dir or _default_catalog_log_dir()),
+        ready=status.endswith("_verified") and bool(target_cfg) and not readiness_diagnostics,
+    )
+
+
 def _resolve_target_cfg(target: KeilTargetModel, scripts_dir: str, override: str | Path) -> tuple[str, str, str]:
     override_text = str(override).strip()
     if override_text:
@@ -164,6 +219,19 @@ def _regions_named(regions: list[MemoryRegion], name: str) -> list[MemoryRegion]
 
 def _summary(regions: list[MemoryRegion]) -> str:
     return ", ".join(f"{region.name}: {region.origin} ({region.length})" for region in regions)
+
+
+def _catalog_summary(regions: list[CatalogMemory]) -> str:
+    return ", ".join(
+        f"{region.name}: 0x{region.start:08X} (0x{region.size:X})"
+        for region in regions
+    )
+
+
+def _default_catalog_log_dir() -> Path:
+    appdata = os.environ.get("APPDATA")
+    base_dir = Path(appdata) if appdata else Path.home() / "AppData" / "Roaming"
+    return base_dir / "KeilTool" / "logs"
 
 
 def _integer_value(value: str) -> int | None:

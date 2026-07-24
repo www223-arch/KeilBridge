@@ -2,6 +2,7 @@ from pathlib import Path
 
 import pytest
 
+from keiltool.core.device_catalog import CatalogDevice, CatalogMemory, CatalogSource
 from keiltool.gui.project_config import LoadedProjectTargets, load_project_targets, resolve_target_facts
 
 
@@ -221,3 +222,74 @@ def test_hardware_readiness_validates_executable_scripts_interface_and_target_cf
     assert "interface" in missing_interface.resolution_reason.lower()
     assert missing_target.ready is False
     assert "target" in missing_target.resolution_reason.lower()
+
+
+def _catalog_device(*, target="target/stm32f3x.cfg", memory=None):
+    return CatalogDevice(
+        vendor="GigaDevice",
+        device="GD32F303CC",
+        family="GD32F30x Series",
+        sub_family="GD32F303",
+        core="Cortex-M4",
+        fpu="FPU",
+        endian="Little-endian",
+        memory=tuple(
+            memory
+            or (
+                CatalogMemory("Flash", 0x08000000, 0x40000, "rx", True, True),
+                CatalogMemory("SRAM", 0x20000000, 0x10000, "rwx", True, False),
+            )
+        ),
+        flash_algorithms=(),
+        openocd_target=target,
+        openocd_status="explicit_pack_compatibility" if target else "unresolved",
+        source=CatalogSource("embedded", "GigaDevice", "GD32F30x_DFP", "2.5.0", "official", "abc"),
+    )
+
+
+def test_catalog_device_resolves_ready_hardware_facts_without_project(tmp_path):
+    from keiltool.gui.project_config import facts_from_catalog_device
+
+    facts = facts_from_catalog_device(
+        _catalog_device(),
+        openocd_path=_openocd_file(tmp_path),
+        scripts_dir=_scripts_dir(tmp_path),
+        default_log_dir=tmp_path / "logs",
+    )
+
+    assert facts.target_name == ""
+    assert facts.device == "GD32F303CC"
+    assert facts.ram_origin == 0x20000000
+    assert facts.ram_size == 0x10000
+    assert facts.target_cfg == "target/stm32f3x.cfg"
+    assert facts.resolution_status == "catalog_verified"
+    assert facts.ready is True
+
+
+def test_catalog_device_fails_closed_for_missing_target_cfg_or_writable_ram(tmp_path):
+    from keiltool.gui.project_config import facts_from_catalog_device
+
+    scripts = _scripts_dir(tmp_path)
+    unresolved = facts_from_catalog_device(
+        _catalog_device(target=""),
+        openocd_path=_openocd_file(tmp_path),
+        scripts_dir=scripts,
+    )
+    missing_cfg = facts_from_catalog_device(
+        _catalog_device(target="target/not-present.cfg"),
+        openocd_path=_openocd_file(tmp_path),
+        scripts_dir=scripts,
+    )
+    no_ram = facts_from_catalog_device(
+        _catalog_device(memory=(CatalogMemory("Flash", 0x08000000, 0x40000, "rx"),)),
+        openocd_path=_openocd_file(tmp_path),
+        scripts_dir=scripts,
+    )
+
+    assert unresolved.ready is False
+    assert unresolved.target_cfg == ""
+    assert missing_cfg.ready is False
+    assert missing_cfg.target_cfg == ""
+    assert no_ram.ready is True
+    assert no_ram.ram_origin is None
+    assert "writable RAM" in no_ram.resolution_reason

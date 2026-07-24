@@ -90,6 +90,32 @@ def test_resolve_verified_snapshot_reloads_project_with_current_visible_values()
     ]
 
 
+def test_resolve_verified_snapshot_uses_exact_catalog_device_without_project():
+    from keiltool.gui.workbench_controller import FactInputs, resolve_verified_snapshot
+
+    device = SimpleNamespace(vendor="GigaDevice", device="GD32F303CC")
+    facts = SimpleNamespace(ready=True)
+    key = FactInputs(
+        project="",
+        target="",
+        openocd="D:/tools/openocd.exe",
+        scripts="D:/tools/scripts",
+        target_override="",
+        device_vendor="GigaDevice",
+        device_name="GD32F303CC",
+    )
+
+    snapshot = resolve_verified_snapshot(
+        key,
+        lookup_catalog_device=lambda vendor, name: device if (vendor, name) == ("GigaDevice", "GD32F303CC") else None,
+        resolve_catalog_facts=lambda selected, **kwargs: facts,
+    )
+
+    assert snapshot.loaded_project is None
+    assert snapshot.target is device
+    assert snapshot.facts is facts
+
+
 def test_incomplete_cleanup_retains_ownership_and_blocks_close_until_retry_completes():
     from keiltool.gui.workbench_controller import LifecycleAction, RttLifecycleController
 

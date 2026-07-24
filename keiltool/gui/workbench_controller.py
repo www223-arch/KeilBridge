@@ -14,6 +14,8 @@ class FactInputs:
     openocd: str
     scripts: str
     target_override: str
+    device_vendor: str = ""
+    device_name: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -62,9 +64,30 @@ def resolve_verified_snapshot(
     *,
     load_targets: Callable[[str], object] | None = None,
     resolve_facts: Callable[..., object] | None = None,
+    lookup_catalog_device: Callable[[str, str], object | None] | None = None,
+    resolve_catalog_facts: Callable[..., object] | None = None,
 ) -> VerifiedSnapshot:
-    if not inputs.project:
+    if not inputs.project and not (inputs.device_vendor and inputs.device_name):
         raise ValueError("请选择 Keil 工程。")
+    if not inputs.project:
+        if lookup_catalog_device is None:
+            lookup_catalog_device = _lookup_catalog_device
+        if resolve_catalog_facts is None:
+            from keiltool.gui.project_config import facts_from_catalog_device
+
+            resolve_catalog_facts = facts_from_catalog_device
+        device = lookup_catalog_device(inputs.device_vendor, inputs.device_name)
+        if device is None:
+            raise ValueError(
+                f"设备目录中不存在精确型号: {inputs.device_vendor}::{inputs.device_name}"
+            )
+        facts = resolve_catalog_facts(
+            device,
+            openocd_path=inputs.openocd,
+            scripts_dir=inputs.scripts,
+            target_override=inputs.target_override,
+        )
+        return VerifiedSnapshot(inputs, None, device, facts)
     if not inputs.target:
         raise ValueError("请选择 Target。")
     if load_targets is None:
@@ -89,6 +112,17 @@ def resolve_verified_snapshot(
         target_override=inputs.target_override,
     )
     return VerifiedSnapshot(inputs, loaded, target, facts)
+
+
+def _lookup_catalog_device(vendor: str, device: str) -> object | None:
+    from keiltool.core.device_catalog import DeviceCatalog, load_embedded_catalog
+    from keiltool.core.device_import import load_user_catalog
+    from keiltool.gui.settings import default_devices_path
+
+    embedded = load_embedded_catalog()
+    user = load_user_catalog(default_devices_path())
+    catalog = DeviceCatalog(embedded=embedded.devices, user=user.devices)
+    return catalog.lookup(vendor, device)
 
 
 class RttPhase(Enum):

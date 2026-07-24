@@ -20,6 +20,8 @@ def test_settings_round_trip(tmp_path):
         rtt_timeout_ms=6000,
         rtt_display_level="INFO",
         logs_dir="D:/fw/logs",
+        device_vendor="GigaDevice",
+        device_name="GD32F303CC",
     )
 
     store.save(settings)

@@ -27,6 +27,8 @@ class GuiSettings:
     rtt_timeout_ms: int = 5000
     rtt_display_level: str = "VERBOSE"
     logs_dir: str = ""
+    device_vendor: str = ""
+    device_name: str = ""
 
     def to_dict(self) -> dict[str, object]:
         return {"version": SETTINGS_VERSION, **asdict(self)}
@@ -52,6 +54,8 @@ class GuiSettings:
             rtt_timeout_ms=_integer(data.get("rtt_timeout_ms"), defaults.rtt_timeout_ms),
             rtt_display_level=_rtt_level(data.get("rtt_display_level")),
             logs_dir=_string(data.get("logs_dir"), defaults.logs_dir),
+            device_vendor=_string(data.get("device_vendor"), defaults.device_vendor),
+            device_name=_string(data.get("device_name"), defaults.device_name),
         )
 
 

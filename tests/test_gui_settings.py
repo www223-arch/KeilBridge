@@ -18,6 +18,7 @@ def test_settings_round_trip(tmp_path):
         rtt_channel=2,
         rtt_port=19022,
         rtt_timeout_ms=6000,
+        rtt_display_level="INFO",
         logs_dir="D:/fw/logs",
     )
 
@@ -41,6 +42,12 @@ def test_settings_from_dict_uses_defaults_for_invalid_values():
     )
 
     assert settings == GuiSettings(rtt_timeout_ms=9)
+
+
+def test_settings_accepts_known_rtt_display_level_and_rejects_unknown_value():
+    assert GuiSettings().rtt_display_level == "VERBOSE"
+    assert GuiSettings.from_dict({"rtt_display_level": "INFO"}).rtt_display_level == "INFO"
+    assert GuiSettings.from_dict({"rtt_display_level": "invalid"}).rtt_display_level == "VERBOSE"
 
 
 def test_incompatible_settings_version_falls_back_to_defaults(tmp_path):

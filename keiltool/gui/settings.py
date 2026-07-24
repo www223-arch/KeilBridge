@@ -6,6 +6,8 @@ import os
 from pathlib import Path
 from typing import Any
 
+from keiltool.core.rtt_log import RttLevel
+
 
 SETTINGS_VERSION = 1
 
@@ -23,6 +25,7 @@ class GuiSettings:
     rtt_channel: int = 0
     rtt_port: int = 19021
     rtt_timeout_ms: int = 5000
+    rtt_display_level: str = "VERBOSE"
     logs_dir: str = ""
 
     def to_dict(self) -> dict[str, object]:
@@ -47,6 +50,7 @@ class GuiSettings:
             rtt_channel=_integer(data.get("rtt_channel"), defaults.rtt_channel),
             rtt_port=_integer(data.get("rtt_port"), defaults.rtt_port),
             rtt_timeout_ms=_integer(data.get("rtt_timeout_ms"), defaults.rtt_timeout_ms),
+            rtt_display_level=_rtt_level(data.get("rtt_display_level")),
             logs_dir=_string(data.get("logs_dir"), defaults.logs_dir),
         )
 
@@ -130,3 +134,9 @@ def _integer(value: Any, default: int) -> int:
         return int(value)
     except (TypeError, ValueError):
         return default
+
+
+def _rtt_level(value: object) -> str:
+    if isinstance(value, str) and value in {level.name for level in RttLevel}:
+        return value
+    return RttLevel.VERBOSE.name

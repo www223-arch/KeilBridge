@@ -80,7 +80,7 @@ def test_connection_check_does_not_reset_or_halt():
 
 - [ ] **Step 2: Run the focused tests and verify import failure**
 
-Run: `python -m pytest tests/test_openocd_backend.py -q`  
+Run: `python -m pytest tests/test_openocd_backend.py -q`
 Expected: FAIL because `keiltool.core.openocd_backend` does not exist.
 
 - [ ] **Step 3: Implement request types, validation, and command construction**
@@ -137,7 +137,7 @@ Replace direct `subprocess.run()` and duplicated log writes in `cmd_flash` with 
 
 - [ ] **Step 7: Run regression tests**
 
-Run: `python -m pytest tests/test_openocd_backend.py tests/test_flash_doctor.py -q`  
+Run: `python -m pytest tests/test_openocd_backend.py tests/test_flash_doctor.py -q`
 Expected: all tests PASS.
 
 - [ ] **Step 8: Commit**
@@ -224,7 +224,7 @@ Explicit override accepts either an absolute cfg path or a scripts-relative `tar
 
 - [ ] **Step 7: Run focused tests and commit**
 
-Run: `python -m pytest tests/test_gui_settings.py tests/test_gui_state.py tests/test_gui_project_config.py -q`  
+Run: `python -m pytest tests/test_gui_settings.py tests/test_gui_state.py tests/test_gui_project_config.py -q`
 Expected: all tests PASS.
 
 ```text
@@ -293,7 +293,7 @@ Verify:
 
 - [ ] **Step 6: Run and commit**
 
-Run: `python -m pytest tests/test_rtt.py -q`  
+Run: `python -m pytest tests/test_rtt.py -q`
 Expected: all tests PASS.
 
 ```text
@@ -348,10 +348,10 @@ On `WM_DELETE_WINDOW`, ask before stopping an active task, stop RTT gracefully, 
 
 - [ ] **Step 7: Run smoke and full tests**
 
-Run: `python -m pytest tests/test_gui_smoke.py -q`  
+Run: `python -m pytest tests/test_gui_smoke.py -q`
 Expected: PASS without opening a window.
 
-Run: `python -m pytest -q`  
+Run: `python -m pytest -q`
 Expected: all tests PASS.
 
 - [ ] **Step 8: Commit**

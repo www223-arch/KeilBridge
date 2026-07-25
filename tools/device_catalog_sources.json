@@ -1,0 +1,104 @@
+{
+  "schema_version": 1,
+  "sources": [
+    {
+      "name": "GigaDevice.GD32C10x_DFP.pdsc",
+      "url": "https://gd32mcu.com/data/documents/pack/GigaDevice.GD32C10x_DFP.pdsc",
+      "sha256": "fa4fdc8fc8cc75dd1bd011ad13d38a91c8993c3ea65245d892ea91fd7fd6e926"
+    },
+    {
+      "name": "GigaDevice.GD32E10x_DFP.pdsc",
+      "url": "https://gd32mcu.com/data/documents/pack/GigaDevice.GD32E10x_DFP.pdsc",
+      "sha256": "f47d28c7fd4362ce6a4bce61e1a71c5db797d64e8f230c92eb587c1af452273d"
+    },
+    {
+      "name": "GigaDevice.GD32E23x_DFP.pdsc",
+      "url": "https://gd32mcu.com/data/documents/pack/GigaDevice.GD32E23x_DFP.pdsc",
+      "sha256": "9f05864577668ee5c48c9fe1c3d906294f2ece1265694cf1c9ec14a112004411"
+    },
+    {
+      "name": "GigaDevice.GD32E50x_DFP.pdsc",
+      "url": "https://gd32mcu.com/data/documents/pack/GigaDevice.GD32E50x_DFP.pdsc",
+      "sha256": "3c213cad36497034cb2dc61fa82a4b681e3a141f2745fd9ea979bfc7ee094c05"
+    },
+    {
+      "name": "GigaDevice.GD32F10x_DFP.pdsc",
+      "url": "https://gd32mcu.com/data/documents/pack/GigaDevice.GD32F10x_DFP.pdsc",
+      "sha256": "9fa6546de167144d16fcf1cbfef6059cb21a05b651788b00222853edded91d73",
+      "openocd_target": "target/stm32f1x.cfg"
+    },
+    {
+      "name": "GigaDevice.GD32F1x0_DFP.pdsc",
+      "url": "https://gd32mcu.com/data/documents/pack/GigaDevice.GD32F1x0_DFP.pdsc",
+      "sha256": "bd9dd4de467c6ff54d831d1f63562dc65898c9c65a5513aac88c1316135a8369"
+    },
+    {
+      "name": "GigaDevice.GD32F20x_DFP.pdsc",
+      "url": "https://gd32mcu.com/data/documents/pack/GigaDevice.GD32F20x_DFP.pdsc",
+      "sha256": "ac73f15881f0e352124dda35cda43c34e37086d004a594ffe7ed90eb440abecc"
+    },
+    {
+      "name": "GigaDevice.GD32F30x_DFP.pdsc",
+      "url": "https://gd32mcu.com/data/documents/pack/GigaDevice.GD32F30x_DFP.pdsc",
+      "sha256": "a12595bfd77742ef345a45d24b88d701d249b0c96bcb65beaf870871c052551a",
+      "openocd_target": "target/stm32f3x.cfg"
+    },
+    {
+      "name": "GigaDevice.GD32F3x0_DFP.pdsc",
+      "url": "https://gd32mcu.com/data/documents/pack/GigaDevice.GD32F3x0_DFP.pdsc",
+      "sha256": "2c1a6d1145465ef4c449ac5884b737bb0e257bb9625bbf24a4ec5047cef7e5dc"
+    },
+    {
+      "name": "GigaDevice.GD32F4xx_DFP.pdsc",
+      "url": "https://gd32mcu.com/data/documents/pack/GigaDevice.GD32F4xx_DFP.pdsc",
+      "sha256": "af935f9cb9b64fa8e3e9923fbc2361849a85d8ba78e9bbe8e974f782e2246c08",
+      "openocd_target": "target/stm32f4x.cfg"
+    },
+    {
+      "name": "GigaDevice.GD32L23x_DFP.pdsc",
+      "url": "https://gd32mcu.com/data/documents/pack/GigaDevice.GD32L23x_DFP.pdsc",
+      "sha256": "24a6d5cc44da3c687865c518430e870a20174be47ef015feaf1346be23e03926"
+    },
+    {
+      "name": "GigaDevice.GD32W51x_DFP.pdsc",
+      "url": "https://gd32mcu.com/data/documents/pack/GigaDevice.GD32W51x_DFP.pdsc",
+      "sha256": "7c81df061bdd7d6ba0d58d3b4a2e2c5b7ecd251a9e12c6180b7552cb5d61644c"
+    },
+    {
+      "name": "Keil.STM32F1xx_DFP.pdsc",
+      "url": "https://www.keil.com/pack/Keil.STM32F1xx_DFP.pdsc",
+      "sha256": "518f72f11c149fe200db436539f1a1697e6ba18cb2e7ef6bec20962593e2b65f",
+      "openocd_target": "target/stm32f1x.cfg"
+    },
+    {
+      "name": "Keil.STM32F3xx_DFP.pdsc",
+      "url": "https://www.keil.com/pack/Keil.STM32F3xx_DFP.pdsc",
+      "sha256": "6608b86a983890ee7f86bba0cd4fa4c54f55bbe2f8fbcf92579785a54d122979",
+      "openocd_target": "target/stm32f3x.cfg"
+    },
+    {
+      "name": "Keil.STM32F4xx_DFP.pdsc",
+      "url": "https://www.keil.com/pack/Keil.STM32F4xx_DFP.pdsc",
+      "sha256": "97d53168e68fbe592c5d39299239ad98c9746783adb7c730bac5206cf6491dda",
+      "openocd_target": "target/stm32f4x.cfg"
+    },
+    {
+      "name": "Keil.STM32G4xx_DFP.pdsc",
+      "url": "https://www.keil.com/pack/Keil.STM32G4xx_DFP.pdsc",
+      "sha256": "6568d187fc13d7ac322d70d420c0f25d8c978ea4af0e1134f8d55f1e2c8c5ea3",
+      "openocd_target": "target/stm32g4x.cfg"
+    },
+    {
+      "name": "Keil.STM32H7xx_DFP.pdsc",
+      "url": "https://www.keil.com/pack/Keil.STM32H7xx_DFP.pdsc",
+      "sha256": "db56d059c4e10e048fea39536a168f98f260f870ac2c8bde2b183c0201998c40",
+      "openocd_target": "target/stm32h7x.cfg"
+    },
+    {
+      "name": "Keil.STM32L4xx_DFP.pdsc",
+      "url": "https://www.keil.com/pack/Keil.STM32L4xx_DFP.pdsc",
+      "sha256": "2f6195a9a25f2eb6f1c4bf78f058cfe9686585ed2a0349e1d6851a76f1049c23",
+      "openocd_target": "target/stm32l4x.cfg"
+    }
+  ]
+}

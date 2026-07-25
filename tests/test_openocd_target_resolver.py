@@ -18,6 +18,17 @@ def test_resolve_gd32f3_family_to_verified_stm32f3_target(tmp_path):
     assert result.status == "family_mapping_verified"
 
 
+def test_resolve_target_rejects_a_cfg_directory(tmp_path):
+    scripts = tmp_path / "scripts"
+    (scripts / "target" / "stm32f3x.cfg").mkdir(parents=True)
+    target = KeilTargetModel(name="App", device="GD32F303CC", vendor="gd", family="gd32f3")
+
+    result = resolve_openocd_target(target, scripts)
+
+    assert result.target_cfg == ""
+    assert result.status == "unresolved"
+
+
 def test_generate_openocd_config_marks_unresolved_target_when_candidate_missing(tmp_path):
     scripts = tmp_path / "scripts"
     (scripts / "target").mkdir(parents=True)

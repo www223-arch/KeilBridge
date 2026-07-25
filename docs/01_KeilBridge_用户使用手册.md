@@ -61,7 +61,17 @@ python -m keiltool.cli build --project "C:\Path\To\App.uvprojx" --target App --b
 - 已有 Keil 生成的 `.axf` 或 `.elf`。
 - 该 `.axf/.elf` 带调试符号。
 
-这条路线不编译、不下载固件，只用 Keil 产物做符号调试。
+这条路线不编译、不下载固件，只用 Keil 产物做符号调试。换句话说，Debug-only 的固件来源仍然是 Keil IDE、Keil 命令行或项目原有构建链路；KeilBridge 只接管 OpenOCD/GDB/VS Code 调试入口和诊断报告。
+
+KeilBridge 也提供了 Keil 命令行封装，用户不需要记住 `UV4.exe` 参数：
+
+```powershell
+python -m keiltool.cli keil build --project "C:\Path\To\App.uvprojx" --target App
+python -m keiltool.cli keil rebuild --project "C:\Path\To\App.uvprojx" --target App
+python -m keiltool.cli keil download --project "C:\Path\To\App.uvprojx" --target App
+```
+
+`build/rebuild` 优先调用 Keil `UV4.exe`；如果当前机器找不到 `UV4.exe`，但工程目录里有 Keil 生成的 `<target>.BAT`，KeilBridge 会运行一份 `.keilbridge/generated/keil-batch/` 下的副本作为 fallback，不修改原 `.BAT`。`download` 需要 Keil `UV4.exe`，因为它依赖 Keil target 里的 Flash Download 配置。
 
 ## 2. 推荐流程：先诊断，再选择
 
@@ -147,6 +157,12 @@ python -m keiltool.cli build --project "C:\Path\To\Project\MDK-ARM\App.uvprojx" 
 
 ### 3.3 指定 Debug-only
 
+Debug-only 的典型流程是：
+
+1. 先用 Keil IDE、Keil 命令行、KeilBridge 的 `keil build/rebuild`，或项目原有脚本编译工程，生成带调试符号的 `.axf/.elf`。
+2. 如果目标板上还没有这份固件，先用 Keil 下载、KeilBridge 的 `keil download`，或原项目已有下载方式下载。
+3. 再让 KeilBridge 生成 debug-only 工作区，使用同一个 `.axf/.elf` 作为符号文件进行 VS Code/OpenOCD/GDB 调试。
+
 ```powershell
 python -m keiltool.cli configure `
   --project "C:\Path\To\Project\MDK-ARM\App.uvprojx" `
@@ -166,6 +182,8 @@ Debug-only 工作区通常有两个入口：
 
 - `KeilBridge Debug-only Attach (...)`：连接当前运行现场，不主动复位，不下载。
 - `KeilBridge Debug-only Reset/Halt (...)`：不下载固件，但会复位并暂停。
+
+注意：这两个入口都不会把 `.axf/.elf` 下载进芯片。它们只使用 `.axf/.elf` 里的符号信息来解释当前芯片里已经存在的程序。如果重新编译了 Keil 工程，通常需要先确保新固件已经下载到板子，再开始 debug-only 调试。
 
 ## 4. 烧录和调试前诊断
 
@@ -229,6 +247,60 @@ Resetting Target
 ```
 
 `flash` 会真实改写目标芯片 Flash。Debug-only 模式下，VS Code 调试配置默认 `loadFiles: []`，不会由调试动作下载固件。
+
+### 4.4 ST-Link 烧录和 RTT 图形工作台
+
+启动图形工作台：
+
+```powershell
+k2c gui
+```
+
+如果正在工具源码目录中直接运行，可使用等价命令：
+
+```powershell
+python -m keiltool.cli gui
+```
+
+启动时不会访问 ST-Link、复位 MCU、烧录或启动 RTT。工作台会恢复上一次关闭时保存的非敏感设置；设置文件位于：
+
+```text
+%APPDATA%\KeilTool\gui-settings.json
+```
+
+Keil 工程在图形工作台中是可选的。只想连接、烧录现有 HEX/BIN 或采集 RTT 时，可直接在 Device 输入框搜索并选择精确芯片型号；选择 Keil `.uvprojx` 工程和 Target 后，Device 会自动切换为工程里的芯片并锁定。清空工程路径后恢复手动选择。芯片选择、OpenOCD 路径和自定义日志根目录都会在关闭时记住。
+
+内置设备目录由仓库中的官方 GigaDevice、STMicroelectronics CMSIS-Pack/PDSC 快照生成，记录来源、版本、core、FPU、Flash/RAM 和 flash algorithm。点击 Device 旁的“导入”可添加 `.pdsc`、`.pack` 或自定义 JSON；用户文件保存在 `%APPDATA%\KeilTool\devices\`，同厂商同型号的用户条目优先于内置条目。PACK 只读取其中的 PDSC，不解压到磁盘。损坏或不安全的导入会被拒绝，不影响已有目录。
+
+CMSIS-Pack 本身不提供 OpenOCD target cfg。KeilBridge 只为已明确维护的兼容系列填写 target；没有映射的芯片仍可查看信息，但硬件按钮保持禁用。可在高级设置中指定 OpenOCD、scripts 目录和 target override。override 必须是实际存在的 `.cfg` 文件：相对路径必须位于 scripts 目录内，绝对路径必须指向现有文件。任何无法验证、文件缺失或越出 scripts 目录的配置都会阻止“检查连接”“烧录并校验”和 RTT，而不是猜测芯片类型继续执行。
+
+烧录区只接受已经生成的 `.hex` 或 `.bin` 文件，不负责编译、合并或从 `.axf/.elf` 转换固件：
+
+- `.hex` 使用文件内嵌地址，BIN 基地址输入框不参与烧录。
+- `.bin` 使用可编辑的 BIN 基地址，默认值为 `0x08000000`。
+- “烧录并校验”要求 OpenOCD 同时给出程序写入和校验成功证据；成功日志通常包含 `Programming Finished` 与 `Verified OK`。
+
+“检查连接”和“烧录并校验”是独立动作。“检查连接”不下载固件；“烧录并校验”会改写 Flash，且完成后会按 OpenOCD 烧录命令复位目标。
+
+RTT 也是独立动作。点击“开始 RTT”后，工作台在 Keil Target 或所选目录芯片的可写 RAM 范围中寻找 `SEGGER RTT` 控制块并附着到 RTT TCP 通道；该流程不包含 reset、halt 或 resume，因此不会为了采集 RTT 主动改变 MCU 运行状态。自动扫描使用已验证的 RAM 范围；选择手动地址时只搜索该地址起始的 `0x100` 字节窗口。
+
+RTT 页会解析 SEGGER 虚拟 Terminal，并优先使用 EasyLogger 已有的 `ASSERT`、`ERROR`、`WARN`、`INFO`、`DEBUG`、`VERBOSE` 等级，不由 GUI 重新定义日志等级。“显示等级”是严重度阈值：例如选择 `INFO` 时显示 `ASSERT` 到 `INFO`，隐藏 `DEBUG` 和 `VERBOSE`。默认值为 `VERBOSE`，关闭工作台时会记住当前阈值；切换阈值会立即重绘最近 20,000 行 GUI 缓存，不会中断 RTT。
+
+Flash、连接检查和 RTT 共享同一支 ST-Link，但任何时刻只允许一个操作拥有它。RTT 正在扫描、采集或停止清理时，烧录和连接检查会禁用；烧录或连接检查进行时，RTT 启动和配置编辑会禁用。先停止 RTT 并等待其清理完成，才能进行烧录。
+
+默认日志目录为：
+
+```text
+<keil-project-root>\.keilbridge\logs\
+```
+
+无工程时默认使用 `%APPDATA%\KeilTool\logs\`。可以在工作台中改为其他根目录，修改会被记住。每次连接、烧录和 RTT 都创建独立目录：
+
+```text
+YYYYMMDD-HHMMSS-fff_<device>_<CONNECT|FLASH|RTT>\
+```
+
+目录中包含任务日志、`openocd.stdout.log`、`openocd.stderr.log` 和 `session.json`；元数据写明开始/结束时间、芯片、任务、target cfg 和结果。RTT 通道完整内容保存在 `rtt.log`。等级过滤和“清空显示”只影响 GUI，不删除或截断完整日志。RTT 和 OpenOCD 文本区支持 `Ctrl+C`、右键复制/全选/复制全部，工具栏也可直接复制全部可见文本。
 
 ## 5. VS Code 使用方式
 

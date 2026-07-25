@@ -6,16 +6,17 @@ import os
 import subprocess
 from dataclasses import asdict
 from pathlib import Path
-from time import strftime
 
 from .core.armclang_workspace import configure_armclang_workspace
 from .core.backend_recommender import recommend_backends, render_backend_recommendation_markdown
 from .core.diagnostics import diagnose_target
-from .core.doctor import classify_openocd_log, render_flash_doctor_markdown, run_flash_doctor
+from .core.doctor import render_flash_doctor_markdown, run_flash_doctor
 from .core.debug_only_workspace import configure_debug_only_workspace
 from .core.elf_doctor import render_elf_doctor_markdown, run_elf_doctor
 from .core.keil_parser import parse_uvprojx
+from .core.keil_cli import run_keil_cli
 from .core.openocd_target_resolver import resolve_openocd_target
+from .core.openocd_backend import FlashRequest, OpenOcdConfig, parse_address, run_flash
 from .core.scatter import generate_gnu_ld, parse_scatter_memory
 from .core.tool_finder import armclang_environment, find_arm_gcc_root, find_armclang_tools, find_cmake, find_ninja, find_openocd, find_openocd_scripts
 from .core.workspace import configure_workspace
@@ -274,10 +275,10 @@ def cmd_openocd(args: argparse.Namespace) -> int:
 
 
 def cmd_flash(args: argparse.Namespace) -> int:
-    """把当前构建出的 ELF 下载到芯片。
+    """通过 ST-Link/OpenOCD 下载现有 HEX 或 BIN 固件。
 
     `doctor flash` 只做连接/复位/向量表诊断，不应该承担真正下载职责。
-    这里提供明确的 flash 命令，内部调用 OpenOCD `program <elf> verify reset exit`，
+    这里提供明确的 flash 命令，内部调用 OpenOCD `program <firmware> verify reset exit`，
     成功标准就是 OpenOCD 返回 0 且输出 program/verify 通过。
     """
 
@@ -287,48 +288,70 @@ def cmd_flash(args: argparse.Namespace) -> int:
     workspace_root = Path(args.workspace_root).resolve() if args.workspace_root else Path(model.inferred_project_root)
     project_name = _sanitize_name(target.name)
     generated_dir = workspace_root / ".keilbridge" / "generated"
-    build_dir = workspace_root / ".keilbridge" / "build" / "gcc-debug"
-    cfg = generated_dir / "openocd" / f"{project_name}_{probe}.cfg"
-    elf = Path(args.elf).resolve() if args.elf else build_dir / f"{project_name}.elf"
-    if not cfg.exists():
-        raise SystemExit(f"OpenOCD config not found: {cfg}. Run configure first.")
-    if not elf.exists():
-        raise SystemExit(f"ELF not found: {elf}. Run build first.")
-
+    firmware_arg = getattr(args, "firmware", None)
+    elf_arg = getattr(args, "elf", None)
     openocd = find_openocd(args.openocd)
     scripts = find_openocd_scripts(openocd)
-    command = [openocd]
-    if scripts:
-        command.extend(["-s", scripts])
-    command.extend(["-f", str(cfg), "-c", f"program {elf.as_posix()} verify reset exit"])
-    print(" ".join(f'"{item}"' if " " in item else item for item in command))
-    # flash 是最容易受探针、OpenOCD 版本、USB/HID 占用影响的阶段。这里不再直接把
-    # subprocess 输出丢给终端就结束，而是同时保存日志，并在失败时立即调用 Doctor
-    # 分类规则，给用户一个可读结论。
+
+    if firmware_arg is None:
+        cfg = generated_dir / "openocd" / f"{project_name}_{probe}.cfg"
+        build_dir = workspace_root / ".keilbridge" / "build" / "gcc-debug"
+        firmware = Path(elf_arg).resolve() if elf_arg else build_dir / f"{project_name}.elf"
+        if not cfg.exists():
+            raise SystemExit(f"OpenOCD config not found: {cfg}. Run configure first.")
+        if not firmware.exists():
+            raise SystemExit(f"ELF not found: {firmware}. Run build first.")
+        config = OpenOcdConfig(
+            executable=Path(openocd),
+            scripts_dir=Path(scripts) if scripts else None,
+            interface_cfg=None,
+            target_cfg=str(cfg),
+        )
+        cwd = generated_dir
+    else:
+        if probe != "stlink":
+            raise SystemExit("HEX/BIN flash supports only the ST-Link OpenOCD probe.")
+        target_resolution = resolve_openocd_target(target, scripts)
+        if not target_resolution.target_cfg or not target_resolution.status.endswith("_verified"):
+            raise SystemExit(f"OpenOCD target could not be resolved: {target_resolution.reason}")
+        firmware = Path(firmware_arg).resolve()
+        config = OpenOcdConfig(
+            executable=Path(openocd),
+            scripts_dir=Path(scripts) if scripts else None,
+            interface_cfg="interface/stlink.cfg",
+            target_cfg=target_resolution.target_cfg,
+        )
+        cwd = workspace_root
+
+    request = FlashRequest(firmware=firmware, base_address=args.base_address)
     logs_dir = workspace_root / ".keilbridge" / "logs"
-    logs_dir.mkdir(parents=True, exist_ok=True)
-    stamp = strftime("%Y%m%d-%H%M%S")
-    stdout_path = logs_dir / f"flash_{project_name}_{probe}_{stamp}.out.log"
-    stderr_path = logs_dir / f"flash_{project_name}_{probe}_{stamp}.err.log"
-    completed = subprocess.run(command, cwd=generated_dir, text=True, capture_output=True)
-    stdout_path.write_text(completed.stdout, encoding="utf-8", newline="\n")
-    stderr_path.write_text(completed.stderr, encoding="utf-8", newline="\n")
-    if completed.stdout:
-        print(completed.stdout, end="")
-    if completed.stderr:
-        print(completed.stderr, end="")
-    print(f"Flash logs: {stdout_path} ; {stderr_path}")
-    if completed.returncode != 0:
-        findings = classify_openocd_log(completed.stdout + "\n" + completed.stderr, openocd, target, probe)
-        if findings:
+    try:
+        result = run_flash(
+            config,
+            request,
+            logs_dir,
+            cwd=cwd,
+            target=target,
+            target_name=target.name,
+        )
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
+    print(" ".join(f'"{item}"' if " " in item else item for item in result.command))
+    if result.stdout:
+        print(result.stdout, end="")
+    if result.stderr:
+        print(result.stderr, end="")
+    print(f"Flash logs: {result.stdout_log} ; {result.stderr_log}")
+    if not result.success:
+        if result.findings:
             print("KeilBridge Flash Doctor:")
-            for finding in findings:
+            for finding in result.findings:
                 print(f"[{finding.severity}] {finding.code}: {finding.title}")
                 if finding.evidence:
                     print(f"  evidence: {finding.evidence}")
                 if finding.suggestion:
                     print(f"  suggestion: {finding.suggestion}")
-        return completed.returncode
+        return result.returncode or 1
     return 0
 
 
@@ -407,6 +430,35 @@ def cmd_doctor_elf(args: argparse.Namespace) -> int:
         if finding.suggestion:
             print(f"  suggestion: {finding.suggestion}")
     return 1 if any(item.severity in {"fail", "fatal"} for item in result.findings) else 0
+
+
+def cmd_keil(args: argparse.Namespace) -> int:
+    """Call Keil uVision command line for build/rebuild/download fallback workflows."""
+
+    model = parse_uvprojx(args.project)
+    target = _pick_target(model, args.target)
+    workspace_root = Path(args.workspace_root).resolve() if args.workspace_root else Path(model.inferred_project_root)
+    try:
+        result = run_keil_cli(
+            project=Path(model.project_file),
+            target=target.name,
+            action=args.keil_command,
+            uvision=args.uvision,
+            workspace_root=workspace_root,
+        )
+    except FileNotFoundError as exc:
+        raise SystemExit(str(exc)) from exc
+    print(" ".join(f'"{item}"' if " " in item else item for item in result.command))
+    print(f"Keil {args.keil_command} mode: {result.mode}")
+    print(f"Keil {args.keil_command} log: {result.log_path}")
+    return result.returncode
+
+
+def cmd_gui(args: argparse.Namespace) -> int:
+    from .gui import launch_gui
+
+    launch_gui()
+    return 0
 
 
 def _write_backend_report(workspace_root: Path, target, armclang_root: str | None, arm_gcc_root: str | None):
@@ -523,14 +575,20 @@ def build_parser() -> argparse.ArgumentParser:
     openocd_cmd.add_argument("--run", action="store_true", help="Run OpenOCD instead of only printing the command")
     openocd_cmd.set_defaults(func=cmd_openocd)
 
-    flash_cmd = subparsers.add_parser("flash", help="Program the generated ELF with OpenOCD")
+    flash_cmd = subparsers.add_parser("flash", help="Program the generated ELF or an existing HEX/BIN file with OpenOCD")
     flash_cmd.add_argument("--project", required=True, type=Path, help="Path to .uvprojx")
     flash_cmd.add_argument("--target", help="Keil target name")
-    flash_cmd.add_argument("--probe", help="Probe profile: stlink, cmsis-dap, daplink. Defaults to uvoptx inference, then stlink.")
+    flash_cmd.add_argument("--probe", help="Probe profile for legacy generated ELF; HEX/BIN supports ST-Link.")
     flash_cmd.add_argument("--workspace-root", help="Override .keilbridge location; defaults to inferred Keil project root")
     flash_cmd.add_argument("--openocd", help="Path to openocd executable")
-    flash_cmd.add_argument("--elf", help="Override ELF path; defaults to .keilbridge/build/gcc-debug/<target>.elf")
+    image_group = flash_cmd.add_mutually_exclusive_group()
+    image_group.add_argument("--elf", type=Path, help="Override ELF path; defaults to .keilbridge/build/gcc-debug/<target>.elf")
+    image_group.add_argument("--firmware", type=Path, help="Existing .hex or .bin firmware file")
+    flash_cmd.add_argument("--base-address", type=parse_address, default=0x08000000, help="BIN flash base address (default: 0x08000000)")
     flash_cmd.set_defaults(func=cmd_flash)
+
+    gui_cmd = subparsers.add_parser("gui", help="Launch the ST-Link flash and RTT workbench")
+    gui_cmd.set_defaults(func=cmd_gui)
 
     doctor_parser = subparsers.add_parser("doctor", help="Run KeilBridge staged diagnostics")
     doctor_subparsers = doctor_parser.add_subparsers(dest="doctor_command", required=True)
@@ -559,6 +617,20 @@ def build_parser() -> argparse.ArgumentParser:
     doctor_elf.add_argument("--elf", help="Override ELF path; defaults to .keilbridge/build/gcc-debug/<target>.elf")
     doctor_elf.add_argument("--arm-gcc-root", help="Path to Arm GNU Toolchain root")
     doctor_elf.set_defaults(func=cmd_doctor_elf)
+
+    keil_parser = subparsers.add_parser("keil", help="Run Keil uVision CLI build/rebuild/download")
+    keil_subparsers = keil_parser.add_subparsers(dest="keil_command", required=True)
+    for name, help_text in {
+        "build": "Build the selected Keil target with uVision CLI",
+        "rebuild": "Rebuild the selected Keil target with uVision CLI",
+        "download": "Program Flash with the selected Keil target settings",
+    }.items():
+        cmd = keil_subparsers.add_parser(name, help=help_text)
+        cmd.add_argument("--project", required=True, type=Path, help="Path to .uvprojx")
+        cmd.add_argument("--target", help="Keil target name")
+        cmd.add_argument("--workspace-root", help="Override .keilbridge location; defaults to inferred Keil project root")
+        cmd.add_argument("--uvision", help="Path to UV4.exe/UV4.com. Defaults to PATH and common Keil install paths.")
+        cmd.set_defaults(func=cmd_keil)
 
     return parser
 

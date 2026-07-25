@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from .device_catalog import load_embedded_catalog
 from .project_model import DeviceInfo, MemoryRegion
 
 
@@ -38,6 +39,27 @@ def lookup_device(device: str) -> DeviceInfo:
     """按 Keil device 名称查找设备数据库。"""
 
     normalized = _normalize_device_name(device)
+    catalog_device = load_embedded_catalog().lookup_any_vendor(normalized)
+    if catalog_device is not None:
+        vendor = catalog_device.vendor
+        vendor_key = "gd" if "giga" in vendor.lower() else "st" if "stmicro" in vendor.lower() else vendor
+        return DeviceInfo(
+            matched=True,
+            device=catalog_device.device,
+            vendor=vendor_key,
+            family=_catalog_family(catalog_device.device),
+            core=catalog_device.core,
+            fpu=catalog_device.fpu,
+            memory=[
+                MemoryRegion(
+                    name=item.name,
+                    origin=f"0x{item.start:08X}",
+                    length=f"0x{item.size:X}",
+                )
+                for item in catalog_device.memory
+            ],
+        )
+
     devices = _load_device_files()
     raw = devices.get(normalized)
     if raw is None:
@@ -64,3 +86,20 @@ def lookup_device(device: str) -> DeviceInfo:
         memory=memory,
     )
 
+
+def _catalog_family(device: str) -> str:
+    normalized = _normalize_device_name(device)
+    for prefix, family in (
+        ("GD32F10", "gd32f1"),
+        ("GD32F30", "gd32f3"),
+        ("GD32F4", "gd32f4"),
+        ("STM32F1", "stm32f1"),
+        ("STM32F3", "stm32f3"),
+        ("STM32F4", "stm32f4"),
+        ("STM32G4", "stm32g4"),
+        ("STM32H7", "stm32h7"),
+        ("STM32L4", "stm32l4"),
+    ):
+        if normalized.startswith(prefix):
+            return family
+    return ""

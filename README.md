@@ -27,7 +27,11 @@ python -m keiltool.cli build --project "C:\Path\To\Project\MDK-ARM\App.uvprojx" 
 python -m keiltool.cli configure --project "C:\Path\To\Project\MDK-ARM\App.uvprojx" --target App --probe stlink --backend debug-only --elf "C:\Path\To\Project\MDK-ARM\App\App.axf"
 
 python -m keiltool.cli doctor flash --project "C:\Path\To\Project\MDK-ARM\App.uvprojx" --target App --probe stlink --run
+
+k2c gui
 ```
+
+`k2c gui` launches the ST-Link/OpenOCD workbench for programming an existing HEX/BIN package or attaching to SEGGER RTT. A Keil project is optional: select an exact device from the embedded official CMSIS-Pack catalog, or import a PDSC/PACK/custom JSON definition. The workbench never guesses an OpenOCD target and disables hardware actions until the selected cfg exists in the active scripts directory. It restores non-sensitive settings, performs no hardware operation at startup, keeps Flash and RTT as separate mutually exclusive actions, supports copyable dark-console output, and saves every operation in its own timestamped device/task directory. The RTT view recognizes SEGGER virtual terminals and EasyLogger levels, supports remembered severity filtering, and still writes the complete UTF-8 log.
 
 ## Required Environment
 

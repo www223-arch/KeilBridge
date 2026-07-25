@@ -161,7 +161,39 @@ python -m keiltool.cli doctor flash --project "xxx.uvprojx" --target App --probe
 - 板子没供电、SWD 接线异常、复位线异常。
 - 芯片读保护或处于异常低功耗/锁死状态。
 
-## 8. `CMSIS-DAP command mismatch` 怎么办？
+## 7A. 只想采集 RTT，为什么还要导入 Keil 工程？
+
+现在不需要。打开 `k2c gui` 后，可直接在 Device 输入框搜索内置设备目录中的精确型号，再启动 RTT。内置目录来自官方 CMSIS-Pack/PDSC；也可点击“导入”添加 `.pdsc`、`.pack` 或自定义 JSON。Keil 工程仍可用于自动带入 Target、芯片和内存信息，但不再是 GUI 硬件操作的前提。
+
+如果芯片存在于目录中但按钮仍禁用，请查看“来源”和“解析”字段。CMSIS-Pack 不包含 OpenOCD target cfg；KeilBridge 只使用明确维护或用户显式提供的映射。没有映射、cfg 不存在或没有可写 RAM 时会明确报告缺失信息，不会根据相似型号猜一个 target。
+
+## 8. GUI 中 RTT 与烧录为什么不能同时进行？
+
+`k2c gui` 把“烧录并校验”和“开始 RTT”设计为两个独立操作，但它们都需要独占同一支 ST-Link/OpenOCD 会话。RTT 扫描、采集或停止清理期间，烧录和连接检查会禁用；烧录或连接检查期间，RTT 启动会禁用。
+
+这是为了避免两个 OpenOCD 进程同时抢占 ST-Link，导致连接失败、日志混杂或把目标置于不可预期状态。需要烧录时，先点击“停止采集”，等待状态变为“RTT 已停止”后再操作。若界面提示“RTT 清理不完整”，再次点击“停止采集”完成清理；在清理完成前，关闭窗口和新的硬件操作都会被阻止。
+
+## 9. GUI 的 RTT 会复位或停止 MCU 吗？
+
+不会。GUI RTT 仅通过 `rtt setup`、`rtt start` 和 RTT TCP server 附着到 `SEGGER RTT` 控制块，不发送 reset、halt 或 resume 命令。自动模式扫描当前 Target 的 RAM；手动模式使用填写地址起始的 `0x100` 字节窗口。
+
+如果找不到 RTT 控制块，确认当前固件已经包含并初始化 SEGGER RTT，检查所选设备或 Target 的 RAM 解析结果，或填写明确的控制块地址。RTT 文本会自动以 UTF-8 写入日志；有工程时默认根目录为 `<keil-project-root>\.keilbridge\logs\`，无工程时为 `%APPDATA%\KeilTool\logs\`，也可在 GUI 中修改并记忆。
+
+RTT 页的“显示等级”使用固件现有的 EasyLogger/SEGGER RTT 等级语义。默认 `VERBOSE` 显示全部；选择 `INFO` 会显示 `ASSERT`、`ERROR`、`WARN` 和 `INFO`。筛选和“清空显示”只处理最近 20,000 行 GUI 缓存，完整 UTF-8 日志仍持续记录所有等级。
+
+## 10. GUI 提示 target 未验证或 target override 无效怎么办？
+
+GUI 只会在 OpenOCD target cfg 已验证时启用“检查连接”“烧录并校验”和 RTT。自动解析失败时，不会猜测 target cfg。可在高级设置填写 override，但它必须是存在的 `.cfg` 文件：相对路径必须位于 OpenOCD scripts 目录内，绝对路径必须指向存在的文件。
+
+检查 Keil Target 的芯片信息、OpenOCD/scripts 路径以及 cfg 文件本身。修正后重新解析 Target；在验证成功前请不要改用不相关的 cfg 强行烧录。
+
+## 11. ST-Link 被占用或 GUI 无法连接怎么办？
+
+先停止 GUI 内的 RTT 或烧录任务，并等待状态回到空闲。随后关闭 Keil、STM32CubeProgrammer、VS Code/Cortex-Debug、串口监视器，以及可能持有探针的其他 OpenOCD/GDB 会话。必要时在任务管理器结束确认不再使用的 `openocd.exe` 和 `arm-none-eabi-gdb.exe`，重新插拔 ST-Link，再使用 GUI 的“检查连接”。
+
+不要在 RTT 采集期间手工启动第二个 OpenOCD，也不要用多个 GUI 实例连接同一支 ST-Link。连接或烧录失败时，先查看 GUI 输出中的命令和日志路径。每个任务都保存在 `时间_芯片_任务` 独立目录中，`session.json` 可用于确认 target、开始/结束时间和执行结果。
+
+## 12. `CMSIS-DAP command mismatch` 怎么办？
 
 常见输出：
 
@@ -182,7 +214,7 @@ Error: Failed to write memory
 5. 重新运行 `doctor flash --run`。
 6. 仍然失败时，换用 xPack OpenOCD 或 STM32CubeCLT OpenOCD。
 
-## 9. `preLaunchTask "CMake: build" 已终止` 怎么办？
+## 13. `preLaunchTask "CMake: build" 已终止` 怎么办？
 
 这通常是旧生成文件依赖 PATH 中的 `cmake`，但 VS Code task 环境找不到。
 
@@ -195,7 +227,7 @@ python -m keiltool.cli configure --project "C:\Path\To\App.uvprojx" --target App
 
 然后重新打开生成的 `.code-workspace`。
 
-## 10. 什么时候需要重新 `configure`？
+## 14. 什么时候需要重新 `configure`？
 
 这些情况建议重新运行：
 
@@ -211,7 +243,7 @@ python -m keiltool.cli configure --project "C:\Path\To\App.uvprojx" --target App
 
 Debug-only 如果 `.axf` 路径不变，通常不用重新 `configure`。
 
-## 11. ARMCC `.lib` 为什么会被提示风险？
+## 15. ARMCC `.lib` 为什么会被提示风险？
 
 Keil 工程里常见：
 
@@ -227,7 +259,7 @@ arm_cortexM4lf_math.lib
 - ArmClang 路线：更可能兼容 Keil/Arm 格式。
 - Debug-only 路线：不重新链接，所以不受这个问题影响。
 
-## 12. 一进调试就 HardFault 怎么办？
+## 16. 一进调试就 HardFault 怎么办？
 
 先不要只看 `HardFault_Handler`。需要采集：
 
@@ -245,7 +277,7 @@ python -m keiltool.cli doctor elf --project "xxx.uvprojx" --target App
 
 重点看 `.init_array`、启动文件、链接脚本、RAM 段和 RTOS 中断入口。
 
-## 13. CubeMX 工程支持吗？
+## 17. CubeMX 工程支持吗？
 
 支持识别和复用：
 
@@ -257,13 +289,13 @@ python -m keiltool.cli doctor elf --project "xxx.uvprojx" --target App
 
 KeilBridge 不调用 CubeMX，不改 `.ioc`，不改 `USER CODE`。
 
-## 14. RTOS 工程支持吗？
+## 18. RTOS 工程支持吗？
 
 当前策略是识别、诊断和对已验证组合做适配。
 
 常见 RTOS 形态可以被识别，例如 FreeRTOS、RT-Thread、ThreadX、uCOS。涉及 ARMCC/RVDS port 到 GCC port 的工程，需要看具体项目诊断结果。
 
-## 15. GD32 支持吗？
+## 19. GD32 支持吗？
 
 已有初步支持。GD32F303CB 已经过 DAPLink/CMSIS-DAP + OpenOCD 的最小工程验证。
 

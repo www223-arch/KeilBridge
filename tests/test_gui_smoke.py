@@ -275,6 +275,30 @@ def test_gui_applies_theme_and_filters_structured_rtt_records(tmp_path):
         assert gui._current_settings().device_name == "GD32F303CC"
         assert "官方目录" in gui.device_source_var.get()
 
+        project_device = gui._catalog.lookup_any_vendor("GD32F303CC")
+        assert project_device is not None
+        gui.project_var.set("D:/firmware/app.uvprojx")
+        gui._facts = SimpleNamespace(
+            device="GD32F303CC",
+            ram_origin=None,
+            ram_size=None,
+            ready=False,
+            openocd_executable="",
+            target_cfg="",
+        )
+        gui._refresh_controls()
+        assert str(gui.controls.device_combo.cget("state")) == "disabled"
+
+        other_label = next(
+            value
+            for value in gui.controls.device_combo.cget("values")
+            if value.startswith("GD32F303ZK ")
+        )
+        gui.device_choice_var.set(other_label)
+        gui._select_catalog_device()
+        assert gui.device_choice_var.get() == gui._device_label(project_device)
+        assert "工程锁定" in gui.device_source_var.get()
+
         gui.output.append_openocd("alpha\nbeta\n")
         view = gui.output.openocd_view
         view.text.tag_add("sel", "1.0", "1.5")

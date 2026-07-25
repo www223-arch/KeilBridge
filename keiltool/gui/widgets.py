@@ -88,7 +88,8 @@ class ConfigurationPane(ttk.Frame):
         )
         self.target_combo.grid(row=1, column=1, columnspan=2, sticky="ew", pady=3)
 
-        ttk.Label(section, text="Device").grid(row=2, column=0, sticky="w", pady=3)
+        self.device_label = ttk.Label(section, text="Device")
+        self.device_label.grid(row=2, column=0, sticky="w", pady=3)
         self.device_combo = ttk.Combobox(
             section,
             textvariable=variables.device_choice_var,

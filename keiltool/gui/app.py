@@ -298,7 +298,10 @@ class KeilToolGui:
         self.controls.device_combo.configure(values=values[:300])
 
     def _select_catalog_device(self) -> None:
-        if self.project_var.get().strip() or self._hardware_busy():
+        if self.project_var.get().strip():
+            self._sync_project_device_selection()
+            return
+        if self._hardware_busy():
             return
         device = self._selected_catalog_device()
         if device is None:
@@ -311,6 +314,26 @@ class KeilToolGui:
         self.device_source_var.set(self._device_source_text(device))
         self.controls.device_combo.configure(values=tuple(self._device_by_label))
         self._resolve_selected_target()
+
+    def _sync_project_device_selection(self) -> None:
+        if not self.project_var.get().strip():
+            return
+        facts = self._facts
+        if facts is None:
+            self.device_choice_var.set("")
+            self.device_source_var.set("Keil 工程锁定 · 等待解析 Target 设备")
+            return
+        catalog_device = self._catalog.lookup_any_vendor(facts.device)
+        if catalog_device is not None:
+            self.device_choice_var.set(self._device_label(catalog_device))
+            self.device_source_var.set(
+                f"Keil 工程锁定 · {self._device_source_text(catalog_device)}"
+            )
+        else:
+            self.device_choice_var.set(facts.device)
+            self.device_source_var.set(
+                f"Keil 工程锁定 · {facts.device} · 设备目录无精确匹配"
+            )
 
     def _import_device(self) -> None:
         path = filedialog.askopenfilename(
@@ -486,15 +509,7 @@ class KeilToolGui:
         self._freshness.accept(snapshot)
         self._facts = facts
         if current.project:
-            catalog_device = self._catalog.lookup_any_vendor(facts.device)
-            if catalog_device is not None:
-                self.device_choice_var.set(self._device_label(catalog_device))
-                self.device_source_var.set(
-                    f"Keil 工程 · {self._device_source_text(catalog_device)}"
-                )
-            else:
-                self.device_choice_var.set(facts.device)
-                self.device_source_var.set("Keil 工程（设备目录无精确匹配）")
+            self._sync_project_device_selection()
         self._apply_facts_display(target_facts_display(facts))
         if not self.logs_dir_var.get().strip():
             self.logs_dir_var.set(facts.default_log_dir)
@@ -1089,8 +1104,12 @@ class KeilToolGui:
                 pass
 
         firmware_is_hex = Path(self.firmware_var.get().strip()).suffix.lower() == ".hex"
+        project_device_locked = bool(self.project_var.get().strip())
+        controls.device_label.configure(
+            text="Device（工程锁定）" if project_device_locked else "Device"
+        )
         controls.device_combo.configure(
-            state="disabled" if busy else ("readonly" if self.project_var.get().strip() else "normal")
+            state="disabled" if busy or project_device_locked else "normal"
         )
         controls.bin_address_entry.configure(state="disabled" if busy or firmware_is_hex else "normal")
         controls.rtt_address_entry.configure(

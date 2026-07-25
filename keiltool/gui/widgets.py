@@ -38,6 +38,7 @@ class WorkbenchVariables(Protocol):
     device_var: tk.StringVar
     device_choice_var: tk.StringVar
     device_source_var: tk.StringVar
+    device_source_mode_var: tk.StringVar
     flash_summary_var: tk.StringVar
     ram_summary_var: tk.StringVar
     target_cfg_var: tk.StringVar
@@ -88,35 +89,53 @@ class ConfigurationPane(ttk.Frame):
         )
         self.target_combo.grid(row=1, column=1, columnspan=2, sticky="ew", pady=3)
 
+        ttk.Label(section, text="配置来源").grid(row=2, column=0, sticky="w", pady=3)
+        source_modes = ttk.Frame(section)
+        source_modes.grid(row=2, column=1, columnspan=2, sticky="w", pady=3)
+        self.project_source_radio = ttk.Radiobutton(
+            source_modes,
+            text="Keil 工程",
+            variable=variables.device_source_mode_var,
+            value="project",
+        )
+        self.project_source_radio.grid(row=0, column=0, sticky="w")
+        self.device_source_radio = ttk.Radiobutton(
+            source_modes,
+            text="独立 Device",
+            variable=variables.device_source_mode_var,
+            value="device",
+        )
+        self.device_source_radio.grid(row=0, column=1, sticky="w", padx=(12, 0))
+
         self.device_label = ttk.Label(section, text="Device")
-        self.device_label.grid(row=2, column=0, sticky="w", pady=3)
+        self.device_label.grid(row=3, column=0, sticky="w", pady=3)
         self.device_combo = ttk.Combobox(
             section,
             textvariable=variables.device_choice_var,
             state="normal",
             width=34,
         )
-        self.device_combo.grid(row=2, column=1, sticky="ew", pady=3)
+        self.device_combo.grid(row=3, column=1, sticky="ew", pady=3)
         self.device_import_button = ttk.Button(section, text="导入", width=6)
-        self.device_import_button.grid(row=2, column=2, sticky="e", padx=(6, 0), pady=3)
-        readonly_row(section, 3, "来源", variables.device_source_var)
-        readonly_row(section, 4, "Flash", variables.flash_summary_var)
-        readonly_row(section, 5, "RAM", variables.ram_summary_var)
-        readonly_row(section, 6, "Target cfg", variables.target_cfg_var)
-        readonly_row(section, 7, "解析", variables.resolution_var)
+        self.device_import_button.grid(row=3, column=2, sticky="e", padx=(6, 0), pady=3)
+        readonly_row(section, 4, "来源", variables.device_source_var)
+        readonly_row(section, 5, "Flash", variables.flash_summary_var)
+        readonly_row(section, 6, "RAM", variables.ram_summary_var)
+        readonly_row(section, 7, "Target cfg", variables.target_cfg_var)
+        readonly_row(section, 8, "解析", variables.resolution_var)
 
         self.firmware_entry, self.firmware_button = path_row(
             section,
-            8,
+            9,
             "固件",
             variables.firmware_var,
         )
-        ttk.Label(section, text="BIN 地址").grid(row=9, column=0, sticky="w", pady=3)
+        ttk.Label(section, text="BIN 地址").grid(row=10, column=0, sticky="w", pady=3)
         self.bin_address_entry = ttk.Entry(section, textvariable=variables.bin_address_var, width=34)
-        self.bin_address_entry.grid(row=9, column=1, columnspan=2, sticky="ew", pady=3)
+        self.bin_address_entry.grid(row=10, column=1, columnspan=2, sticky="ew", pady=3)
 
         actions = ttk.Frame(section)
-        actions.grid(row=10, column=0, columnspan=3, sticky="ew", pady=(7, 0))
+        actions.grid(row=11, column=0, columnspan=3, sticky="ew", pady=(7, 0))
         actions.columnconfigure((0, 1), weight=1)
         self.connect_button = ttk.Button(actions, text="检查连接")
         self.connect_button.grid(row=0, column=0, sticky="ew", padx=(0, 4))
@@ -130,6 +149,8 @@ class ConfigurationPane(ttk.Frame):
             self.firmware_button,
         )
         self.editable_widgets.append((self.target_combo, "readonly"))
+        self.editable_widgets.append((self.project_source_radio, "normal"))
+        self.editable_widgets.append((self.device_source_radio, "normal"))
         self.editable_widgets.append((self.device_combo, "normal"))
         self.editable_widgets.append((self.device_import_button, "normal"))
         self.editable_widgets.append((self.bin_address_entry, "normal"))

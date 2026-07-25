@@ -29,6 +29,9 @@ class GuiSettings:
     logs_dir: str = ""
     device_vendor: str = ""
     device_name: str = ""
+    device_source_mode: str = "device"
+    project_firmware: str = ""
+    device_firmware: str = ""
 
     def to_dict(self) -> dict[str, object]:
         return {"version": SETTINGS_VERSION, **asdict(self)}
@@ -40,10 +43,13 @@ class GuiSettings:
         if "version" in data and data["version"] != SETTINGS_VERSION:
             return cls()
         defaults = cls()
+        project = _string(data.get("project"), defaults.project)
+        firmware = _string(data.get("firmware"), defaults.firmware)
+        source_mode = _device_source_mode(data.get("device_source_mode"), project)
         return cls(
-            project=_string(data.get("project"), defaults.project),
+            project=project,
             target=_string(data.get("target"), defaults.target),
-            firmware=_string(data.get("firmware"), defaults.firmware),
+            firmware=firmware,
             bin_address=_string(data.get("bin_address"), defaults.bin_address),
             openocd_path=_string(data.get("openocd_path"), defaults.openocd_path),
             scripts_dir=_string(data.get("scripts_dir"), defaults.scripts_dir),
@@ -56,6 +62,15 @@ class GuiSettings:
             logs_dir=_string(data.get("logs_dir"), defaults.logs_dir),
             device_vendor=_string(data.get("device_vendor"), defaults.device_vendor),
             device_name=_string(data.get("device_name"), defaults.device_name),
+            device_source_mode=source_mode,
+            project_firmware=_string(
+                data.get("project_firmware"),
+                firmware if project else "",
+            ),
+            device_firmware=_string(
+                data.get("device_firmware"),
+                firmware if not project else "",
+            ),
         )
 
 
@@ -142,6 +157,12 @@ def _integer(value: Any, default: int) -> int:
         return int(value)
     except (TypeError, ValueError):
         return default
+
+
+def _device_source_mode(value: object, project: str) -> str:
+    if value in {"project", "device"}:
+        return str(value)
+    return "project" if project else "device"
 
 
 def _rtt_level(value: object) -> str:

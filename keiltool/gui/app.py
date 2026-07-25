@@ -75,6 +75,9 @@ _BUSY_STATES = frozenset(
     }
 )
 
+_PROJECT_SOURCE = "project"
+_DEVICE_SOURCE = "device"
+
 _STATE_TEXT = {
     SessionState.IDLE: "空闲",
     SessionState.CONNECT: "检查连接",
@@ -135,7 +138,7 @@ class KeilToolGui:
 
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
         self.root.after(50, self._poll_events)
-        if settings.project:
+        if settings.project and self.device_source_mode_var.get() == _PROJECT_SOURCE:
             self.root.after_idle(lambda: self._load_project(Path(settings.project), restored=True))
         elif settings.device_vendor and settings.device_name:
             self.root.after_idle(self._resolve_selected_target)
@@ -170,16 +173,39 @@ class KeilToolGui:
 
     def _create_variables(self, settings: GuiSettings) -> None:
         selected = self._catalog.lookup(settings.device_vendor, settings.device_name)
+        source_mode = (
+            settings.device_source_mode
+            if settings.project or settings.device_source_mode == _DEVICE_SOURCE
+            else _DEVICE_SOURCE
+        )
+        self._project_target = settings.target
+        self._project_firmware = settings.project_firmware or (
+            settings.firmware if source_mode == _PROJECT_SOURCE else ""
+        )
+        self._device_firmware = settings.device_firmware or (
+            settings.firmware if source_mode == _DEVICE_SOURCE else ""
+        )
+        self._independent_device = selected
         self.project_var = tk.StringVar(value=settings.project)
-        self.target_var = tk.StringVar(value=settings.target)
+        self.target_var = tk.StringVar(
+            value=settings.target if source_mode == _PROJECT_SOURCE else ""
+        )
+        self.device_source_mode_var = tk.StringVar(value=source_mode)
         self.device_var = tk.StringVar(value=selected.device if selected else "—")
         self.device_choice_var = tk.StringVar(value=self._device_label(selected) if selected else "")
-        self.device_source_var = tk.StringVar(value=self._device_source_text(selected))
+        source_prefix = "独立 Device" if source_mode == _DEVICE_SOURCE else "Keil 工程"
+        self.device_source_var = tk.StringVar(
+            value=f"{source_prefix} · {self._device_source_text(selected)}"
+        )
         self.flash_summary_var = tk.StringVar(value="—")
         self.ram_summary_var = tk.StringVar(value="—")
         self.target_cfg_var = tk.StringVar(value="—")
         self.resolution_var = tk.StringVar(value="请选择 Keil 工程")
-        self.firmware_var = tk.StringVar(value=settings.firmware)
+        self.firmware_var = tk.StringVar(
+            value=self._project_firmware
+            if source_mode == _PROJECT_SOURCE
+            else self._device_firmware
+        )
         self.bin_address_var = tk.StringVar(value=settings.bin_address)
         self.rtt_manual_var = tk.BooleanVar(value=bool(settings.rtt_address))
         self.rtt_address_var = tk.StringVar(value=settings.rtt_address)
@@ -259,7 +285,9 @@ class KeilToolGui:
         controls.rtt_stop_button.configure(command=self._stop_rtt)
         controls.auto_radio.configure(command=self._refresh_controls)
         controls.manual_radio.configure(command=self._refresh_controls)
-        controls.target_combo.bind("<<ComboboxSelected>>", lambda _event: self._resolve_selected_target())
+        controls.project_source_radio.configure(command=self._change_device_source)
+        controls.device_source_radio.configure(command=self._change_device_source)
+        controls.target_combo.bind("<<ComboboxSelected>>", lambda _event: self._select_project_target())
         controls.device_combo.bind("<<ComboboxSelected>>", lambda _event: self._select_catalog_device())
         controls.device_combo.bind("<KeyRelease>", self._filter_device_choices)
         controls.device_combo.bind("<Return>", lambda _event: self._select_catalog_device())
@@ -287,7 +315,7 @@ class KeilToolGui:
         return self._catalog.lookup_any_vendor(value)
 
     def _filter_device_choices(self, _event: tk.Event | None = None) -> None:
-        if self.project_var.get().strip():
+        if self.device_source_mode_var.get() == _PROJECT_SOURCE:
             return
         query = self.device_choice_var.get().strip().lower()
         values = tuple(
@@ -298,7 +326,7 @@ class KeilToolGui:
         self.controls.device_combo.configure(values=values[:300])
 
     def _select_catalog_device(self) -> None:
-        if self.project_var.get().strip():
+        if self.device_source_mode_var.get() == _PROJECT_SOURCE:
             self._sync_project_device_selection()
             return
         if self._hardware_busy():
@@ -310,30 +338,88 @@ class KeilToolGui:
             self._clear_facts("请选择设备目录中的精确型号")
             self._refresh_controls()
             return
+        previous = self._independent_device
+        if previous is not None and (
+            previous.vendor != device.vendor or previous.device != device.device
+        ):
+            self._device_firmware = ""
+            self.firmware_var.set("")
+        self._independent_device = device
         self.device_choice_var.set(self._device_label(device))
-        self.device_source_var.set(self._device_source_text(device))
+        self.device_source_var.set(f"独立 Device · {self._device_source_text(device)}")
         self.controls.device_combo.configure(values=tuple(self._device_by_label))
         self._resolve_selected_target()
 
     def _sync_project_device_selection(self) -> None:
-        if not self.project_var.get().strip():
+        if self.device_source_mode_var.get() != _PROJECT_SOURCE:
             return
         facts = self._facts
         if facts is None:
             self.device_choice_var.set("")
-            self.device_source_var.set("Keil 工程锁定 · 等待解析 Target 设备")
+            self.device_source_var.set("Keil 工程 · 等待解析 Target 设备")
             return
         catalog_device = self._catalog.lookup_any_vendor(facts.device)
         if catalog_device is not None:
             self.device_choice_var.set(self._device_label(catalog_device))
             self.device_source_var.set(
-                f"Keil 工程锁定 · {self._device_source_text(catalog_device)}"
+                f"Keil 工程 · {self._device_source_text(catalog_device)}"
             )
         else:
             self.device_choice_var.set(facts.device)
             self.device_source_var.set(
-                f"Keil 工程锁定 · {facts.device} · 设备目录无精确匹配"
+                f"Keil 工程 · {facts.device} · 设备目录无精确匹配"
             )
+
+    def _change_device_source(self) -> None:
+        if self._hardware_busy():
+            return
+        mode = self.device_source_mode_var.get()
+        if mode == _PROJECT_SOURCE:
+            project = self.project_var.get().strip()
+            if not project:
+                self.device_source_mode_var.set(_DEVICE_SOURCE)
+                self._refresh_controls()
+                return
+            self._remember_device_context()
+            self.target_var.set(self._project_target)
+            self.firmware_var.set(self._project_firmware)
+            self._facts = None
+            self._clear_facts("正在重新解析 Keil 工程 Target")
+            self._load_project(Path(project))
+            return
+
+        self._remember_project_context()
+        self.target_var.set("")
+        self.controls.target_combo.configure(values=())
+        self.firmware_var.set(self._device_firmware)
+        self._facts = None
+        if self._independent_device is not None:
+            self.device_choice_var.set(self._device_label(self._independent_device))
+            self.device_source_var.set(
+                f"独立 Device · {self._device_source_text(self._independent_device)}"
+            )
+            self._resolve_selected_target()
+        else:
+            self.device_choice_var.set("")
+            self.device_source_var.set("独立 Device · 未选择")
+            self._clear_facts("请选择设备目录中的精确型号")
+            self._freshness.observe(self._visible_fact_inputs())
+            self._refresh_controls()
+
+    def _remember_project_context(self) -> None:
+        self._project_target = self.target_var.get().strip()
+        self._project_firmware = self.firmware_var.get().strip()
+
+    def _remember_device_context(self) -> None:
+        selected = self._selected_catalog_device()
+        if selected is not None:
+            self._independent_device = selected
+        self._device_firmware = self.firmware_var.get().strip()
+
+    def _select_project_target(self) -> None:
+        if self.device_source_mode_var.get() == _PROJECT_SOURCE:
+            self._project_target = self.target_var.get().strip()
+        self._resolve_selected_target()
 
     def _import_device(self) -> None:
         path = filedialog.askopenfilename(
@@ -358,9 +444,12 @@ class KeilToolGui:
             )
             if selected is None:
                 raise ValueError("导入成功，但刷新目录后找不到设备。")
-            if not self.project_var.get().strip():
+            if self.device_source_mode_var.get() == _DEVICE_SOURCE:
+                self._independent_device = selected
                 self.device_choice_var.set(self._device_label(selected))
-                self.device_source_var.set(self._device_source_text(selected))
+                self.device_source_var.set(
+                    f"独立 Device · {self._device_source_text(selected)}"
+                )
                 self._resolve_selected_target()
             self._append_openocd(
                 f"[设备目录] 已导入 {len(result.devices)} 个型号: {result.output_path}\n"
@@ -369,10 +458,11 @@ class KeilToolGui:
             messagebox.showerror("设备导入失败", str(exc), parent=self.root)
 
     def _visible_fact_inputs(self) -> FactInputs:
-        selected = None if self.project_var.get().strip() else self._selected_catalog_device()
+        project_mode = self.device_source_mode_var.get() == _PROJECT_SOURCE
+        selected = None if project_mode else self._selected_catalog_device()
         return FactInputs(
-            project=self.project_var.get().strip(),
-            target=self.target_var.get().strip(),
+            project=self.project_var.get().strip() if project_mode else "",
+            target=self.target_var.get().strip() if project_mode else "",
             openocd=self.openocd_var.get().strip(),
             scripts=self.scripts_var.get().strip(),
             target_override=self.target_override_var.get().strip(),
@@ -393,7 +483,15 @@ class KeilToolGui:
             filetypes=[("Keil 工程", "*.uvprojx"), ("所有文件", "*.*")],
         )
         if path:
+            if path != self.project_var.get().strip():
+                if self.device_source_mode_var.get() == _DEVICE_SOURCE:
+                    self._remember_device_context()
+                self._project_target = ""
+                self._project_firmware = ""
+                self.target_var.set("")
+                self.firmware_var.set("")
             self.project_var.set(path)
+            self.device_source_mode_var.set(_PROJECT_SOURCE)
             self._load_project(Path(path))
 
     def _choose_firmware(self) -> None:
@@ -404,6 +502,10 @@ class KeilToolGui:
         )
         if path:
             self.firmware_var.set(path)
+            if self.device_source_mode_var.get() == _PROJECT_SOURCE:
+                self._project_firmware = path
+            else:
+                self._device_firmware = path
 
     def _choose_logs_dir(self) -> None:
         path = filedialog.askdirectory(parent=self.root, title="选择日志目录")
@@ -441,10 +543,18 @@ class KeilToolGui:
             self._show_busy()
             return
         if not self.project_var.get().strip():
+            if self.device_source_mode_var.get() == _PROJECT_SOURCE:
+                self._remember_project_context()
+            self.device_source_mode_var.set(_DEVICE_SOURCE)
             self.controls.target_combo.configure(values=())
             self.target_var.set("")
-            selected = self._selected_catalog_device()
-            self.device_source_var.set(self._device_source_text(selected))
+            self.firmware_var.set(self._device_firmware)
+            selected = self._independent_device
+            if selected is not None:
+                self.device_choice_var.set(self._device_label(selected))
+            self.device_source_var.set(
+                f"独立 Device · {self._device_source_text(selected)}"
+            )
             if selected is None:
                 self._facts = None
                 self._clear_facts("请选择设备型号")
@@ -452,6 +562,11 @@ class KeilToolGui:
             else:
                 self._resolve_selected_target()
             return
+        if self.device_source_mode_var.get() != _PROJECT_SOURCE:
+            self._remember_device_context()
+            self.device_source_mode_var.set(_PROJECT_SOURCE)
+            self.target_var.set(self._project_target)
+            self.firmware_var.set(self._project_firmware)
         try:
             loaded = load_project_targets(path)
         except Exception as exc:
@@ -468,6 +583,7 @@ class KeilToolGui:
         self.controls.target_combo.configure(values=names)
         requested = self.target_var.get()
         self.target_var.set(requested if requested in names else (names[0] if names else ""))
+        self._project_target = self.target_var.get().strip()
         if not names:
             self._facts = None
             self._clear_facts("工程中没有可用 Target")
@@ -1104,12 +1220,23 @@ class KeilToolGui:
                 pass
 
         firmware_is_hex = Path(self.firmware_var.get().strip()).suffix.lower() == ".hex"
-        project_device_locked = bool(self.project_var.get().strip())
+        project_mode = self.device_source_mode_var.get() == _PROJECT_SOURCE
         controls.device_label.configure(
-            text="Device（工程锁定）" if project_device_locked else "Device"
+            text="Device（来自工程）" if project_mode else "Device"
+        )
+        controls.project_source_radio.configure(
+            state=(
+                "disabled"
+                if busy or not self.project_var.get().strip()
+                else "normal"
+            )
+        )
+        controls.device_source_radio.configure(state="disabled" if busy else "normal")
+        controls.target_combo.configure(
+            state="readonly" if not busy and project_mode else "disabled"
         )
         controls.device_combo.configure(
-            state="disabled" if busy or project_device_locked else "normal"
+            state="disabled" if busy or project_mode else "normal"
         )
         controls.bin_address_entry.configure(state="disabled" if busy or firmware_is_hex else "normal")
         controls.rtt_address_entry.configure(
@@ -1259,10 +1386,15 @@ class KeilToolGui:
         self.root.destroy()
 
     def _current_settings(self) -> GuiSettings:
-        selected = self._selected_catalog_device()
+        mode = self.device_source_mode_var.get()
+        if mode == _PROJECT_SOURCE:
+            self._remember_project_context()
+        else:
+            self._remember_device_context()
+        selected = self._independent_device
         return GuiSettings(
             project=self.project_var.get().strip(),
-            target=self.target_var.get().strip(),
+            target=self._project_target,
             firmware=self.firmware_var.get().strip(),
             bin_address=self.bin_address_var.get().strip(),
             openocd_path=self.openocd_var.get().strip(),
@@ -1276,6 +1408,9 @@ class KeilToolGui:
             logs_dir=self.logs_dir_var.get().strip(),
             device_vendor=selected.vendor if selected else "",
             device_name=selected.device if selected else "",
+            device_source_mode=mode,
+            project_firmware=self._project_firmware,
+            device_firmware=self._device_firmware,
         )
 
 

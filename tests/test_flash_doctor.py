@@ -1,5 +1,5 @@
 from keiltool.core.doctor import _resolve_openocd_cfg, classify_openocd_log
-from keiltool.core.project_model import KeilTargetModel
+from keiltool.core.project_model import KeilTargetModel, MemoryRegion
 
 
 def test_flash_doctor_finds_debug_only_openocd_config(tmp_path):
@@ -45,3 +45,33 @@ def test_flash_doctor_reports_unresolved_generated_target(tmp_path):
     findings = _static_flash_findings(KeilTargetModel(name="App"), "openocd", cfg, "stlink")
 
     assert any(item.code == "OPENOCD_TARGET_UNRESOLVED" and item.severity == "fatal" for item in findings)
+
+
+def test_reset_state_finding_reports_register_values_and_checked_ranges():
+    target = KeilTargetModel(
+        name="App",
+        device="GD32F303CC",
+        memory=[
+            MemoryRegion("FLASH", "0x08000000", "256K"),
+            MemoryRegion("RAM", "0x20000000", "64K"),
+        ],
+    )
+
+    findings = classify_openocd_log(
+        "Info : pc: 0x08001234\nInfo : msp: 0x20010000\n",
+        "openocd",
+        target,
+        "stlink",
+    )
+
+    finding = next(item for item in findings if item.code == "RESET_STATE_LOOKS_VALID")
+    assert finding.title == "复位寄存器地址范围检查通过"
+    assert "PC=0x08001234" in finding.message
+    assert "MSP=0x20010000" in finding.message
+    assert "FLASH [0x08000000, 0x08040000)" in finding.message
+    assert "RAM [0x20000000, 0x20010000]" in finding.message
+    assert "范围来源: Keil 工程内存定义" in finding.message
+    assert "仅验证地址范围" in finding.message
+    assert "program/verify" in finding.message
+    assert "pc: 0x08001234" in finding.evidence
+    assert "msp: 0x20010000" in finding.evidence

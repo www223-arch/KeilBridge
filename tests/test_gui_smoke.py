@@ -1,5 +1,6 @@
 import importlib
 import argparse
+from pathlib import Path
 import queue
 import sys
 from types import SimpleNamespace
@@ -241,12 +242,13 @@ def test_high_rate_rtt_poll_yields_to_unrelated_tk_callback():
     assert unrelated_ran == [True]
 
 
-def test_gui_applies_theme_and_filters_structured_rtt_records(tmp_path):
+def test_gui_applies_theme_and_filters_structured_rtt_records(tmp_path, monkeypatch):
     import tkinter as tk
 
     from keiltool.core.rtt import RttEvent
     from keiltool.core.rtt_log import RttLevel
     from keiltool.gui.app import KeilToolGui
+    from keiltool.gui.rtt_display import RttDisplayBuffer
     from keiltool.gui.settings import SettingsStore
     from keiltool.gui.theme import PALETTE
 
@@ -277,7 +279,10 @@ def test_gui_applies_theme_and_filters_structured_rtt_records(tmp_path):
 
         project_device = gui._catalog.lookup_any_vendor("GD32F303CC")
         assert project_device is not None
+        gui.device_source_mode_var.set("project")
         gui.project_var.set("D:/firmware/app.uvprojx")
+        gui.target_var.set("Dragon_debug")
+        gui.firmware_var.set("D:/firmware/project.hex")
         gui._facts = SimpleNamespace(
             device="GD32F303CC",
             ram_origin=None,
@@ -297,7 +302,42 @@ def test_gui_applies_theme_and_filters_structured_rtt_records(tmp_path):
         gui.device_choice_var.set(other_label)
         gui._select_catalog_device()
         assert gui.device_choice_var.get() == gui._device_label(project_device)
-        assert "工程锁定" in gui.device_source_var.get()
+        assert "Keil 工程" in gui.device_source_var.get()
+
+        gui.device_source_mode_var.set("device")
+        gui._change_device_source()
+        assert gui.project_var.get() == "D:/firmware/app.uvprojx"
+        assert gui.target_var.get() == ""
+        assert gui.firmware_var.get() == ""
+        assert gui._visible_fact_inputs().project == ""
+        assert str(gui.controls.target_combo.cget("state")) == "disabled"
+        assert str(gui.controls.device_combo.cget("state")) == "normal"
+
+        gui.device_choice_var.set(other_label)
+        gui._select_catalog_device()
+        independent_inputs = gui._visible_fact_inputs()
+        assert independent_inputs.project == ""
+        assert independent_inputs.target == ""
+        assert independent_inputs.device_name == "GD32F303ZK"
+        gui.firmware_var.set("D:/firmware/device.bin")
+
+        loaded_projects = []
+        monkeypatch.setattr(
+            gui,
+            "_load_project",
+            lambda path, restored=False: loaded_projects.append(path),
+        )
+        gui.device_source_mode_var.set("project")
+        gui._change_device_source()
+        assert gui.target_var.get() == "Dragon_debug"
+        assert gui.firmware_var.get() == "D:/firmware/project.hex"
+        assert gui._visible_fact_inputs().project == "D:/firmware/app.uvprojx"
+        assert loaded_projects == [Path("D:/firmware/app.uvprojx")]
+        saved = gui._current_settings()
+        assert saved.device_source_mode == "project"
+        assert saved.project_firmware == "D:/firmware/project.hex"
+        assert saved.device_firmware == "D:/firmware/device.bin"
+        assert saved.device_name == "GD32F303ZK"
 
         gui.output.append_openocd("alpha\nbeta\n")
         view = gui.output.openocd_view
@@ -317,24 +357,7 @@ def test_gui_applies_theme_and_filters_structured_rtt_records(tmp_path):
 
         assert gui.output._rtt_text.get("1.0", "end-1c") == "I/ready\n"
         assert gui.rtt_visible_counts_var.get() == "1 可见 / 2 缓存"
-    finally:
-        if not gui._destroyed:
-            gui._on_close()
 
-
-def test_gui_removes_visible_record_evicted_from_rtt_cache(tmp_path):
-    import tkinter as tk
-
-    from keiltool.core.rtt import RttEvent
-    from keiltool.core.rtt_log import RttLevel
-    from keiltool.gui.app import KeilToolGui
-    from keiltool.gui.rtt_display import RttDisplayBuffer
-    from keiltool.gui.settings import SettingsStore
-
-    root = tk.Tk()
-    root.withdraw()
-    gui = KeilToolGui(root, settings_store=SettingsStore(tmp_path / "settings.json"))
-    try:
         gui._rtt_display = RttDisplayBuffer(max_records=2)
         gui._clear_rtt_display()
         for text in ("I/one\n", "I/two\n", "I/three\n"):

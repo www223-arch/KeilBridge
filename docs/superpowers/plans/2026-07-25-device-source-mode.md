@@ -26,10 +26,10 @@
 **Interfaces:**
 - Produces: `GuiSettings.device_source_mode`, `project_firmware`, and `device_firmware`.
 
-- [ ] Write tests showing old settings infer a safe source mode and new fields round-trip.
-- [ ] Run `pytest tests/test_gui_settings.py -v` and observe the missing-field failure.
-- [ ] Add backward-compatible parsing and serialization for the three fields.
-- [ ] Run `pytest tests/test_gui_settings.py -v` and verify it passes.
+- [x] Write tests showing old settings infer a safe source mode and new fields round-trip.
+- [x] Run `pytest tests/test_gui_settings.py -v` and observe the missing-field failure.
+- [x] Add backward-compatible parsing and serialization for the three fields.
+- [x] Run `pytest tests/test_gui_settings.py -v` and verify it passes.
 
 ### Task 2: Add Exclusive Mode Transitions
 
@@ -42,13 +42,13 @@
 - Consumes: the new `GuiSettings` fields.
 - Produces: `_change_device_source()` and mode-aware `_visible_fact_inputs()`.
 
-- [ ] Write a GUI test that loads project state, switches to Independent Device, and asserts Target, firmware, and project fact inputs are empty.
-- [ ] Extend the test to select a catalog Device and assert only catalog identifiers enter `FactInputs`.
-- [ ] Extend the test to switch back and assert the project Target and firmware are restored.
-- [ ] Run the focused test and observe failure because the source controls and transition do not exist.
-- [ ] Add the source radio controls and mode state.
-- [ ] Implement transitions, source-specific context memory, fact invalidation, and control states.
-- [ ] Run the focused test and verify it passes.
+- [x] Write a GUI test that loads project state, switches to Independent Device, and asserts Target, firmware, and project fact inputs are empty.
+- [x] Extend the test to select a catalog Device and assert only catalog identifiers enter `FactInputs`.
+- [x] Extend the test to switch back and assert the project Target and firmware are restored.
+- [x] Run the focused test and observe failure because the source controls and transition do not exist.
+- [x] Add the source radio controls and mode state.
+- [x] Implement transitions, source-specific context memory, fact invalidation, and control states.
+- [x] Run the focused test and verify it passes.
 
 ### Task 3: Verify And Launch The Correct Worktree
 
@@ -59,7 +59,7 @@
 - Consumes: the completed GUI branch.
 - Produces: a shortcut whose working directory is the current worktree.
 
-- [ ] Run `pytest -q` and require the complete suite to pass.
-- [ ] Update the shortcut working directory to the current worktree.
-- [ ] Close stale GUI processes, launch through the shortcut command, and inspect its process command line and working code location.
-- [ ] Commit the implementation and tests.
+- [x] Run `pytest -q` and require the complete suite to pass.
+- [x] Update the shortcut working directory to the current worktree.
+- [x] Close stale GUI processes, launch through the shortcut command, and inspect its process command line and working code location.
+- [x] Commit the implementation and tests.

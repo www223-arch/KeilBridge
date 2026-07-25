@@ -112,6 +112,10 @@ def facts_from_catalog_device(
     elif device.openocd_target:
         target_cfg, override_status, reason = _resolve_override(device.openocd_target, scripts)
         status = "catalog_verified" if override_status == "override_verified" else f"catalog_{override_status}"
+        reason = reason.replace(
+            "OpenOCD target override",
+            "Device catalog OpenOCD target mapping",
+        )
     else:
         target_cfg = ""
         status = "catalog_unresolved"

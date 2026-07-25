@@ -263,6 +263,7 @@ def test_catalog_device_resolves_ready_hardware_facts_without_project(tmp_path):
     assert facts.ram_size == 0x10000
     assert facts.target_cfg == "target/stm32f3x.cfg"
     assert facts.resolution_status == "catalog_verified"
+    assert facts.resolution_reason == "Device catalog OpenOCD target mapping was verified."
     assert facts.ready is True
 
 

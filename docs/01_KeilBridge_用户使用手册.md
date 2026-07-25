@@ -197,7 +197,7 @@ python -m keiltool.cli doctor flash --project "C:\Path\To\Project\MDK-ARM\App.uv
 
 - OpenOCD 是否能启动。
 - 探针是否能连接目标芯片。
-- reset/halt 后 PC/MSP 是否像有效启动向量。
+- reset/halt 后 PC/MSP 的原始值及其是否落入工程声明的 Flash/RAM 范围。
 - 常见 OpenOCD、CMSIS-DAP、ST-Link 通信错误。
 
 它不会下载固件。
@@ -268,7 +268,7 @@ python -m keiltool.cli gui
 %APPDATA%\KeilTool\gui-settings.json
 ```
 
-Keil 工程在图形工作台中是可选的。只想连接、烧录现有 HEX/BIN 或采集 RTT 时，可直接在 Device 输入框搜索并选择精确芯片型号；选择 Keil `.uvprojx` 工程和 Target 后，Device 会自动切换为工程里的芯片并锁定。清空工程路径后恢复手动选择。芯片选择、OpenOCD 路径和自定义日志根目录都会在关闭时记住。
+Keil 工程在图形工作台中是可选的。“配置来源”明确区分 `Keil 工程` 和 `独立 Device`，两种来源不会混用。工程模式中的 Device、Target、Flash/RAM 和固件属于当前工程上下文；切到独立 Device 后，工程 Target 和工程固件立即退出活动配置，再从目录选择精确芯片和对应固件。切回工程模式时重新解析并恢复此前的工程 Target。两种模式及各自固件、芯片选择、OpenOCD 路径和自定义日志根目录都会在关闭时记住。
 
 内置设备目录由仓库中的官方 GigaDevice、STMicroelectronics CMSIS-Pack/PDSC 快照生成，记录来源、版本、core、FPU、Flash/RAM 和 flash algorithm。点击 Device 旁的“导入”可添加 `.pdsc`、`.pack` 或自定义 JSON；用户文件保存在 `%APPDATA%\KeilTool\devices\`，同厂商同型号的用户条目优先于内置条目。PACK 只读取其中的 PDSC，不解压到磁盘。损坏或不安全的导入会被拒绝，不影响已有目录。
 
@@ -384,7 +384,7 @@ python -m keiltool.cli doctor flash `
 
 ```text
 OpenOCD 可连接 STM32G431CBUx
-reset/halt 后 PC/MSP 有效
+reset/halt 实测 PC/MSP 均位于工程声明的 Flash/RAM 范围
 arm-none-eabi-gdb 可读取 Keil AXF 符号
 GDB 可对 main 设置硬件断点
 VS Code 可正常打断点

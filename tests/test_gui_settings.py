@@ -22,6 +22,9 @@ def test_settings_round_trip(tmp_path):
         logs_dir="D:/fw/logs",
         device_vendor="GigaDevice",
         device_name="GD32F303CC",
+        device_source_mode="device",
+        project_firmware="D:/fw/project.hex",
+        device_firmware="D:/fw/device.bin",
     )
 
     store.save(settings)
@@ -29,6 +32,32 @@ def test_settings_round_trip(tmp_path):
     assert store.load() == settings
     assert json.loads((tmp_path / "gui-settings.json").read_text(encoding="utf-8"))["version"] == 1
     assert not (tmp_path / "gui-settings.json.tmp").exists()
+
+
+def test_legacy_settings_infer_exclusive_device_source_contexts():
+    project = GuiSettings.from_dict(
+        {
+            "version": 1,
+            "project": "D:/fw/app.uvprojx",
+            "target": "Debug",
+            "firmware": "D:/fw/project.hex",
+        }
+    )
+    standalone = GuiSettings.from_dict(
+        {
+            "version": 1,
+            "firmware": "D:/fw/device.bin",
+            "device_vendor": "GigaDevice",
+            "device_name": "GD32F303CC",
+        }
+    )
+
+    assert project.device_source_mode == "project"
+    assert project.project_firmware == "D:/fw/project.hex"
+    assert project.device_firmware == ""
+    assert standalone.device_source_mode == "device"
+    assert standalone.project_firmware == ""
+    assert standalone.device_firmware == "D:/fw/device.bin"
 
 
 def test_damaged_settings_fall_back_to_defaults(tmp_path):

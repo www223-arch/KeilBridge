@@ -34,6 +34,11 @@ from keiltool.gui.project_config import (
     load_project_targets,
 )
 from keiltool.gui.firmware_freshness import FirmwareChange, FirmwareFingerprint, FirmwareFreshness
+from keiltool.gui.operation_feedback import (
+    OperationFeedback,
+    OperationVisualState,
+    ProgressMode,
+)
 from keiltool.gui.rtt_display import RttDisplayBuffer, build_rtt_view, parse_rtt_level
 from keiltool.gui.settings import (
     GuiSettings,
@@ -43,7 +48,7 @@ from keiltool.gui.settings import (
 )
 from keiltool.gui.state import BusySessionError, SessionState, TaskGate
 from keiltool.gui.theme import configure_theme
-from keiltool.gui.widgets import ConfigurationPane, OutputNotebook
+from keiltool.gui.widgets import ConfigurationPane, OperationStatusPane, OutputNotebook
 from keiltool.gui.workbench_controller import (
     BoundedEventPoller,
     FactInputs,
@@ -112,6 +117,7 @@ class KeilToolGui:
         self.settings_store = settings_store or SettingsStore()
         self.gate = TaskGate()
         self._freshness = FreshnessController()
+        self.operation_feedback = OperationFeedback()
         self._firmware_freshness = {
             _PROJECT_SOURCE: FirmwareFreshness(),
             _DEVICE_SOURCE: FirmwareFreshness(),
@@ -129,6 +135,8 @@ class KeilToolGui:
         self._rtt_started_at: float | None = None
         self._rtt_bytes = 0
         self._rtt_lines = 0
+        self._rtt_error_message = ""
+        self._last_operation_feedback_refresh = 0.0
         self._rtt_display = RttDisplayBuffer(max_records=20_000)
         self._one_shot_cleanup_log: Path | None = None
         self._operation_logs: dict[object, SessionLogContext] = {}
@@ -258,12 +266,18 @@ class KeilToolGui:
 
         right = ttk.Frame(self.root, padding=(0, 6, 10, 4), style="Background.TFrame")
         right.grid(row=0, column=1, sticky="nsew")
-        right.rowconfigure(0, weight=1)
+        right.rowconfigure(1, weight=1)
         right.columnconfigure(0, weight=1)
 
         self.controls = ConfigurationPane(left, self)
         self.controls.grid(row=0, column=0, sticky="nsew")
         self.controls.device_combo.configure(values=tuple(self._device_by_label))
+
+        self.operation_status = OperationStatusPane(right)
+        self.operation_status.grid(row=0, column=0, sticky="ew", pady=(0, 6))
+        self.operation_status.set_copy_command(self._copy_operation_error)
+        self.operation_status.set_open_logs_command(self._open_operation_log_dir)
+        self.operation_status.update(self.operation_feedback)
 
         self.output = OutputNotebook(
             right,
@@ -275,7 +289,7 @@ class KeilToolGui:
             on_clear_rtt=self._clear_rtt_display,
             open_logs_dir=self._open_logs_dir,
         )
-        self.output.grid(row=0, column=0, sticky="nsew")
+        self.output.grid(row=1, column=0, sticky="nsew")
 
         status = ttk.Frame(self.root, padding=(10, 2, 10, 3), style="Status.TFrame")
         status.grid(row=1, column=0, columnspan=2, sticky="ew")
@@ -457,6 +471,7 @@ class KeilToolGui:
         )
         if not path:
             return
+        self._begin_feedback("导入设备定义", "解析设备文件")
         try:
             result = import_device_file(path, default_devices_path())
             self._reload_device_catalog()
@@ -477,8 +492,12 @@ class KeilToolGui:
             self._append_openocd(
                 f"[设备目录] 已导入 {len(result.devices)} 个型号: {result.output_path}\n"
             )
+            self._complete_feedback(
+                f"已导入 {len(result.devices)} 个设备型号",
+                artifact=result.output_path,
+            )
         except Exception as exc:
-            messagebox.showerror("设备导入失败", str(exc), parent=self.root)
+            self._fail_feedback("设备导入失败", str(exc))
 
     def _visible_fact_inputs(self) -> FactInputs:
         project_mode = self.device_source_mode_var.get() == _PROJECT_SOURCE
@@ -699,6 +718,7 @@ class KeilToolGui:
             self.device_source_mode_var.set(_PROJECT_SOURCE)
             self.target_var.set(self._project_target)
             self.firmware_var.set(self._project_firmware)
+        self._begin_feedback("读取 Keil 工程", "解析工程 Target")
         try:
             loaded = load_project_targets(path)
         except Exception as exc:
@@ -706,8 +726,7 @@ class KeilToolGui:
             self.controls.target_combo.configure(values=())
             self._clear_facts(f"工程读取失败: {exc}")
             self._append_openocd(f"[工程] {path}\n读取失败: {exc}\n\n")
-            if not restored:
-                messagebox.showerror("工程读取失败", str(exc), parent=self.root)
+            self._fail_feedback("工程读取失败", str(exc))
             self._refresh_controls()
             return
 
@@ -719,9 +738,14 @@ class KeilToolGui:
         if not names:
             self._facts = None
             self._clear_facts("工程中没有可用 Target")
+            self._fail_feedback("工程中没有可用 Target", str(path))
             self._refresh_controls()
             return
         self._resolve_selected_target()
+        if self._facts is None:
+            self._fail_feedback("工程 Target 解析失败", self.resolution_var.get())
+        else:
+            self._complete_feedback(f"已载入 Target: {self.target_var.get()}")
 
     def _resolve_selected_target(self) -> None:
         if self._hardware_busy():
@@ -796,6 +820,10 @@ class KeilToolGui:
         return Path(value).expanduser()
 
     def _check_connection(self) -> None:
+        if self._hardware_busy():
+            self._show_busy()
+            return
+        self._begin_feedback("检查连接", "准备 OpenOCD 配置")
         try:
             snapshot = self._obtain_fresh_snapshot()
             config = self._build_openocd_config(snapshot)
@@ -812,7 +840,7 @@ class KeilToolGui:
                     "interface_cfg": config.interface_cfg,
                 },
             )
-            operation = OpenOcdOperation(timeout=30.0)
+            operation = OpenOcdOperation(timeout=30.0, background=True)
             try:
                 self._begin_one_shot(SessionState.CONNECT, operation)
             except Exception:
@@ -823,8 +851,10 @@ class KeilToolGui:
             self._show_busy()
             return
         except Exception as exc:
-            messagebox.showerror("无法检查连接", str(exc), parent=self.root)
+            self._fail_feedback("无法检查连接", str(exc))
             return
+        self.operation_feedback.log_dir = log_context.directory
+        self._set_feedback_stage("OpenOCD 执行中", ProgressMode.INDETERMINATE)
         self._set_status()
         self._refresh_controls()
         self._start_worker(
@@ -842,6 +872,10 @@ class KeilToolGui:
         )
 
     def _read_flash(self) -> None:
+        if self._hardware_busy():
+            self._show_busy()
+            return
+        self._begin_feedback("读取完整 Flash", "准备读取参数")
         try:
             snapshot = self._obtain_fresh_snapshot()
             config = self._build_openocd_config(snapshot)
@@ -864,6 +898,8 @@ class KeilToolGui:
                 filetypes=[("BIN 镜像", "*.bin"), ("所有文件", "*.*")],
             )
             if not output:
+                self.operation_feedback.reset()
+                self._refresh_operation_feedback()
                 return
             request = build_flash_read_request(facts, output)
             target = snapshot.target
@@ -880,7 +916,7 @@ class KeilToolGui:
                     "size": request.size,
                 },
             )
-            operation = OpenOcdOperation(timeout=300.0)
+            operation = OpenOcdOperation(timeout=300.0, background=True)
             try:
                 self._begin_one_shot(SessionState.FLASH_READ, operation)
             except Exception:
@@ -891,9 +927,11 @@ class KeilToolGui:
             self._show_busy()
             return
         except Exception as exc:
-            messagebox.showerror("无法读取 Flash", str(exc), parent=self.root)
+            self._fail_feedback("无法读取 Flash", str(exc))
             return
 
+        self.operation_feedback.log_dir = log_context.directory
+        self._set_feedback_stage("OpenOCD 执行中", ProgressMode.INDETERMINATE)
         self._set_status()
         self._refresh_controls()
         self._start_worker(
@@ -912,16 +950,20 @@ class KeilToolGui:
         )
 
     def _flash(self) -> None:
+        if self._hardware_busy():
+            self._show_busy()
+            return
         try:
             if not self._check_firmware_external_change():
                 return
+            self._begin_feedback("烧录并校验", "准备固件与目标配置")
             snapshot = self._obtain_fresh_snapshot()
             config = self._build_openocd_config(snapshot)
             request = build_flash_request(self.firmware_var.get().strip(), self.bin_address_var.get().strip())
             log_dir = self._log_dir()
             target = snapshot.target
         except Exception as exc:
-            messagebox.showerror("无法烧录", str(exc), parent=self.root)
+            self._fail_feedback("无法烧录", str(exc))
             return
 
         facts = cast(ProjectTargetFacts, snapshot.facts)
@@ -944,6 +986,8 @@ class KeilToolGui:
             parent=self.root,
         )
         if not confirmed:
+            self.operation_feedback.reset()
+            self._refresh_operation_feedback()
             return
         try:
             log_context = create_session_logs(
@@ -958,7 +1002,7 @@ class KeilToolGui:
                     "base_address": request.base_address,
                 },
             )
-            operation = OpenOcdOperation(timeout=300.0)
+            operation = OpenOcdOperation(timeout=300.0, background=True)
             try:
                 self._begin_one_shot(SessionState.FLASH, operation)
             except Exception:
@@ -969,8 +1013,10 @@ class KeilToolGui:
             self._show_busy()
             return
         except Exception as exc:
-            messagebox.showerror("无法创建烧录日志", str(exc), parent=self.root)
+            self._fail_feedback("无法创建烧录日志", str(exc))
             return
+        self.operation_feedback.log_dir = log_context.directory
+        self._set_feedback_stage("OpenOCD 执行中", ProgressMode.INDETERMINATE)
         self._set_status()
         self._refresh_controls()
         self._start_worker(
@@ -989,6 +1035,10 @@ class KeilToolGui:
         )
 
     def _start_rtt(self) -> None:
+        if self._hardware_busy():
+            self._show_busy()
+            return
+        self._begin_feedback("RTT 日志采集", "准备 RTT 配置")
         try:
             snapshot = self._obtain_fresh_snapshot()
             config = self._build_openocd_config(snapshot)
@@ -1029,6 +1079,7 @@ class KeilToolGui:
                 request,
                 log_paths.channel,
                 connect_timeout=timeout_ms / 1000.0,
+                background=True,
             )
             self.gate.begin(SessionState.RTT_SCAN)
             try:
@@ -1041,7 +1092,7 @@ class KeilToolGui:
             self._show_busy()
             return
         except Exception as exc:
-            messagebox.showerror("无法启动 RTT", str(exc), parent=self.root)
+            self._fail_feedback("无法启动 RTT", str(exc))
             return
 
         self._rtt_session = session
@@ -1050,6 +1101,9 @@ class KeilToolGui:
         self._rtt_started_at = None
         self._rtt_bytes = 0
         self._rtt_lines = 0
+        self._rtt_error_message = ""
+        self.operation_feedback.log_dir = log_context.directory
+        self._set_feedback_stage("扫描 RTT 控制块", ProgressMode.INDETERMINATE)
         self.elapsed_var.set("00:00:00")
         self.counts_var.set("0 字节 / 0 行")
         self._append_openocd(
@@ -1068,6 +1122,8 @@ class KeilToolGui:
         if session is None:
             return
         action = self._rtt_lifecycle.request_stop()
+        self.operation_feedback.stopping("正在停止 RTT 并清理 OpenOCD")
+        self._refresh_operation_feedback()
         if action is LifecycleAction.STOP_SESSION:
             self._dispatch_rtt_stop(session)
         elif self._rtt_lifecycle.phase is RttPhase.STOP_PENDING:
@@ -1122,6 +1178,16 @@ class KeilToolGui:
             else:
                 self._handle_rtt_event(cast(RttEvent, item.event))
         self._update_elapsed()
+        feedback = getattr(self, "operation_feedback", None)
+        now = time.monotonic()
+        refresh_due = now - getattr(self, "_last_operation_feedback_refresh", 0.0) >= 0.1
+        if (
+            feedback is not None
+            and feedback.state in {OperationVisualState.RUNNING, OperationVisualState.STOPPING}
+            and refresh_due
+        ):
+            self._refresh_operation_feedback()
+            self._last_operation_feedback_refresh = now
         if not self._destroyed:
             self.root.after(0 if batch.backlog else 50, self._poll_events)
 
@@ -1172,6 +1238,8 @@ class KeilToolGui:
         if not self._one_shot_lifecycle.begin_cleanup(operation):
             return
         self.status_var.set("正在重试清理 OpenOCD 进程")
+        self.operation_feedback.stopping("正在清理 OpenOCD 进程")
+        self._refresh_operation_feedback()
         self._refresh_controls()
         self._start_worker(
             "one-shot-cleanup-settled",
@@ -1202,14 +1270,19 @@ class KeilToolGui:
             self._finalize_operation_log(operation, "incomplete_cleaned")
             self._one_shot_cleanup_log = None
             self.status_var.set("OpenOCD 进程已确认退出")
+            self._fail_feedback(
+                self.operation_feedback.summary or "操作未完成，但 OpenOCD 进程已退出",
+                self.operation_feedback.detail,
+                log_dir=self.operation_feedback.log_dir,
+                returncode=self.operation_feedback.returncode,
+            )
         else:
             self.status_var.set("OpenOCD 清理仍不完整；再次关闭窗口可重试")
-            if not self._closing:
-                messagebox.showerror(
-                    "OpenOCD 清理不完整",
-                    "OpenOCD 进程尚未确认退出。硬件操作和窗口关闭已阻止；关闭窗口可再次重试清理。",
-                    parent=self.root,
-                )
+            self.operation_feedback.incomplete(
+                "OpenOCD 进程尚未确认退出",
+                "硬件操作和窗口关闭已阻止；关闭窗口可再次重试清理。",
+            )
+            self._refresh_operation_feedback()
         self._refresh_controls()
         self._finish_close_if_ready()
 
@@ -1217,17 +1290,24 @@ class KeilToolGui:
         if not isinstance(value, ConnectionResult):
             self._handle_worker_error("connection-result", RuntimeError("连接检查返回了无效结果。"), None)
             return
+        self._set_feedback_stage("分析连接结果", ProgressMode.DETERMINATE, 90)
         self._render_openocd_result("连接检查", value)
         if value.success:
             self.gate.finish()
             self.status_var.set("连接检查成功")
-            if not self._closing:
-                messagebox.showinfo("连接检查", "已确认 ST-Link 和目标内核连接。", parent=self.root)
+            self._complete_feedback(
+                "已确认 ST-Link 与目标内核连接",
+                log_dir=value.stdout_log.parent,
+            )
         else:
             self.gate.fail()
             self.status_var.set("连接检查失败")
-            if not self._closing:
-                messagebox.showerror("连接检查失败", self._result_error_summary(value), parent=self.root)
+            self._fail_feedback(
+                "连接检查失败",
+                self._result_error_summary(value),
+                log_dir=value.stdout_log.parent,
+                returncode=value.returncode,
+            )
         self._refresh_controls()
         self._finish_close_if_ready()
 
@@ -1235,17 +1315,24 @@ class KeilToolGui:
         if not isinstance(value, FlashResult):
             self._handle_worker_error("flash-result", RuntimeError("烧录返回了无效结果。"), None)
             return
+        self._set_feedback_stage("分析烧录与校验结果", ProgressMode.DETERMINATE, 90)
         self._render_openocd_result("烧录并校验", value)
         if value.success:
             self.gate.finish()
             self.status_var.set("烧录并校验成功")
-            if not self._closing:
-                messagebox.showinfo("烧录完成", "固件烧录和校验均已成功。", parent=self.root)
+            self._complete_feedback(
+                "固件写入与校验均已通过",
+                log_dir=value.stdout_log.parent,
+            )
         else:
             self.gate.fail()
             self.status_var.set("烧录或校验失败")
-            if not self._closing:
-                messagebox.showerror("烧录失败", self._result_error_summary(value), parent=self.root)
+            self._fail_feedback(
+                "烧录或校验失败",
+                self._result_error_summary(value),
+                log_dir=value.stdout_log.parent,
+                returncode=value.returncode,
+            )
         self._refresh_controls()
         self._finish_close_if_ready()
 
@@ -1257,6 +1344,7 @@ class KeilToolGui:
                 None,
             )
             return
+        self._set_feedback_stage("校验镜像大小与摘要", ProgressMode.DETERMINATE, 90)
         self._render_openocd_result("读取完整 Flash", value)
         self._append_openocd(
             "----- Flash 镜像 -----\n"
@@ -1269,26 +1357,20 @@ class KeilToolGui:
         if value.success:
             self.gate.finish()
             self.status_var.set("完整 Flash 读取成功")
-            if not self._closing:
-                messagebox.showinfo(
-                    "Flash 读取完成",
-                    (
-                        f"已读取 {value.actual_size:,} 字节。\n"
-                        f"地址: 0x{value.address:08X}\n"
-                        f"文件: {value.output}\n"
-                        f"SHA-256: {value.sha256}"
-                    ),
-                    parent=self.root,
-                )
+            self._complete_feedback(
+                f"已读取并校验 {value.actual_size:,} 字节，SHA-256: {value.sha256}",
+                artifact=value.output,
+                log_dir=value.stdout_log.parent,
+            )
         else:
             self.gate.fail()
             self.status_var.set("Flash 读取失败")
-            if not self._closing:
-                messagebox.showerror(
-                    "Flash 读取失败",
-                    self._result_error_summary(value),
-                    parent=self.root,
-                )
+            self._fail_feedback(
+                "完整 Flash 读取失败",
+                self._result_error_summary(value),
+                log_dir=value.stdout_log.parent,
+                returncode=value.returncode,
+            )
         self._refresh_controls()
         self._finish_close_if_ready()
 
@@ -1307,6 +1389,7 @@ class KeilToolGui:
                 self._finalize_operation_log(owner, "worker_error")
             self.gate.fail()
         elif str(operation).startswith("rtt") and owner is not None:
+            self._rtt_error_message = message
             operation_name = "start" if operation == "rtt-start-settled" else "stop"
             action = self._rtt_lifecycle.worker_failed(owner, operation_name)
             if action is LifecycleAction.STOP_SESSION:
@@ -1314,9 +1397,9 @@ class KeilToolGui:
         else:
             self.gate.fail()
         self.status_var.set(f"失败: {message}")
+        log_dir = self.operation_feedback.log_dir
+        self._fail_feedback("后台任务失败", message, log_dir=log_dir)
         self._refresh_controls()
-        if not self._closing:
-            messagebox.showerror("任务失败", message, parent=self.root)
         if retry_operation is not None:
             self._dispatch_one_shot_cleanup(retry_operation)
         self._finish_close_if_ready()
@@ -1341,17 +1424,29 @@ class KeilToolGui:
             self._rtt_bytes += len(event.text.encode("utf-8", errors="replace"))
             self._rtt_lines += event.text.count("\n")
             self.counts_var.set(f"{self._rtt_bytes:,} 字节 / {self._rtt_lines:,} 行")
+            if (
+                self.operation_feedback.task == "RTT 日志采集"
+                and self.operation_feedback.state is OperationVisualState.RUNNING
+            ):
+                self.operation_feedback.summary = self.counts_var.get()
         elif event.kind == "connected":
             if self.gate.state is SessionState.RTT_SCAN:
                 self.gate.finish()
                 self.gate.begin(SessionState.RTT)
             self._rtt_started_at = time.monotonic()
             self.status_var.set("RTT 采集中")
+            self._set_feedback_stage("正在采集 RTT 日志", ProgressMode.INDETERMINATE)
             self._append_openocd(f"{event.message}\n")
             self._refresh_controls()
         elif event.kind in {"error", "eof"}:
             self._append_openocd(f"[RTT] {event.message}\n")
             self.status_var.set(f"RTT 异常: {event.message}")
+            self._rtt_error_message = event.message
+            self._fail_feedback(
+                "RTT 采集异常",
+                event.message,
+                log_dir=self.operation_feedback.log_dir,
+            )
             self.root.after_idle(self._stop_rtt)
         elif event.kind == "stopped":
             session = self._rtt_session
@@ -1363,18 +1458,35 @@ class KeilToolGui:
                 if self.gate.state in {SessionState.RTT_SCAN, SessionState.RTT}:
                     self.gate.begin_stopping()
                 self.status_var.set("RTT 清理不完整，请点击“停止采集”重试")
-                messagebox.showerror(
+                self.operation_feedback.incomplete(
                     "RTT 清理不完整",
-                    "OpenOCD 或 RTT 工作线程尚未完全退出。硬件操作和关闭已阻止，请点击“停止采集”重试清理。",
-                    parent=self.root,
+                    "OpenOCD 或 RTT 工作线程尚未完全退出；请点击“停止采集”重试清理。",
                 )
+                self._refresh_operation_feedback()
             elif action is LifecycleAction.RELEASE_SESSION:
                 if event.outcome == "startup_failed":
                     self.gate.fail()
                     self.status_var.set("RTT 启动失败")
+                    self._fail_feedback(
+                        "RTT 启动失败",
+                        self._rtt_error_message or event.message,
+                        log_dir=self.operation_feedback.log_dir,
+                    )
+                elif self._rtt_error_message:
+                    self.gate.fail()
+                    self.status_var.set("RTT 因异常停止")
+                    self._fail_feedback(
+                        "RTT 采集异常并已停止",
+                        self._rtt_error_message,
+                        log_dir=self.operation_feedback.log_dir,
+                    )
                 else:
                     self.gate.finish()
                     self.status_var.set("RTT 已停止")
+                    self._complete_feedback(
+                        f"RTT 已停止，共采集 {self._rtt_bytes:,} 字节 / {self._rtt_lines:,} 行",
+                        log_dir=self.operation_feedback.log_dir,
+                    )
                 if self._rtt_log_context is not None:
                     try:
                         self._rtt_log_context.finalize(event.outcome)
@@ -1547,11 +1659,7 @@ class KeilToolGui:
         self.status_var.set(_STATE_TEXT[self.gate.state])
 
     def _show_busy(self) -> None:
-        messagebox.showwarning(
-            "ST-Link 正忙",
-            f"当前任务: {_STATE_TEXT[self.gate.state]}。请等待当前任务结束。",
-            parent=self.root,
-        )
+        self.status_var.set(f"当前任务仍在执行: {_STATE_TEXT[self.gate.state]}")
 
     def _update_elapsed(self) -> None:
         if self._rtt_started_at is None:
@@ -1563,6 +1671,73 @@ class KeilToolGui:
 
     def _append_openocd(self, text: str) -> None:
         self.output.append_openocd(text)
+
+    def _refresh_operation_feedback(self) -> None:
+        self.operation_status.update(self.operation_feedback)
+
+    def _begin_feedback(self, task: str, stage: str) -> None:
+        self.operation_feedback.begin(task, stage)
+        self._refresh_operation_feedback()
+
+    def _set_feedback_stage(
+        self,
+        stage: str,
+        mode: ProgressMode,
+        value: int | None = None,
+    ) -> None:
+        self.operation_feedback.set_stage(stage, mode, value)
+        self._refresh_operation_feedback()
+
+    def _complete_feedback(
+        self,
+        summary: str,
+        *,
+        artifact: Path | None = None,
+        log_dir: Path | None = None,
+    ) -> None:
+        self.operation_feedback.succeed(
+            summary,
+            artifact=artifact,
+            log_dir=log_dir or self.operation_feedback.log_dir,
+        )
+        self._refresh_operation_feedback()
+
+    def _fail_feedback(
+        self,
+        summary: str,
+        detail: str = "",
+        *,
+        log_dir: Path | None = None,
+        returncode: int | None = None,
+    ) -> None:
+        self.operation_feedback.fail(
+            summary,
+            detail=detail,
+            log_dir=log_dir or self.operation_feedback.log_dir,
+            returncode=returncode,
+        )
+        self.output.select_openocd()
+        self._refresh_operation_feedback()
+
+    def _copy_operation_error(self) -> None:
+        text = self.operation_feedback.copyable_error
+        if not text:
+            return
+        self.root.clipboard_clear()
+        self.root.clipboard_append(text)
+        self.status_var.set("错误详情已复制")
+
+    def _open_operation_log_dir(self) -> None:
+        path = self.operation_feedback.log_dir
+        if path is None:
+            return
+        try:
+            path.mkdir(parents=True, exist_ok=True)
+            if os.name != "nt" or not hasattr(os, "startfile"):
+                raise OSError("当前平台不支持通过资源管理器打开目录。")
+            os.startfile(path)  # type: ignore[attr-defined]
+        except OSError as exc:
+            self.status_var.set(f"无法打开任务日志目录: {exc}")
 
     def _render_settings_diagnostic(self, diagnostic: SettingsDiagnostic) -> None:
         self._append_openocd(
@@ -1577,7 +1752,7 @@ class KeilToolGui:
                 raise OSError("当前平台不支持通过资源管理器打开目录。")
             os.startfile(path)  # type: ignore[attr-defined]
         except OSError as exc:
-            messagebox.showerror("无法打开日志目录", str(exc), parent=self.root)
+            self._fail_feedback("无法打开日志目录", str(exc))
 
     def _on_close(self) -> None:
         if self._closing:

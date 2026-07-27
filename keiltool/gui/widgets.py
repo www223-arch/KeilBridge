@@ -5,6 +5,11 @@ from tkinter import ttk
 from typing import Callable, Protocol
 
 from keiltool.core.rtt_log import RttLogRecord
+from keiltool.gui.operation_feedback import (
+    OperationFeedback,
+    OperationVisualState,
+    ProgressMode,
+)
 from keiltool.gui.rtt_display import RTT_LEVEL_NAMES
 from keiltool.gui.theme import configure_log_text
 
@@ -54,6 +59,101 @@ class WorkbenchVariables(Protocol):
     target_override_var: tk.StringVar
     rtt_port_var: tk.StringVar
     rtt_timeout_var: tk.StringVar
+
+
+class OperationStatusPane(ttk.Frame):
+    _STATE_PRESENTATION = {
+        OperationVisualState.IDLE: ("空闲", "Idle"),
+        OperationVisualState.RUNNING: ("执行中", "Running"),
+        OperationVisualState.SUCCEEDED: ("完成", "Succeeded"),
+        OperationVisualState.FAILED: ("失败", "Failed"),
+        OperationVisualState.STOPPING: ("停止中", "Stopping"),
+        OperationVisualState.INCOMPLETE: ("清理不完整", "Incomplete"),
+    }
+
+    def __init__(self, parent: tk.Misc) -> None:
+        super().__init__(parent, height=112, padding=(10, 7), style="Operation.TFrame")
+        self.grid_propagate(False)
+        self.columnconfigure(1, weight=1)
+        self.task_var = tk.StringVar(value="当前任务")
+        self.state_var = tk.StringVar(value="空闲")
+        self.stage_var = tk.StringVar(value="等待操作")
+        self.elapsed_var = tk.StringVar(value="00:00:00")
+        self.summary_var = tk.StringVar(value="")
+        self._active_progress: tuple[ProgressMode, str] | None = None
+
+        ttk.Label(self, textvariable=self.task_var, style="OperationTitle.TLabel").grid(
+            row=0, column=0, sticky="w"
+        )
+        self.state_label = ttk.Label(
+            self,
+            textvariable=self.state_var,
+            style="OperationIdle.TLabel",
+        )
+        self.state_label.grid(row=0, column=1, sticky="w", padx=(10, 0))
+        ttk.Label(self, textvariable=self.elapsed_var, style="Operation.TLabel").grid(
+            row=0, column=2, sticky="e"
+        )
+        ttk.Label(self, textvariable=self.stage_var, style="Operation.TLabel").grid(
+            row=1, column=0, columnspan=3, sticky="w", pady=(5, 2)
+        )
+        self.progress = ttk.Progressbar(
+            self,
+            orient="horizontal",
+            mode="determinate",
+            maximum=100,
+            style="OperationIdle.Horizontal.TProgressbar",
+        )
+        self.progress.grid(row=2, column=0, columnspan=3, sticky="ew")
+        footer = ttk.Frame(self, style="Operation.TFrame")
+        footer.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(5, 0))
+        footer.columnconfigure(0, weight=1)
+        ttk.Label(
+            footer,
+            textvariable=self.summary_var,
+            width=1,
+            style="Operation.TLabel",
+        ).grid(row=0, column=0, sticky="ew")
+        self.copy_button = ttk.Button(footer, text="复制错误", state="disabled")
+        self.copy_button.grid(row=0, column=1, padx=(6, 0))
+        self.logs_button = ttk.Button(footer, text="打开日志", state="disabled")
+        self.logs_button.grid(row=0, column=2, padx=(6, 0))
+
+    def set_copy_command(self, callback: Callable[[], None]) -> None:
+        self.copy_button.configure(command=callback)
+
+    def set_open_logs_command(self, callback: Callable[[], None]) -> None:
+        self.logs_button.configure(command=callback)
+
+    def update(self, feedback: OperationFeedback, *, now: float | None = None) -> None:
+        state_text, style_name = self._STATE_PRESENTATION[feedback.state]
+        self.task_var.set(feedback.task)
+        self.state_var.set(state_text)
+        self.stage_var.set(feedback.stage)
+        self.elapsed_var.set(_format_elapsed(feedback.elapsed(now)))
+        self.summary_var.set(feedback.summary)
+        self.state_label.configure(style=f"Operation{style_name}.TLabel")
+        self.progress.configure(style=f"Operation{style_name}.Horizontal.TProgressbar")
+        active = (feedback.progress_mode, style_name)
+        if active != self._active_progress:
+            self.progress.stop()
+            if feedback.progress_mode is ProgressMode.INDETERMINATE:
+                self.progress.configure(mode="indeterminate")
+                self.progress.start(12)
+            else:
+                self.progress.configure(mode="determinate")
+            self._active_progress = active
+        if feedback.progress_mode is not ProgressMode.INDETERMINATE:
+            self.progress.configure(value=feedback.progress_value)
+        self.copy_button.configure(state="normal" if feedback.copyable_error else "disabled")
+        self.logs_button.configure(state="normal" if feedback.log_dir else "disabled")
+
+
+def _format_elapsed(seconds: float) -> str:
+    total = max(0, int(seconds))
+    hours, remainder = divmod(total, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
 
 
 class ConfigurationPane(ttk.Frame):
@@ -297,12 +397,13 @@ class OutputNotebook(ttk.Frame):
         self.rowconfigure(0, weight=1)
         self.columnconfigure(0, weight=1)
 
-        notebook = ttk.Notebook(self, style="Console.TNotebook")
-        notebook.grid(row=0, column=0, sticky="nsew")
-        rtt_tab = ttk.Frame(notebook, padding=8, style="Console.TFrame")
-        openocd_tab = ttk.Frame(notebook, padding=8, style="Console.TFrame")
-        notebook.add(rtt_tab, text="RTT 日志")
-        notebook.add(openocd_tab, text="OpenOCD 输出")
+        self.notebook = ttk.Notebook(self, style="Console.TNotebook")
+        self.notebook.grid(row=0, column=0, sticky="nsew")
+        rtt_tab = ttk.Frame(self.notebook, padding=8, style="Console.TFrame")
+        openocd_tab = ttk.Frame(self.notebook, padding=8, style="Console.TFrame")
+        self.notebook.add(rtt_tab, text="RTT 日志")
+        self.notebook.add(openocd_tab, text="OpenOCD 输出")
+        self._openocd_tab = openocd_tab
 
         rtt_tab.columnconfigure(0, weight=1)
         rtt_tab.rowconfigure(2, weight=1)
@@ -369,6 +470,9 @@ class OutputNotebook(ttk.Frame):
         )
         self.openocd_view = LogTextView(openocd_tab, row=1)
         self._openocd_text = self.openocd_view.text
+
+    def select_openocd(self) -> None:
+        self.notebook.select(self._openocd_tab)
 
     def append_rtt(self, text: str) -> None:
         _append_text(self._rtt_text, text)

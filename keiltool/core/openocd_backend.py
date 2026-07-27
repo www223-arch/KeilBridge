@@ -10,6 +10,7 @@ import time
 from typing import Protocol
 
 from .doctor import DoctorFinding, classify_openocd_log
+from .process_launch import background_process_kwargs
 from .project_model import KeilTargetModel
 
 
@@ -145,6 +146,7 @@ class OpenOcdOperation:
         poll_interval: float = 0.05,
         popen_factory=subprocess.Popen,
         monotonic=time.monotonic,
+        background: bool = False,
     ) -> None:
         if timeout <= 0:
             raise ValueError("OpenOCD operation timeout must be positive.")
@@ -158,6 +160,7 @@ class OpenOcdOperation:
         self._poll_interval = poll_interval
         self._popen_factory = popen_factory
         self._monotonic = monotonic
+        self._background = background
         self._cancelled = threading.Event()
         self._lock = threading.Lock()
         self._cleanup_lock = threading.Lock()
@@ -208,6 +211,7 @@ class OpenOcdOperation:
                 text=True,
                 encoding="utf-8",
                 errors="replace",
+                **(background_process_kwargs() if self._background else {}),
             )
         except OSError as exc:
             return _ExecutionResult(

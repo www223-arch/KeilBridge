@@ -288,9 +288,11 @@ def test_high_rate_rtt_poll_yields_to_unrelated_tk_callback():
 def test_gui_applies_theme_and_filters_structured_rtt_records(tmp_path, monkeypatch):
     import tkinter as tk
 
+    from keiltool.core.openocd_backend import ConnectionResult
     from keiltool.core.rtt import RttEvent
     from keiltool.core.rtt_log import RttLevel
     from keiltool.gui.app import KeilToolGui
+    from keiltool.gui.operation_feedback import OperationFeedback, ProgressMode
     from keiltool.gui.rtt_display import RttDisplayBuffer
     from keiltool.gui.settings import SettingsStore
     from keiltool.gui.state import SessionState
@@ -310,6 +312,74 @@ def test_gui_applies_theme_and_filters_structured_rtt_records(tmp_path, monkeypa
             "ASSERT",
         )
         assert root.cget("background") == PALETTE["background"]
+        assert gui.operation_status.winfo_reqheight() >= 96
+        feedback = OperationFeedback()
+        feedback.begin("检查连接", "OpenOCD 执行中", started_at=10.0)
+        feedback.set_stage("OpenOCD 执行中", ProgressMode.INDETERMINATE)
+        gui.operation_status.update(feedback, now=12.0)
+        assert gui.operation_status.state_var.get() == "执行中"
+        assert gui.operation_status.stage_var.get() == "OpenOCD 执行中"
+        assert gui.operation_status.elapsed_var.get() == "00:00:02"
+        assert str(gui.operation_status.progress.cget("mode")) == "indeterminate"
+
+        feedback.fail("无法连接目标", detail="init mode failed", returncode=1, finished_at=13.0)
+        gui.operation_status.update(feedback, now=20.0)
+        assert gui.operation_status.state_var.get() == "失败"
+        assert gui.operation_status.summary_var.get() == "无法连接目标"
+        assert str(gui.operation_status.copy_button.cget("state")) == "normal"
+
+        gui.output.select_openocd()
+        assert gui.output.notebook.index("current") == 1
+
+        info_dialogs = []
+        error_dialogs = []
+        monkeypatch.setattr(
+            "keiltool.gui.app.messagebox.showinfo",
+            lambda *args, **kwargs: info_dialogs.append((args, kwargs)),
+        )
+        monkeypatch.setattr(
+            "keiltool.gui.app.messagebox.showerror",
+            lambda *args, **kwargs: error_dialogs.append((args, kwargs)),
+        )
+        gui._begin_feedback("检查连接", "准备配置")
+        gui.gate.begin(SessionState.CONNECT)
+        gui._finish_connection(
+            ConnectionResult(
+                success=True,
+                returncode=0,
+                command=["openocd"],
+                stdout="connected\n",
+                stderr="",
+                stdout_log=tmp_path / "connect.out.log",
+                stderr_log=tmp_path / "connect.err.log",
+                findings=[],
+                outcome="succeeded",
+            )
+        )
+        assert gui.operation_feedback.state.value == "succeeded"
+        assert gui.operation_feedback.progress_value == 100
+        assert info_dialogs == []
+
+        gui.output.notebook.select(0)
+        gui._begin_feedback("检查连接", "准备配置")
+        gui.gate.begin(SessionState.CONNECT)
+        gui._finish_connection(
+            ConnectionResult(
+                success=False,
+                returncode=1,
+                command=["openocd"],
+                stdout="",
+                stderr="init mode failed\n",
+                stdout_log=tmp_path / "connect-fail.out.log",
+                stderr_log=tmp_path / "connect-fail.err.log",
+                findings=[],
+                outcome="failed",
+            )
+        )
+        assert gui.operation_feedback.state.value == "failed"
+        assert gui.operation_feedback.returncode == 1
+        assert gui.output.notebook.index("current") == 1
+        assert error_dialogs == []
         assert gui.controls.flash_read_button.cget("text") == "读取完整 Flash"
         assert gui.output._rtt_text.tag_cget("ERROR", "foreground") == PALETTE["error"]
         label = next(
@@ -384,6 +454,7 @@ def test_gui_applies_theme_and_filters_structured_rtt_records(tmp_path, monkeypa
         assert saved.device_firmware == "D:/firmware/device.bin"
         assert saved.device_name == "GD32F303ZK"
 
+        gui.output.clear_openocd()
         gui.output.append_openocd("alpha\nbeta\n")
         view = gui.output.openocd_view
         view.text.tag_add("sel", "1.0", "1.5")
@@ -412,6 +483,64 @@ def test_gui_applies_theme_and_filters_structured_rtt_records(tmp_path, monkeypa
 
         assert gui.output._rtt_text.get("1.0", "end-1c") == "I/two\nI/three\n"
         assert gui.rtt_visible_counts_var.get() == "2 可见 / 2 缓存"
+
+        gui._begin_feedback("RTT 日志采集", "扫描 RTT 控制块")
+        gui.gate.begin(SessionState.RTT_SCAN)
+        gui._handle_rtt_event(RttEvent("connected", message="RTT connected"))
+        assert gui.operation_feedback.state.value == "running"
+        assert gui.operation_feedback.stage == "正在采集 RTT 日志"
+        gui._handle_rtt_event(RttEvent("data", text="I/live\n", level=RttLevel.INFO, terminal=0))
+        assert "字节" in gui.operation_feedback.summary
+        assert "行" in gui.operation_feedback.summary
+        gui.gate.finish()
+
+        stopped_sessions = []
+        session = SimpleNamespace()
+        gui._rtt_session = session
+        gui._rtt_lifecycle.begin_start(session)
+        gui._rtt_lifecycle.start_settled(session)
+        gui.gate.begin(SessionState.RTT)
+        gui._begin_feedback("RTT 日志采集", "正在采集 RTT 日志")
+        gui._rtt_bytes = 128
+        gui._rtt_lines = 4
+        monkeypatch.setattr(gui, "_dispatch_rtt_stop", stopped_sessions.append)
+        gui._stop_rtt()
+        assert stopped_sessions == [session]
+        assert gui.operation_feedback.state.value == "stopping"
+        gui._handle_rtt_event(RttEvent("stopped", message="clean", outcome="clean"))
+        assert gui.operation_feedback.state.value == "succeeded"
+        assert "128 字节 / 4 行" in gui.operation_feedback.summary
+
+        incomplete_session = SimpleNamespace()
+        gui._rtt_session = incomplete_session
+        gui._rtt_lifecycle.begin_start(incomplete_session)
+        gui._rtt_lifecycle.start_settled(incomplete_session)
+        gui.gate.begin(SessionState.RTT)
+        gui._begin_feedback("RTT 日志采集", "正在采集 RTT 日志")
+        gui._handle_rtt_event(
+            RttEvent("stopped", message="cleanup incomplete", outcome="incomplete")
+        )
+        assert gui.operation_feedback.state.value == "incomplete"
+        assert error_dialogs == []
+        gui._handle_rtt_event(RttEvent("stopped", message="clean", outcome="clean"))
+
+        failed_session = SimpleNamespace()
+        gui._rtt_session = failed_session
+        gui._rtt_lifecycle.begin_start(failed_session)
+        gui.gate.begin(SessionState.RTT_SCAN)
+        gui._begin_feedback("RTT 日志采集", "扫描 RTT 控制块")
+        gui._handle_worker_error(
+            "rtt-start-settled",
+            RuntimeError("RTT startup worker failed"),
+            failed_session,
+        )
+        assert gui.operation_feedback.state.value == "failed"
+        assert "RTT startup worker failed" in gui.operation_feedback.detail
+        gui._handle_rtt_event(
+            RttEvent("stopped", message="startup failed", outcome="startup_failed")
+        )
+        assert gui.operation_feedback.state.value == "failed"
+        assert error_dialogs == []
 
         firmware = tmp_path / "external.bin"
         firmware.write_bytes(b"version-1")
@@ -474,7 +603,24 @@ def test_gui_applies_theme_and_filters_structured_rtt_records(tmp_path, monkeypa
         gui._read_flash()
 
         assert dispatched[0][1] is SessionState.FLASH_READ
+        assert dispatched[0][2]._background is True
         assert dispatched[1][0] == "flash-read-result"
+        assert gui.operation_feedback.task == "读取完整 Flash"
+        assert gui.operation_feedback.state.value == "running"
+        assert gui.operation_feedback.stage == "OpenOCD 执行中"
+        assert gui.operation_feedback.log_dir is not None
+
+        error_dialogs.clear()
+        monkeypatch.setattr(
+            gui,
+            "_obtain_fresh_snapshot",
+            lambda: (_ for _ in ()).throw(ValueError("缺少目标芯片配置")),
+        )
+        gui._check_connection()
+        assert gui.operation_feedback.state.value == "failed"
+        assert gui.operation_feedback.summary == "无法检查连接"
+        assert "缺少目标芯片配置" in gui.operation_feedback.detail
+        assert error_dialogs == []
     finally:
         if not gui._destroyed:
             gui._on_close()

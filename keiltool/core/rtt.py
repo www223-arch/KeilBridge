@@ -10,6 +10,7 @@ import time
 from typing import Callable, Protocol, TextIO
 
 from .openocd_backend import OpenOcdConfig
+from .process_launch import background_process_kwargs
 from .rtt_log import RttLevel, RttLogRecord, SeggerRttLogParser
 
 
@@ -99,6 +100,7 @@ class RttSession:
         stop_timeout: float = 2.0,
         retry_interval: float = 0.05,
         host: str = "127.0.0.1",
+        background: bool = False,
     ) -> None:
         if connect_timeout <= 0:
             raise ValueError("RTT connect timeout must be positive.")
@@ -118,6 +120,7 @@ class RttSession:
         self._stop_timeout = stop_timeout
         self._retry_interval = retry_interval
         self._host = host
+        self._background = background
         self._port = request.port
         self._socket_lock = threading.Lock()
         self._log_lock = threading.Lock()
@@ -159,6 +162,7 @@ class RttSession:
                     text=True,
                     encoding="utf-8",
                     errors="replace",
+                    **(background_process_kwargs() if self._background else {}),
                 )
             except OSError as exc:
                 self._finish_startup_failure(f"Unable to start OpenOCD: {exc}")

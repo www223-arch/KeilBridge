@@ -454,6 +454,35 @@ def test_stop_before_start_prevents_openocd_launch(tmp_path):
     assert launches == []
 
 
+def test_background_rtt_session_passes_hidden_window_options(tmp_path, monkeypatch):
+    from keiltool.core import rtt
+
+    process = FakeProcess(returncode=0)
+    captured = {}
+    monkeypatch.setattr(
+        rtt,
+        "background_process_kwargs",
+        lambda: {"creationflags": 0x08000000},
+    )
+
+    def popen(*args, **kwargs):
+        captured.update(kwargs)
+        return process
+
+    session = RttSession(
+        CONFIG,
+        RttRequest(scan_address=0x20000000, scan_size=0x10000),
+        tmp_path / "rtt.log",
+        popen_factory=popen,
+        background=True,
+    )
+
+    session.start()
+    session.stop()
+
+    assert captured["creationflags"] == 0x08000000
+
+
 def test_stop_handles_process_exit_race_and_emits_one_clean_event(tmp_path):
     process = ExitRaceProcess()
     session = RttSession(

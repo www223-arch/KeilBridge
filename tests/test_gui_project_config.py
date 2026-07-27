@@ -74,9 +74,32 @@ def test_resolve_target_facts_uses_verified_family_mapping(tmp_path):
     assert facts.ready is True
     assert facts.target_cfg == "target/stm32f3x.cfg"
     assert facts.resolution_status == "family_mapping_verified"
+    assert facts.flash_origin == 0x08000000
+    assert facts.flash_size == 0x40000
     assert facts.ram_origin == 0x20000000
     assert facts.ram_size == 0x10000
     assert facts.default_log_dir == str(tmp_path / ".keilbridge" / "logs")
+
+
+def test_complete_flash_range_prefers_exact_device_catalog_over_project_partition(tmp_path):
+    loaded = load_project_targets(_project_file(tmp_path))
+    target = loaded.targets[0]
+    target.memory[0] = target.memory[0].__class__("FLASH", "0x08005800", "150K")
+
+    facts = resolve_target_facts(
+        target,
+        loaded.project_root,
+        openocd_path=_openocd_file(tmp_path),
+        scripts_dir=_scripts_dir(tmp_path),
+        catalog_device=_catalog_device(),
+    )
+
+    assert facts.flash_origin == 0x08000000
+    assert facts.flash_size == 0x40000
+    assert facts.flash_range_complete is True
+    assert facts.flash_range_source == "device_catalog"
+    assert "工程" in facts.flash_summary
+    assert "0x08005800" in facts.flash_summary
 
 
 def test_resolve_target_facts_accepts_verified_relative_and_absolute_overrides(tmp_path):
@@ -259,6 +282,8 @@ def test_catalog_device_resolves_ready_hardware_facts_without_project(tmp_path):
 
     assert facts.target_name == ""
     assert facts.device == "GD32F303CC"
+    assert facts.flash_origin == 0x08000000
+    assert facts.flash_size == 0x40000
     assert facts.ram_origin == 0x20000000
     assert facts.ram_size == 0x10000
     assert facts.target_cfg == "target/stm32f3x.cfg"

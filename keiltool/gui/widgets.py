@@ -136,11 +136,13 @@ class ConfigurationPane(ttk.Frame):
 
         actions = ttk.Frame(section)
         actions.grid(row=11, column=0, columnspan=3, sticky="ew", pady=(7, 0))
-        actions.columnconfigure((0, 1), weight=1)
+        actions.columnconfigure((0, 1, 2), weight=1)
         self.connect_button = ttk.Button(actions, text="检查连接")
-        self.connect_button.grid(row=0, column=0, sticky="ew", padx=(0, 4))
+        self.connect_button.grid(row=0, column=0, sticky="ew", padx=(0, 3))
+        self.flash_read_button = ttk.Button(actions, text="读取完整 Flash")
+        self.flash_read_button.grid(row=0, column=1, sticky="ew", padx=3)
         self.flash_button = ttk.Button(actions, text="烧录并校验", style="Primary.TButton")
-        self.flash_button.grid(row=0, column=1, sticky="ew", padx=(4, 0))
+        self.flash_button.grid(row=0, column=2, sticky="ew", padx=(3, 0))
 
         self._remember_editable(
             self.project_entry,

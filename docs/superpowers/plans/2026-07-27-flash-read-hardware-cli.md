@@ -30,11 +30,11 @@
 - Produces: `MemoryRange`, `HardwareContext`, `HardwareSelection`, and `resolve_hardware_context(selection)`.
 - Produces: `ProjectTargetFacts.flash_origin` and `flash_size` for GUI compatibility.
 
-- [ ] Write failing tests for exact project/device selection, ambiguity, primary Flash/RAM ranges, verified cfg, and unresolved failure.
-- [ ] Run focused tests and verify failures are caused by missing interfaces.
-- [ ] Implement the resolver by reusing catalog, project parser, and verified cfg rules.
-- [ ] Adapt GUI project facts without changing existing displayed summaries.
-- [ ] Run focused tests and verify they pass.
+- [x] Write failing tests for exact project/device selection, ambiguity, primary Flash/RAM ranges, verified cfg, and unresolved failure.
+- [x] Run focused tests and verify failures are caused by missing interfaces.
+- [x] Implement the resolver by reusing catalog, project parser, and verified cfg rules.
+- [x] Adapt GUI project facts without changing existing displayed summaries.
+- [x] Run focused tests and verify they pass.
 
 ### Task 2: Core Complete Flash Readback
 
@@ -45,10 +45,10 @@
 **Interfaces:**
 - Produces: `FlashReadRequest`, `FlashReadResult`, `build_flash_read_command()`, and `run_flash_read()`.
 
-- [ ] Write failing command tests for quoted output paths, initial-state capture, halt, `dump_image`, conditional resume, shutdown, and no reset command.
-- [ ] Write failing result tests for exact byte count, SHA-256, partial output, OpenOCD failure, timeout, and cancellation cleanup.
-- [ ] Implement command construction and read result validation through `OpenOcdOperation`.
-- [ ] Run backend tests and verify they pass.
+- [x] Write failing command tests for quoted output paths, initial-state capture, halt, `dump_image`, conditional resume, shutdown, and no reset command.
+- [x] Write failing result tests for exact byte count, SHA-256, partial output, OpenOCD failure, timeout, and cancellation cleanup.
+- [x] Implement command construction and read result validation through `OpenOcdOperation`.
+- [x] Run backend tests and verify they pass.
 
 ### Task 3: Firmware External-Change Gate
 
@@ -61,11 +61,11 @@
 **Interfaces:**
 - Produces: `FirmwareFingerprint`, `FirmwareFreshness`, `observe(path)`, `accept(path)`, and `is_current(path)`.
 
-- [ ] Write failing tests for SHA-256 fingerprints, same-path changes, missing files, accept, decline/stale state, and reselection.
-- [ ] Implement the independent freshness model.
-- [ ] Bind a debounced root focus-return check and prompt with old/new evidence.
-- [ ] Add a final freshness check before flash dispatch and disable flash while stale.
-- [ ] Run focused tests and verify they pass.
+- [x] Write failing tests for SHA-256 fingerprints, same-path changes, missing files, accept, decline/stale state, and reselection.
+- [x] Implement the independent freshness model.
+- [x] Bind a debounced root focus-return check and prompt with old/new evidence.
+- [x] Add a final freshness check before flash dispatch and disable flash while stale.
+- [x] Run focused tests and verify they pass.
 
 ### Task 4: GUI Flash Read Action
 
@@ -81,11 +81,11 @@
 - Consumes: `FlashReadRequest` and `run_flash_read()`.
 - Produces: separate `读取完整 Flash` button and `SessionState.FLASH_READ` lifecycle.
 
-- [ ] Write failing state/readiness tests and a GUI dispatch/result test.
-- [ ] Add the stable three-command action layout and save-file selection.
-- [ ] Dispatch through the existing exclusive one-shot gate and session logs.
-- [ ] Render origin, size, output path, SHA-256, and evidence logs.
-- [ ] Run GUI tests and verify they pass.
+- [x] Write failing state/readiness tests and a GUI dispatch/result test.
+- [x] Add the stable three-command action layout and save-file selection.
+- [x] Dispatch through the existing exclusive one-shot gate and session logs.
+- [x] Render origin, size, output path, SHA-256, and evidence logs.
+- [x] Run GUI tests and verify they pass.
 
 ### Task 5: Connect, Flash Write, And Flash Read CLI
 
@@ -98,10 +98,10 @@
 **Interfaces:**
 - Produces: `k2c connect`, `k2c flash-read`, and extended `k2c flash` selectors.
 
-- [ ] Write failing parser tests for mutually exclusive project/device selection and legacy flash compatibility.
-- [ ] Write failing command tests for text/JSON success and failure output with stable exit codes.
-- [ ] Implement common hardware arguments, context resolution, session logs, and rendering.
-- [ ] Run CLI hardware tests and verify they pass.
+- [x] Write failing parser tests for mutually exclusive project/device selection and legacy flash compatibility.
+- [x] Write failing command tests for text/JSON success and failure output with stable exit codes.
+- [x] Implement common hardware arguments, context resolution, session logs, and rendering.
+- [x] Run CLI hardware tests and verify they pass.
 
 ### Task 6: RTT Raw Events And CLI
 
@@ -114,11 +114,11 @@
 **Interfaces:**
 - Produces: raw byte `RttEvent` data and `k2c rtt --format text|jsonl|raw`.
 
-- [ ] Write failing RTT tests proving original recv bytes are emitted without changing decoded GUI records.
-- [ ] Write failing CLI tests for text, versioned JSONL, raw output, duration stop, Ctrl+C exit 130, and bounded cleanup.
-- [ ] Add raw events to `RttSession` and preserve existing text logging/parser behavior.
-- [ ] Implement CLI streaming with payload on stdout and diagnostics on stderr.
-- [ ] Run RTT and CLI tests and verify they pass.
+- [x] Write failing RTT tests proving original recv bytes are emitted without changing decoded GUI records.
+- [x] Write failing CLI tests for text, versioned JSONL, raw output, duration stop, Ctrl+C exit 130, and bounded cleanup.
+- [x] Add raw events to `RttSession` and preserve existing text logging/parser behavior.
+- [x] Implement CLI streaming with payload on stdout and diagnostics on stderr.
+- [x] Run RTT and CLI tests and verify they pass.
 
 ### Task 7: Documentation, Full Verification, And Runtime Smoke
 
@@ -130,8 +130,8 @@
 **Interfaces:**
 - Documents final commands, safety behavior, output schemas, and reload semantics.
 
-- [ ] Run `python -m pytest -q` and require the complete suite to pass.
-- [ ] Run CLI `--help` and parser smoke commands.
-- [ ] Launch the GUI, verify layout and firmware reload prompt without performing a write.
-- [ ] If ST-Link connects read-only, perform one Flash readback and verify exact size/SHA-256; otherwise record the hardware blocker without claiming a hardware pass.
-- [ ] Update every checklist item and commit the implementation.
+- [x] Run `python -m pytest -q` and require the complete suite to pass.
+- [x] Run CLI `--help` and parser smoke commands.
+- [x] Launch the GUI, verify layout and firmware reload prompt without performing a write.
+- [x] Record the existing ST-Link connection blocker without claiming a hardware readback pass.
+- [x] Update every checklist item and commit the implementation.

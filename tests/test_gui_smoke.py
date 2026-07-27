@@ -90,6 +90,49 @@ def test_build_flash_request_parses_bin_address(tmp_path):
     assert request.base_address == 0x08004000
 
 
+def test_build_flash_read_request_uses_complete_primary_flash(tmp_path):
+    from keiltool.gui.workbench_model import build_flash_read_request
+
+    facts = SimpleNamespace(
+        flash_origin=0x08000000,
+        flash_size=0x40000,
+        flash_range_complete=True,
+    )
+    output = tmp_path / "board-flash.bin"
+
+    request = build_flash_read_request(facts, output)
+
+    assert request.output == output
+    assert request.address == 0x08000000
+    assert request.size == 0x40000
+
+
+def test_build_flash_read_request_rejects_unknown_flash_range(tmp_path):
+    from keiltool.gui.workbench_model import build_flash_read_request
+
+    facts = SimpleNamespace(
+        flash_origin=None,
+        flash_size=None,
+        flash_range_complete=False,
+    )
+
+    with pytest.raises(ValueError, match="Flash range"):
+        build_flash_read_request(facts, tmp_path / "board-flash.bin")
+
+
+def test_build_flash_read_request_rejects_unverified_project_partition(tmp_path):
+    from keiltool.gui.workbench_model import build_flash_read_request
+
+    facts = SimpleNamespace(
+        flash_origin=0x08005800,
+        flash_size=150 * 1024,
+        flash_range_complete=False,
+    )
+
+    with pytest.raises(ValueError, match="complete physical Flash"):
+        build_flash_read_request(facts, tmp_path / "board-flash.bin")
+
+
 def test_build_rtt_request_uses_project_ram_in_auto_mode():
     from keiltool.gui.workbench_model import build_rtt_request
 
@@ -250,6 +293,7 @@ def test_gui_applies_theme_and_filters_structured_rtt_records(tmp_path, monkeypa
     from keiltool.gui.app import KeilToolGui
     from keiltool.gui.rtt_display import RttDisplayBuffer
     from keiltool.gui.settings import SettingsStore
+    from keiltool.gui.state import SessionState
     from keiltool.gui.theme import PALETTE
 
     root = tk.Tk()
@@ -266,6 +310,7 @@ def test_gui_applies_theme_and_filters_structured_rtt_records(tmp_path, monkeypa
             "ASSERT",
         )
         assert root.cget("background") == PALETTE["background"]
+        assert gui.controls.flash_read_button.cget("text") == "读取完整 Flash"
         assert gui.output._rtt_text.tag_cget("ERROR", "foreground") == PALETTE["error"]
         label = next(
             value
@@ -367,6 +412,69 @@ def test_gui_applies_theme_and_filters_structured_rtt_records(tmp_path, monkeypa
 
         assert gui.output._rtt_text.get("1.0", "end-1c") == "I/two\nI/three\n"
         assert gui.rtt_visible_counts_var.get() == "2 可见 / 2 缓存"
+
+        firmware = tmp_path / "external.bin"
+        firmware.write_bytes(b"version-1")
+        gui.device_source_mode_var.set("device")
+        gui.firmware_var.set(str(firmware))
+        gui._current_firmware_freshness().accept(firmware)
+        firmware.write_bytes(b"version-2-longer")
+        reload_answers = []
+        monkeypatch.setattr(
+            "keiltool.gui.app.messagebox.askyesno",
+            lambda title, message, **_kwargs: reload_answers.append((title, message)) or False,
+        )
+
+        assert gui._check_firmware_external_change() is False
+        assert gui._current_firmware_freshness().stale
+        assert len(reload_answers) == 1
+        assert "SHA-256" in reload_answers[0][1]
+        assert gui._check_firmware_external_change() is False
+        assert len(reload_answers) == 1
+
+        gui._current_firmware_freshness().accept(firmware)
+        firmware.write_bytes(b"version-3")
+        monkeypatch.setattr(
+            "keiltool.gui.app.messagebox.askyesno",
+            lambda *_args, **_kwargs: True,
+        )
+        assert gui._check_firmware_external_change() is True
+        assert not gui._current_firmware_freshness().stale
+
+        read_output = tmp_path / "complete-flash.bin"
+        read_snapshot = SimpleNamespace(
+            facts=SimpleNamespace(
+                device="GD32F303CC",
+                flash_origin=0x08000000,
+                flash_size=0x40000,
+                flash_range_complete=True,
+            ),
+            target=None,
+        )
+        read_config = SimpleNamespace(interface_cfg="interface/stlink.cfg", target_cfg="target/stm32f3x.cfg")
+        dispatched = []
+        monkeypatch.setattr(gui, "_obtain_fresh_snapshot", lambda: read_snapshot)
+        monkeypatch.setattr(gui, "_build_openocd_config", lambda _snapshot: read_config)
+        monkeypatch.setattr(gui, "_log_dir", lambda: tmp_path)
+        monkeypatch.setattr(
+            "keiltool.gui.app.filedialog.asksaveasfilename",
+            lambda **_kwargs: str(read_output),
+        )
+        monkeypatch.setattr(
+            gui,
+            "_begin_one_shot",
+            lambda state, operation: dispatched.append(("begin", state, operation)),
+        )
+        monkeypatch.setattr(
+            gui,
+            "_start_worker",
+            lambda kind, action, *, owner=None: dispatched.append((kind, action, owner)),
+        )
+
+        gui._read_flash()
+
+        assert dispatched[0][1] is SessionState.FLASH_READ
+        assert dispatched[1][0] == "flash-read-result"
     finally:
         if not gui._destroyed:
             gui._on_close()

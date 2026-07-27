@@ -29,3 +29,13 @@ def test_failed_session_can_start_new_work():
 def test_begin_rejects_non_work_state():
     with pytest.raises(ValueError, match="work state"):
         TaskGate().begin(SessionState.IDLE)
+
+
+def test_flash_read_is_an_exclusive_work_state():
+    gate = TaskGate()
+    gate.begin(SessionState.FLASH_READ)
+
+    with pytest.raises(BusySessionError):
+        gate.begin(SessionState.CONNECT)
+
+    assert gate.state is SessionState.FLASH_READ

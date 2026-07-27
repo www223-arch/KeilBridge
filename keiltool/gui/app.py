@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 import os
 from pathlib import Path
 import queue
@@ -15,20 +16,24 @@ from keiltool.core.device_catalog import CatalogDevice, DeviceCatalog, load_embe
 from keiltool.core.device_import import import_device_file, load_user_catalog
 from keiltool.core.openocd_backend import (
     ConnectionResult,
+    FlashReadResult,
     FlashResult,
     OpenOcdCleanupResult,
     OpenOcdConfig,
     OpenOcdOperation,
     run_connection_check,
     run_flash,
+    run_flash_read,
 )
 from keiltool.core.rtt import RttEvent, RttSession
 from keiltool.core.rtt_log import RttLevel, RttLogRecord
 from keiltool.core.session_logs import SessionLogContext, create_session_logs
 from keiltool.gui.project_config import (
     ProjectTargetFacts,
+    clear_project_device_catalog_cache,
     load_project_targets,
 )
+from keiltool.gui.firmware_freshness import FirmwareChange, FirmwareFingerprint, FirmwareFreshness
 from keiltool.gui.rtt_display import RttDisplayBuffer, build_rtt_view, parse_rtt_level
 from keiltool.gui.settings import (
     GuiSettings,
@@ -56,11 +61,13 @@ from keiltool.gui.workbench_controller import (
 from keiltool.gui.workbench_model import (
     RttLogPaths,
     TargetFactsDisplay,
+    build_flash_read_request,
     build_flash_request,
     build_rtt_request,
     int_or_default,
     is_firmware_ready,
     is_target_ready,
+    safe_filename,
     target_facts_display,
 )
 
@@ -69,6 +76,7 @@ _BUSY_STATES = frozenset(
     {
         SessionState.CONNECT,
         SessionState.FLASH,
+        SessionState.FLASH_READ,
         SessionState.RTT_SCAN,
         SessionState.RTT,
         SessionState.STOPPING,
@@ -82,6 +90,7 @@ _STATE_TEXT = {
     SessionState.IDLE: "空闲",
     SessionState.CONNECT: "检查连接",
     SessionState.FLASH: "烧录中",
+    SessionState.FLASH_READ: "读取 Flash 中",
     SessionState.RTT_SCAN: "RTT 扫描中",
     SessionState.RTT: "RTT 采集中",
     SessionState.STOPPING: "停止中",
@@ -103,6 +112,12 @@ class KeilToolGui:
         self.settings_store = settings_store or SettingsStore()
         self.gate = TaskGate()
         self._freshness = FreshnessController()
+        self._firmware_freshness = {
+            _PROJECT_SOURCE: FirmwareFreshness(),
+            _DEVICE_SOURCE: FirmwareFreshness(),
+        }
+        self._window_inactive = False
+        self._firmware_focus_check_pending = False
         self._one_shot_lifecycle = OneShotLifecycleController()
         self._rtt_lifecycle = RttLifecycleController()
         self._event_poller = BoundedEventPoller()
@@ -137,13 +152,17 @@ class KeilToolGui:
         self._refresh_controls()
 
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
+        self.root.bind("<FocusOut>", self._on_window_focus_out, add="+")
+        self.root.bind("<FocusIn>", self._on_window_focus_in, add="+")
         self.root.after(50, self._poll_events)
+        self.root.after_idle(self._initialize_firmware_baseline)
         if settings.project and self.device_source_mode_var.get() == _PROJECT_SOURCE:
             self.root.after_idle(lambda: self._load_project(Path(settings.project), restored=True))
         elif settings.device_vendor and settings.device_name:
             self.root.after_idle(self._resolve_selected_target)
 
     def _reload_device_catalog(self) -> None:
+        clear_project_device_catalog_cache()
         embedded = load_embedded_catalog()
         user = load_user_catalog(default_devices_path())
         self._catalog = DeviceCatalog(embedded=embedded.devices, user=user.devices)
@@ -280,6 +299,7 @@ class KeilToolGui:
         controls.scripts_button.configure(command=self._choose_scripts_dir)
         controls.override_button.configure(command=self._choose_target_override)
         controls.connect_button.configure(command=self._check_connection)
+        controls.flash_read_button.configure(command=self._read_flash)
         controls.flash_button.configure(command=self._flash)
         controls.rtt_start_button.configure(command=self._start_rtt)
         controls.rtt_stop_button.configure(command=self._stop_rtt)
@@ -292,6 +312,8 @@ class KeilToolGui:
         controls.device_combo.bind("<KeyRelease>", self._filter_device_choices)
         controls.device_combo.bind("<Return>", lambda _event: self._select_catalog_device())
         self.firmware_var.trace_add("write", lambda *_args: self._refresh_controls())
+        controls.firmware_entry.bind("<FocusOut>", self._accept_typed_firmware)
+        controls.firmware_entry.bind("<Return>", self._accept_typed_firmware)
         for variable in (
             self.project_var,
             self.target_var,
@@ -343,6 +365,7 @@ class KeilToolGui:
             previous.vendor != device.vendor or previous.device != device.device
         ):
             self._device_firmware = ""
+            self._firmware_freshness[_DEVICE_SOURCE].clear()
             self.firmware_var.set("")
         self._independent_device = device
         self.device_choice_var.set(self._device_label(device))
@@ -488,6 +511,7 @@ class KeilToolGui:
                     self._remember_device_context()
                 self._project_target = ""
                 self._project_firmware = ""
+                self._firmware_freshness[_PROJECT_SOURCE].clear()
                 self.target_var.set("")
                 self.firmware_var.set("")
             self.project_var.set(path)
@@ -502,10 +526,118 @@ class KeilToolGui:
         )
         if path:
             self.firmware_var.set(path)
+            self._current_firmware_freshness().accept(path)
             if self.device_source_mode_var.get() == _PROJECT_SOURCE:
                 self._project_firmware = path
             else:
                 self._device_firmware = path
+            self.status_var.set("已载入固件文件")
+            self._refresh_controls()
+
+    def _current_firmware_freshness(self) -> FirmwareFreshness:
+        return self._firmware_freshness[self.device_source_mode_var.get()]
+
+    def _initialize_firmware_baseline(self) -> None:
+        path = self.firmware_var.get().strip()
+        if not path:
+            return
+        try:
+            self._current_firmware_freshness().accept(path)
+        except OSError:
+            pass
+        self._refresh_controls()
+
+    def _accept_typed_firmware(self, _event: tk.Event | None = None) -> None:
+        path = self.firmware_var.get().strip()
+        if not path:
+            self._current_firmware_freshness().clear()
+            self._refresh_controls()
+            return
+        try:
+            self._current_firmware_freshness().accept(path)
+        except OSError as exc:
+            self.status_var.set(f"固件文件不可用: {exc}")
+        else:
+            if self.device_source_mode_var.get() == _PROJECT_SOURCE:
+                self._project_firmware = path
+            else:
+                self._device_firmware = path
+            self.status_var.set("已载入固件文件")
+        self._refresh_controls()
+
+    def _on_window_focus_out(self, _event: tk.Event | None = None) -> None:
+        self.root.after_idle(self._mark_window_inactive_if_needed)
+
+    def _mark_window_inactive_if_needed(self) -> None:
+        if not self._destroyed and self.root.focus_displayof() is None:
+            self._window_inactive = True
+
+    def _on_window_focus_in(self, _event: tk.Event | None = None) -> None:
+        if not self._window_inactive or self._firmware_focus_check_pending:
+            return
+        self._window_inactive = False
+        self._firmware_focus_check_pending = True
+        self.root.after_idle(self._check_firmware_after_focus)
+
+    def _check_firmware_after_focus(self) -> None:
+        self._firmware_focus_check_pending = False
+        if not self._destroyed and not self._hardware_busy():
+            self._check_firmware_external_change()
+
+    def _check_firmware_external_change(self) -> bool:
+        path = self.firmware_var.get().strip()
+        if not path:
+            return True
+        freshness = self._current_firmware_freshness()
+        change = freshness.observe(path)
+        if change is None:
+            self._refresh_controls()
+            return not freshness.stale
+        if change.current is None:
+            self.status_var.set("固件文件已丢失或不可读取，烧录已禁用")
+            self._append_openocd(f"[固件检查] 文件不可用: {path}\n{change.error}\n\n")
+            self._refresh_controls()
+            return False
+
+        reload_file = messagebox.askyesno(
+            "固件文件已更新",
+            self._firmware_change_message(change),
+            parent=self.root,
+        )
+        if reload_file:
+            freshness.accept_pending()
+            self.status_var.set("已重新载入更新后的固件")
+            self._append_openocd(f"[固件检查] 已接受外部更新: {change.current.path}\n")
+            self._refresh_controls()
+            return True
+
+        self.status_var.set("固件已变化但未重新载入，烧录已禁用；重新选择固件可载入")
+        self._append_openocd(f"[固件检查] 外部更新未载入，已禁用烧录: {change.current.path}\n")
+        self._refresh_controls()
+        return False
+
+    @staticmethod
+    def _firmware_change_message(change: FirmwareChange) -> str:
+        previous = KeilToolGui._format_firmware_fingerprint("上次载入", change.previous)
+        current = KeilToolGui._format_firmware_fingerprint("磁盘当前", change.current)
+        return (
+            "检测到固件文件被外部程序修改。是否重新载入当前磁盘版本？\n\n"
+            f"{previous}\n\n{current}\n\n"
+            "选择“否”后将禁用烧录，直到重新选择该固件。"
+        )
+
+    @staticmethod
+    def _format_firmware_fingerprint(label: str, value: FirmwareFingerprint | None) -> str:
+        if value is None:
+            return f"{label}: 无"
+        modified = datetime.fromtimestamp(value.modified_ns / 1_000_000_000).astimezone()
+        return (
+            f"{label}:\n"
+            f"路径: {value.path}\n"
+            f"大小: {value.size:,} 字节\n"
+            f"修改时间: {modified.isoformat(timespec='seconds')}\n"
+            f"SHA-256: {value.sha256}"
+        )
 
     def _choose_logs_dir(self) -> None:
         path = filedialog.askdirectory(parent=self.root, title="选择日志目录")
@@ -709,8 +841,80 @@ class KeilToolGui:
             owner=operation,
         )
 
+    def _read_flash(self) -> None:
+        try:
+            snapshot = self._obtain_fresh_snapshot()
+            config = self._build_openocd_config(snapshot)
+            facts = cast(ProjectTargetFacts, snapshot.facts)
+            if not facts.flash_range_complete:
+                raise ValueError(
+                    "当前来源没有确认整颗芯片的物理 Flash 范围，无法执行完整读取。"
+                )
+            log_dir = self._log_dir()
+            log_dir.mkdir(parents=True, exist_ok=True)
+            output = filedialog.asksaveasfilename(
+                parent=self.root,
+                title="保存完整 Flash 镜像",
+                initialdir=str(log_dir),
+                initialfile=(
+                    f"{safe_filename(facts.device)}_flash_"
+                    f"0x{facts.flash_origin:08X}_{facts.flash_size}.bin"
+                ),
+                defaultextension=".bin",
+                filetypes=[("BIN 镜像", "*.bin"), ("所有文件", "*.*")],
+            )
+            if not output:
+                return
+            request = build_flash_read_request(facts, output)
+            target = snapshot.target
+            log_context = create_session_logs(
+                log_dir,
+                device=facts.device,
+                task="FLASH_READ",
+                metadata={
+                    "probe": "ST-Link",
+                    "target_cfg": config.target_cfg,
+                    "interface_cfg": config.interface_cfg,
+                    "output": str(request.output.expanduser().resolve()),
+                    "address": f"0x{request.address:08X}",
+                    "size": request.size,
+                },
+            )
+            operation = OpenOcdOperation(timeout=300.0)
+            try:
+                self._begin_one_shot(SessionState.FLASH_READ, operation)
+            except Exception:
+                log_context.finalize("not_started")
+                raise
+            self._operation_logs[operation] = log_context
+        except BusySessionError:
+            self._show_busy()
+            return
+        except Exception as exc:
+            messagebox.showerror("无法读取 Flash", str(exc), parent=self.root)
+            return
+
+        self._set_status()
+        self._refresh_controls()
+        self._start_worker(
+            "flash-read-result",
+            lambda: run_flash_read(
+                config,
+                request,
+                log_context.directory,
+                operation=operation,
+                target=target if hasattr(target, "name") else None,
+                target_name=str(getattr(target, "name", "")),
+                stdout_log_path=log_context.stdout_log,
+                stderr_log_path=log_context.stderr_log,
+            ),
+            owner=operation,
+        )
+
     def _flash(self) -> None:
         try:
+            if not self._check_firmware_external_change():
+                return
             snapshot = self._obtain_fresh_snapshot()
             config = self._build_openocd_config(snapshot)
             request = build_flash_request(self.firmware_var.get().strip(), self.bin_address_var.get().strip())
@@ -928,6 +1132,9 @@ class KeilToolGui:
         elif event.kind == "flash-result":
             operation, value = event.value
             self._settle_one_shot_result(operation, value, self._finish_flash)
+        elif event.kind == "flash-read-result":
+            operation, value = event.value
+            self._settle_one_shot_result(operation, value, self._finish_flash_read)
         elif event.kind == "one-shot-cleanup-settled":
             operation, value = event.value
             self._finish_one_shot_cleanup(operation, value)
@@ -1039,6 +1246,49 @@ class KeilToolGui:
             self.status_var.set("烧录或校验失败")
             if not self._closing:
                 messagebox.showerror("烧录失败", self._result_error_summary(value), parent=self.root)
+        self._refresh_controls()
+        self._finish_close_if_ready()
+
+    def _finish_flash_read(self, value: object) -> None:
+        if not isinstance(value, FlashReadResult):
+            self._handle_worker_error(
+                "flash-read-result",
+                RuntimeError("Flash 读取返回了无效结果。"),
+                None,
+            )
+            return
+        self._render_openocd_result("读取完整 Flash", value)
+        self._append_openocd(
+            "----- Flash 镜像 -----\n"
+            f"起始地址: 0x{value.address:08X}\n"
+            f"请求大小: {value.requested_size:,} 字节\n"
+            f"实际大小: {value.actual_size:,} 字节\n"
+            f"输出文件: {value.output}\n"
+            f"SHA-256: {value.sha256 or '未生成'}\n\n"
+        )
+        if value.success:
+            self.gate.finish()
+            self.status_var.set("完整 Flash 读取成功")
+            if not self._closing:
+                messagebox.showinfo(
+                    "Flash 读取完成",
+                    (
+                        f"已读取 {value.actual_size:,} 字节。\n"
+                        f"地址: 0x{value.address:08X}\n"
+                        f"文件: {value.output}\n"
+                        f"SHA-256: {value.sha256}"
+                    ),
+                    parent=self.root,
+                )
+        else:
+            self.gate.fail()
+            self.status_var.set("Flash 读取失败")
+            if not self._closing:
+                messagebox.showerror(
+                    "Flash 读取失败",
+                    self._result_error_summary(value),
+                    parent=self.root,
+                )
         self._refresh_controls()
         self._finish_close_if_ready()
 
@@ -1173,7 +1423,11 @@ class KeilToolGui:
         except OSError as exc:
             self._append_openocd(f"[日志结束信息写入失败] {exc}\n")
 
-    def _render_openocd_result(self, title: str, result: ConnectionResult | FlashResult) -> None:
+    def _render_openocd_result(
+        self,
+        title: str,
+        result: ConnectionResult | FlashResult | FlashReadResult,
+    ) -> None:
         command = subprocess.list2cmdline(result.command)
         self._append_openocd(
             f"\n[{title}]\n"
@@ -1198,7 +1452,9 @@ class KeilToolGui:
         self._append_openocd("\n")
 
     @staticmethod
-    def _result_error_summary(result: ConnectionResult | FlashResult) -> str:
+    def _result_error_summary(
+        result: ConnectionResult | FlashResult | FlashReadResult,
+    ) -> str:
         findings = "\n".join(
             f"• {finding.title}: {finding.message}" for finding in result.findings
         )
@@ -1246,8 +1502,26 @@ class KeilToolGui:
         ready = self._freshness.is_current(self._visible_fact_inputs()) and is_target_ready(self._facts)
         idle = not busy
         controls.connect_button.configure(state="normal" if idle and ready else "disabled")
+        flash_read_ready = bool(
+            self._facts
+            and getattr(self._facts, "flash_range_complete", False)
+            and getattr(self._facts, "flash_origin", None) is not None
+            and getattr(self._facts, "flash_size", None)
+        )
+        controls.flash_read_button.configure(
+            state="normal" if idle and ready and flash_read_ready else "disabled"
+        )
         controls.flash_button.configure(
-            state="normal" if idle and ready and is_firmware_ready(self.firmware_var.get().strip()) else "disabled"
+            state=(
+                "normal"
+                if idle
+                and ready
+                and is_firmware_ready(self.firmware_var.get().strip())
+                and self._current_firmware_freshness().accepts_path(
+                    self.firmware_var.get().strip()
+                )
+                else "disabled"
+            )
         )
         auto_rtt_ready = bool(self._facts and self._facts.ram_origin is not None and self._facts.ram_size)
         rtt_fields_ready = self.rtt_manual_var.get() or auto_rtt_ready

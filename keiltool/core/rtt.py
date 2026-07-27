@@ -50,6 +50,7 @@ def build_rtt_command(config: OpenOcdConfig, request: RttRequest) -> list[str]:
 @dataclass(frozen=True, slots=True)
 class RttEvent:
     kind: str
+    data: bytes = b""
     text: str = ""
     message: str = ""
     stream: str = ""
@@ -286,6 +287,7 @@ class RttSession:
                     parser_finalized = True
                     self._emit("eof", message="RTT TCP connection closed.")
                     return
+                self._emit("raw", data=data)
                 for record in parser.feed(data):
                     self._write_record(record)
         except OSError as exc:
@@ -422,6 +424,7 @@ class RttSession:
         self,
         kind: str,
         *,
+        data: bytes = b"",
         text: str = "",
         message: str = "",
         stream: str = "",
@@ -432,6 +435,7 @@ class RttSession:
         self.events.put(
             RttEvent(
                 kind=kind,
+                data=data,
                 text=text,
                 message=message,
                 stream=stream,

@@ -190,11 +190,13 @@ def test_session_emits_structured_levels_and_persists_all_text(tmp_path):
     session.stop()
 
     data = [event for event in events if event.kind == "data"]
+    raw = b"".join(event.data for event in events if event.kind == "raw")
     assert [(event.level, event.terminal, event.text) for event in data] == [
         (RttLevel.INFO, 0, "I/ready\n"),
         (RttLevel.DEBUG, 1, "D/control loop\n"),
         (RttLevel.VERBOSE, 2, "V/sample\n"),
     ]
+    assert raw == payload
     assert log_path.read_text(encoding="utf-8") == "I/ready\nD/control loop\nV/sample\n"
 
 

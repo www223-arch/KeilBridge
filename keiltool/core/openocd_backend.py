@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
+import hashlib
 from pathlib import Path
 import subprocess
 import threading
@@ -63,6 +64,18 @@ class FlashRequest:
 
 
 @dataclass(frozen=True, slots=True)
+class FlashReadRequest:
+    output: Path
+    address: int
+    size: int
+
+    def __post_init__(self) -> None:
+        parse_address(self.address)
+        if self.size <= 0 or self.address + self.size > 0x1_0000_0000:
+            raise ValueError("Flash read size must define a positive 32-bit range.")
+
+
+@dataclass(frozen=True, slots=True)
 class ConnectionResult:
     success: bool
     returncode: int
@@ -85,6 +98,24 @@ class FlashResult:
     stdout_log: Path
     stderr_log: Path
     findings: list[DoctorFinding]
+    outcome: str = "failed"
+
+
+@dataclass(frozen=True, slots=True)
+class FlashReadResult:
+    success: bool
+    returncode: int
+    command: list[str]
+    stdout: str
+    stderr: str
+    stdout_log: Path
+    stderr_log: Path
+    findings: list[DoctorFinding]
+    output: Path
+    address: int
+    requested_size: int
+    actual_size: int
+    sha256: str
     outcome: str = "failed"
 
 
@@ -345,6 +376,23 @@ def build_flash_command(config: OpenOcdConfig, request: FlashRequest) -> list[st
     return [*command, "-c", program]
 
 
+def build_flash_read_command(config: OpenOcdConfig, request: FlashReadRequest) -> list[str]:
+    output = quote_tcl_word(request.output.resolve().as_posix())
+    script = (
+        "set _kt_target [target current]; "
+        "set _kt_state [$_kt_target curstate]; "
+        "set _kt_resume [expr {$_kt_state ne \"halted\"}]; "
+        "set _kt_rc [catch { "
+        "if {$_kt_resume} { halt }; "
+        f"dump_image {output} 0x{request.address:08X} 0x{request.size:X} "
+        "} _kt_error]; "
+        "if {$_kt_resume} { catch { resume } }; "
+        "if {$_kt_rc} { echo \"Flash read failed: $_kt_error\"; shutdown error }; "
+        "shutdown"
+    )
+    return [*config.base_command(), "-c", "init", "-c", script]
+
+
 def quote_tcl_word(value: str) -> str:
     """Return a Tcl word that preserves a literal OpenOCD argument."""
 
@@ -473,6 +521,80 @@ def run_flash(
     )
 
 
+def run_flash_read(
+    config: OpenOcdConfig,
+    request: FlashReadRequest,
+    log_dir: Path,
+    *,
+    runner: OpenOcdRunner | None = None,
+    operation: OpenOcdOperation | None = None,
+    cwd: Path | None = None,
+    target: KeilTargetModel | None = None,
+    target_name: str = "",
+    stdout_log_path: Path | None = None,
+    stderr_log_path: Path | None = None,
+) -> FlashReadResult:
+    output = request.output.expanduser().resolve()
+    output.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        output.unlink(missing_ok=True)
+    except OSError as exc:
+        raise ValueError(f"Unable to replace Flash read output: {output}: {exc}") from exc
+
+    normalized_request = FlashReadRequest(output, request.address, request.size)
+    command = build_flash_read_command(config, normalized_request)
+    completed, stdout_log, stderr_log = _run_with_logs(
+        command,
+        log_dir,
+        "flash_read",
+        runner,
+        operation or OpenOcdOperation(),
+        cwd,
+        target_name,
+        stdout_log_path,
+        stderr_log_path,
+    )
+    findings = _classify(completed.stdout, completed.stderr, config.executable, target)
+    actual_size = output.stat().st_size if output.is_file() else 0
+    digest = _sha256_file(output) if output.is_file() else ""
+    success = (
+        completed.outcome == "completed"
+        and completed.returncode == 0
+        and actual_size == request.size
+    )
+    if completed.outcome != "completed":
+        findings.append(_operation_finding(completed.outcome, "flash_read"))
+    elif completed.returncode == 0 and actual_size != request.size:
+        findings.append(
+            DoctorFinding(
+                stage="flash",
+                severity="fail",
+                code="OPENOCD_FLASH_READ_SIZE_MISMATCH",
+                title="Flash readback size does not match the requested range",
+                message=(
+                    f"Requested {request.size} bytes from 0x{request.address:08X}, "
+                    f"but the output contains {actual_size} bytes: {output}"
+                ),
+            )
+        )
+    return FlashReadResult(
+        success=success,
+        returncode=completed.returncode,
+        command=command,
+        stdout=completed.stdout,
+        stderr=completed.stderr,
+        stdout_log=stdout_log,
+        stderr_log=stderr_log,
+        findings=findings,
+        output=output,
+        address=request.address,
+        requested_size=request.size,
+        actual_size=actual_size,
+        sha256=digest,
+        outcome="succeeded" if success else completed.outcome if completed.outcome != "completed" else "failed",
+    )
+
+
 def _run_with_logs(
     command: list[str],
     log_dir: Path,
@@ -517,6 +639,14 @@ def _write_operation_log(path: Path, text: str, *, append: bool) -> None:
     mode = "a" if append else "w"
     with path.open(mode, encoding="utf-8", newline="\n") as stream:
         stream.write(text)
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _operation_finding(outcome: str, operation: str) -> DoctorFinding:

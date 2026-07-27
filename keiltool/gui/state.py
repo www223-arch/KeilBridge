@@ -8,6 +8,7 @@ class SessionState(Enum):
     IDLE = "idle"
     CONNECT = "connect"
     FLASH = "flash"
+    FLASH_READ = "flash_read"
     RTT_SCAN = "rtt_scan"
     RTT = "rtt"
     STOPPING = "stopping"
@@ -19,7 +20,15 @@ class BusySessionError(RuntimeError):
 
 
 class TaskGate:
-    _WORK_STATES = frozenset({SessionState.CONNECT, SessionState.FLASH, SessionState.RTT_SCAN, SessionState.RTT})
+    _WORK_STATES = frozenset(
+        {
+            SessionState.CONNECT,
+            SessionState.FLASH,
+            SessionState.FLASH_READ,
+            SessionState.RTT_SCAN,
+            SessionState.RTT,
+        }
+    )
 
     def __init__(self) -> None:
         self._lock = RLock()

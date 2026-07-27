@@ -167,9 +167,33 @@ python -m keiltool.cli doctor flash --project "xxx.uvprojx" --target App --probe
 
 如果芯片存在于目录中但按钮仍禁用，请查看“来源”和“解析”字段。CMSIS-Pack 不包含 OpenOCD target cfg；KeilBridge 只使用明确维护或用户显式提供的映射。没有映射、cfg 不存在或没有可写 RAM 时会明确报告缺失信息，不会根据相似型号猜一个 target。
 
+也可完全不打开 GUI：
+
+```powershell
+k2c rtt --device GD32F303CC --format text
+k2c rtt --device GD32F303CC --format jsonl
+k2c rtt --device GD32F303CC --format raw > rtt.bin
+```
+
+`text/jsonl/raw` 的采集内容写 stdout，诊断写 stderr。默认持续采集完整日志，按 `Ctrl+C` 会清理 OpenOCD 并返回 `130`。
+
+## 7B. 如何读取板子上的完整 Flash？
+
+GUI 使用独立的“读取完整 Flash”按钮；CLI 可使用：
+
+```powershell
+k2c flash-read --device GD32F303CC --output board-flash.bin --output-format json
+```
+
+它读取设备目录或 Keil Target 中已验证的主用户 Flash 起始地址和完整容量，不包含 option bytes、OTP 或系统 ROM。为获得一致镜像，工具会记录当前状态并在必要时暂停内核，结束后仅恢复原本正在运行的目标，不执行复位。结果必须满足精确字节数，并报告 SHA-256；失败时可能保留部分文件作为证据，不应把部分文件当作完整备份。
+
+## 7C. 为什么固件更新后 GUI 会询问 reload？
+
+GUI 会记录所选 `.hex/.bin` 的路径、大小、修改时间和 SHA-256。外部编译完成后切回窗口，会对比磁盘版本并显示旧/新证据。接受后烧录新版本；拒绝后烧录按钮保持禁用，防止同一路径下实际内容已经变化却继续操作。重新选择该固件即可再次载入。点击“烧录并校验”时还会执行最终复核。
+
 ## 8. GUI 中 RTT 与烧录为什么不能同时进行？
 
-`k2c gui` 把“烧录并校验”和“开始 RTT”设计为两个独立操作，但它们都需要独占同一支 ST-Link/OpenOCD 会话。RTT 扫描、采集或停止清理期间，烧录和连接检查会禁用；烧录或连接检查期间，RTT 启动会禁用。
+`k2c gui` 把“读取完整 Flash”“烧录并校验”和“开始 RTT”设计为独立操作，但它们都需要独占同一支 ST-Link/OpenOCD 会话。RTT 扫描、采集或停止清理期间，Flash 读取、烧录和连接检查会禁用；其他硬件操作期间，RTT 启动会禁用。
 
 这是为了避免两个 OpenOCD 进程同时抢占 ST-Link，导致连接失败、日志混杂或把目标置于不可预期状态。需要烧录时，先点击“停止采集”，等待状态变为“RTT 已停止”后再操作。若界面提示“RTT 清理不完整”，再次点击“停止采集”完成清理；在清理完成前，关闭窗口和新的硬件操作都会被阻止。
 

@@ -173,9 +173,12 @@ python -m keiltool.cli doctor flash --project "xxx.uvprojx" --target App --probe
 k2c rtt --device GD32F303CC --format text
 k2c rtt --device GD32F303CC --format jsonl
 k2c rtt --device GD32F303CC --format raw > rtt.bin
+k2c rtt --device STM32G431CBUx --vendor Keil --channel 1 --port 19022 --format raw --output "C:\Logs\foc_sweep.bin" --duration 8
 ```
 
-`text/jsonl/raw` 的采集内容写 stdout，诊断写 stderr。默认持续采集完整日志，按 `Ctrl+C` 会清理 OpenOCD 并返回 `130`。
+`text/jsonl` 的采集内容写 stdout。raw 未指定 `--output` 时原样写 stdout；指定 `--output PATH` 后不做 UTF-8 或终端日志解析，使用至少 1 MiB 文件缓冲写入二进制文件。诊断、累计接收字节、文件字节、异常和断连信息写 stderr。`--channel 1` 选择独立的 RTT 上行通道 1，`--port` 选择本地 OpenOCD RTT TCP 端口。默认持续采集，按 `Ctrl+C` 会 flush/close 文件、清理 OpenOCD 并返回 `130`。
+
+主机端的接收字节数与文件字节数不代表 MCU 端没有漏记录。FOC 扫频数据是否有效，仍须检查每条固定记录中的 timestamp 是否连续。
 
 ## 7B. 如何读取板子上的完整 Flash？
 

@@ -9,6 +9,7 @@ import sys
 import time
 from dataclasses import asdict
 from pathlib import Path
+from typing import BinaryIO
 
 from .core.armclang_workspace import configure_armclang_workspace
 from .core.backend_recommender import recommend_backends, render_backend_recommendation_markdown
@@ -431,12 +432,64 @@ def _cmd_flash_hardware(args: argparse.Namespace) -> int:
     )
 
 
-def _write_rtt_payload(event: RttEvent, output_format: str) -> None:
+_RTT_RAW_FILE_BUFFER_SIZE = 1024 * 1024
+
+
+class _RttRawSink:
+    def __init__(self, output: Path | None) -> None:
+        self.output = output.expanduser() if output is not None else None
+        self.received_bytes = 0
+        self.file_bytes = 0
+        self._stream: BinaryIO | None = None
+
+    def open(self) -> None:
+        if self.output is None:
+            return
+        self.output.parent.mkdir(parents=True, exist_ok=True)
+        self._stream = self.output.open("wb", buffering=_RTT_RAW_FILE_BUFFER_SIZE)
+
+    def write(self, data: bytes) -> None:
+        self.received_bytes += len(data)
+        if self._stream is None:
+            stream = sys.stdout.buffer
+            stream.write(data)
+            stream.flush()
+            return
+        written = self._stream.write(data)
+        if written != len(data):
+            raise OSError(f"Short RTT raw write: expected {len(data)} bytes, wrote {written}.")
+        self.file_bytes += written
+
+    def close(self) -> None:
+        stream = self._stream
+        self._stream = None
+        close_error: OSError | None = None
+        if stream is not None:
+            try:
+                stream.flush()
+            except OSError as exc:
+                close_error = exc
+            try:
+                stream.close()
+            except OSError as exc:
+                if close_error is None:
+                    close_error = exc
+        if self.output is not None and self.output.exists():
+            self.file_bytes = self.output.stat().st_size
+        if close_error is not None:
+            raise close_error
+
+
+def _write_rtt_payload(
+    event: RttEvent,
+    output_format: str,
+    raw_sink: _RttRawSink | None = None,
+) -> None:
     if output_format == "raw":
         if event.kind == "raw" and event.data:
-            stream = sys.stdout.buffer
-            stream.write(event.data)
-            stream.flush()
+            if raw_sink is None:
+                raw_sink = _RttRawSink(None)
+            raw_sink.write(event.data)
         return
     if event.kind != "data":
         return
@@ -462,6 +515,8 @@ def _persist_rtt_openocd_event(event: RttEvent, log_context) -> None:
 
 
 def cmd_rtt(args: argparse.Namespace) -> int:
+    if args.output is not None and args.format != "raw":
+        raise SystemExit("--output requires --format raw.")
     context = _resolve_hardware(args)
     if args.address is None:
         if context.ram is None:
@@ -496,13 +551,24 @@ def cmd_rtt(args: argparse.Namespace) -> int:
         log_context.rtt_log,
         connect_timeout=args.connect_timeout,
         stop_timeout=args.stop_timeout,
+        parse_records=args.format != "raw",
     )
+    raw_sink = _RttRawSink(args.output) if args.format == "raw" else None
+    if raw_sink is not None:
+        try:
+            raw_sink.open()
+        except OSError as exc:
+            raise SystemExit(f"Unable to open RTT raw output: {exc}") from exc
     print(f"RTT log: {log_context.rtt_log}", file=sys.stderr, flush=True)
     print(f"Session metadata: {log_context.metadata_log}", file=sys.stderr, flush=True)
+    if raw_sink is not None and raw_sink.output is not None:
+        print(f"RTT raw output: {raw_sink.output.resolve()}", file=sys.stderr, flush=True)
     connected = False
     failed = False
     interrupted = False
     cleanup_outcome = "clean"
+    error_message = "none"
+    disconnect_message = "none"
     deadline = time.monotonic() + args.duration if args.duration is not None else None
     try:
         session.start()
@@ -517,15 +583,17 @@ def cmd_rtt(args: argparse.Namespace) -> int:
             except queue.Empty:
                 continue
             _persist_rtt_openocd_event(event, log_context)
-            _write_rtt_payload(event, args.format)
+            _write_rtt_payload(event, args.format, raw_sink)
             if event.kind == "connected":
                 connected = True
                 print(event.message, file=sys.stderr, flush=True)
             elif event.kind == "error":
                 failed = True
+                error_message = event.message or "unspecified RTT error"
                 print(f"RTT error: {event.message}", file=sys.stderr, flush=True)
                 break
             elif event.kind == "eof":
+                disconnect_message = event.message or "RTT TCP connection closed"
                 break
             elif event.kind == "stopped":
                 cleanup_outcome = event.outcome or "clean"
@@ -534,6 +602,10 @@ def cmd_rtt(args: argparse.Namespace) -> int:
     except KeyboardInterrupt:
         interrupted = True
         print("RTT interrupted; stopping session.", file=sys.stderr, flush=True)
+    except OSError as exc:
+        failed = True
+        error_message = f"raw output write failed: {exc}"
+        print(f"RTT error: {error_message}", file=sys.stderr, flush=True)
     finally:
         session.stop()
         session.wait(timeout=args.stop_timeout + 1.0)
@@ -543,15 +615,41 @@ def cmd_rtt(args: argparse.Namespace) -> int:
             except queue.Empty:
                 break
             _persist_rtt_openocd_event(event, log_context)
-            _write_rtt_payload(event, args.format)
+            try:
+                _write_rtt_payload(event, args.format, raw_sink)
+            except OSError as exc:
+                failed = True
+                error_message = f"raw output write failed: {exc}"
+                print(f"RTT cleanup error: {error_message}", file=sys.stderr, flush=True)
             if event.kind == "error":
                 failed = True
+                error_message = event.message or "unspecified RTT cleanup error"
                 print(f"RTT cleanup error: {event.message}", file=sys.stderr, flush=True)
+            elif event.kind == "eof":
+                disconnect_message = event.message or "RTT TCP connection closed"
             elif event.kind == "stopped":
                 cleanup_outcome = event.outcome or cleanup_outcome
                 failed = failed or cleanup_outcome == "incomplete"
+        if raw_sink is not None:
+            try:
+                raw_sink.close()
+            except OSError as exc:
+                failed = True
+                error_message = f"raw output close failed: {exc}"
+                print(f"RTT cleanup error: {error_message}", file=sys.stderr, flush=True)
         outcome = "interrupted" if interrupted else "failed" if failed or not connected else cleanup_outcome
         log_context.finalize(outcome)
+        if raw_sink is not None:
+            print(
+                "RTT capture summary: "
+                f"received_bytes={raw_sink.received_bytes} "
+                f"file_bytes={raw_sink.file_bytes} "
+                f"error={error_message} "
+                f"disconnect={disconnect_message} "
+                f"cleanup={cleanup_outcome}",
+                file=sys.stderr,
+                flush=True,
+            )
     if interrupted:
         return 130
     return 1 if failed or not connected else 0
@@ -942,6 +1040,11 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["text", "jsonl", "raw"],
         default="text",
         help="RTT payload format written to stdout (default: text)",
+    )
+    rtt_cmd.add_argument(
+        "--output",
+        type=Path,
+        help="Raw binary output file; requires --format raw and suppresses raw stdout",
     )
     rtt_cmd.add_argument("--address", type=parse_address, help="Manual RTT scan start address")
     rtt_cmd.add_argument(

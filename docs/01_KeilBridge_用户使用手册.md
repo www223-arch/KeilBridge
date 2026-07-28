@@ -317,11 +317,14 @@ k2c connect --device GD32F303CC --vendor GigaDevice --output-format json
 k2c flash --device GD32F303CC --firmware "C:\Path\app.hex" --output-format json
 k2c flash-read --device GD32F303CC --output "C:\Logs\GD32F303CC_flash.bin" --output-format json
 k2c rtt --device GD32F303CC --format jsonl
+k2c rtt --device STM32G431CBUx --vendor Keil --channel 1 --port 19022 --format raw --output "C:\Logs\foc_sweep.bin" --duration 8
 ```
 
 `connect`、`flash` 和 `flash-read` 的 JSON schema 为 `keiltool.hardware.v1`，包含成功状态、设备、来源、target cfg、OpenOCD 返回码、证据日志和产物信息。`flash-read` 只有在输出文件字节数与主 Flash 容量完全一致时才成功，并返回 SHA-256；失败时保留已有的部分文件作为诊断证据。
 
-RTT 默认持续采集到 `Ctrl+C`、RTT EOF 或错误，也可用 `--duration <秒>` 限时。`--format text` 输出解析后的日志，`jsonl` 输出 schema 为 `keiltool.rtt.v1` 的逐条记录，`raw` 原样输出 RTT TCP 字节。三种格式的 payload 都只写 stdout，OpenOCD 状态和日志路径写 stderr，便于管道和第三方工具处理。`Ctrl+C` 会清理 RTT/OpenOCD 后返回退出码 `130`。
+RTT 默认持续采集到 `Ctrl+C`、RTT EOF 或错误，也可用 `--duration <秒>` 限时。`--format text` 输出解析后的日志，`jsonl` 输出 schema 为 `keiltool.rtt.v1` 的逐条记录；`raw` 不做 UTF-8 解码、换行或终端帧处理，原样处理 RTT TCP 字节。raw 未指定 `--output` 时仍写 stdout；指定 `--output PATH` 时使用至少 1 MiB 的主机文件缓冲直接写入该二进制文件，并抑制 raw stdout。输出文件在每次启动时截断，退出时 flush/close。OpenOCD 状态、累计接收字节数、最终文件字节数、异常和断连信息写 stderr。`Ctrl+C` 会清理 RTT/OpenOCD 后返回退出码 `130`。
+
+`--channel 1` 可让 FOC 二进制记录独占 RTT 上行通道 1，`--port 19022` 指定 KeilTool 连接的本地 OpenOCD RTT TCP 端口。该采集命令只执行 `rtt setup`、`rtt start` 和 `rtt server start`，目标运行期间不发送 reset、halt 或 resume。主机字节计数只能证明 KeilTool 收到和写入了多少字节，不能检测 MCU 产生记录之前或 RTT 缓冲区内发生的漏记录；扫频有效性仍应由记录内 timestamp 连续性判定。
 
 高级覆盖参数在这些命令中保持一致：`--openocd`、`--scripts`、`--target-cfg` 和 `--logs-dir`。无法验证设备内存范围或 target cfg 时命令会失败，不会猜测配置继续访问硬件。
 

@@ -5,6 +5,8 @@ from pathlib import Path
 import queue
 from types import SimpleNamespace
 
+import pytest
+
 from keiltool import cli
 from keiltool.core.hardware_context import MemoryRange
 from keiltool.core.rtt import RttEvent
@@ -38,6 +40,7 @@ class FakeRttSession:
             self.events.put(event)
         self.started = False
         self.stopped = False
+        self.kwargs = kwargs
         FakeRttSession.last = self
 
     def start(self):
@@ -50,7 +53,7 @@ class FakeRttSession:
         return True
 
 
-def _run(tmp_path, monkeypatch, output_format: str):
+def _run(tmp_path, monkeypatch, output_format: str, *extra_args: str):
     monkeypatch.setattr(cli, "resolve_hardware_context", lambda _selection: _context(tmp_path))
     monkeypatch.setattr(cli, "RttSession", FakeRttSession)
     args = cli.build_parser().parse_args(
@@ -62,6 +65,7 @@ def _run(tmp_path, monkeypatch, output_format: str):
             str(tmp_path / "logs"),
             "--format",
             output_format,
+            *extra_args,
         ]
     )
     return args.func(args)
@@ -107,6 +111,104 @@ def test_rtt_raw_writes_original_bytes(tmp_path, monkeypatch, capsysbinary):
     assert _run(tmp_path, monkeypatch, "raw") == 0
 
     assert capsysbinary.readouterr().out == payload
+
+
+def test_rtt_raw_output_file_preserves_bytes_across_receive_boundaries(
+    tmp_path,
+    monkeypatch,
+    capsysbinary,
+):
+    chunks = (
+        b"\x00\x80",
+        b"\xff\x10\x00",
+        b"\x80\xff\x00tail",
+    )
+    FakeRttSession.event_list = (
+        RttEvent("connected", message="connected"),
+        *(RttEvent("raw", data=chunk) for chunk in chunks),
+        RttEvent("eof", message="RTT TCP connection closed by peer"),
+    )
+    output = tmp_path / "foc-sweep.bin"
+
+    assert (
+        _run(
+            tmp_path,
+            monkeypatch,
+            "raw",
+            "--output",
+            str(output),
+            "--channel",
+            "1",
+            "--port",
+            "19022",
+        )
+        == 0
+    )
+
+    capture = capsysbinary.readouterr()
+    expected = b"".join(chunks)
+    assert cli._RTT_RAW_FILE_BUFFER_SIZE >= 1024 * 1024
+    assert capture.out == b""
+    assert output.read_bytes() == expected
+    assert FakeRttSession.last.request.channel == 1
+    assert FakeRttSession.last.request.port == 19022
+    assert FakeRttSession.last.kwargs["parse_records"] is False
+    assert f"received_bytes={len(expected)}".encode() in capture.err
+    assert f"file_bytes={len(expected)}".encode() in capture.err
+    assert b"disconnect=RTT TCP connection closed by peer" in capture.err
+
+
+def test_rtt_raw_output_reports_receive_error_and_preserves_received_bytes(
+    tmp_path,
+    monkeypatch,
+    capsysbinary,
+):
+    payload = b"\x00\x80\xffpartial"
+    FakeRttSession.event_list = (
+        RttEvent("connected", message="connected"),
+        RttEvent("raw", data=payload),
+        RttEvent("error", message="RTT TCP receive failed: connection reset"),
+    )
+    output = tmp_path / "partial.bin"
+
+    assert _run(tmp_path, monkeypatch, "raw", "--output", str(output)) == 1
+
+    capture = capsysbinary.readouterr()
+    assert output.read_bytes() == payload
+    assert f"received_bytes={len(payload)}".encode() in capture.err
+    assert f"file_bytes={len(payload)}".encode() in capture.err
+    assert b"error=RTT TCP receive failed: connection reset" in capture.err
+
+
+def test_rtt_output_requires_raw_format(tmp_path, monkeypatch):
+    with pytest.raises(SystemExit, match="--output requires --format raw"):
+        _run(
+            tmp_path,
+            monkeypatch,
+            "text",
+            "--output",
+            str(tmp_path / "not-raw.bin"),
+        )
+
+
+def test_rtt_raw_sink_closes_file_when_final_flush_fails(tmp_path):
+    class FlushFailingStream:
+        closed = False
+
+        def flush(self):
+            raise OSError("disk flush failed")
+
+        def close(self):
+            self.closed = True
+
+    stream = FlushFailingStream()
+    sink = cli._RttRawSink(tmp_path / "capture.bin")
+    sink._stream = stream
+
+    with pytest.raises(OSError, match="disk flush failed"):
+        sink.close()
+
+    assert stream.closed
 
 
 def test_rtt_duration_stops_a_connected_session(tmp_path, monkeypatch):

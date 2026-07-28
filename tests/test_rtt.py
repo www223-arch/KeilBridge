@@ -200,6 +200,37 @@ def test_session_emits_structured_levels_and_persists_all_text(tmp_path):
     assert log_path.read_text(encoding="utf-8") == "I/ready\nD/control loop\nV/sample\n"
 
 
+def test_raw_only_session_preserves_bytes_without_text_parsing(tmp_path):
+    payload = b"\x00\x80\xffbinary\n\xff1not-terminal-data\x00"
+    port, server = _start_rtt_server(payload)
+    process = FakeProcess(stdout_lines=("Info : rtt: Found control block at 0x20000000\n",))
+    log_path = tmp_path / "rtt.log"
+    session = RttSession(
+        CONFIG,
+        RttRequest(scan_address=0x20000000, scan_size=0x10000, port=port),
+        log_path,
+        popen_factory=lambda *args, **kwargs: process,
+        connect_timeout=0.5,
+        parse_records=False,
+    )
+
+    session.start()
+    events = []
+    while True:
+        event = session.events.get(timeout=1)
+        events.append(event)
+        if event.kind == "eof":
+            break
+        if event.kind == "error":
+            raise AssertionError(event.message)
+    server.join(timeout=1)
+    session.stop()
+
+    assert b"".join(event.data for event in events if event.kind == "raw") == payload
+    assert not [event for event in events if event.kind == "data"]
+    assert log_path.read_bytes() == b""
+
+
 class FakeClock:
     def __init__(self) -> None:
         self.value = 0.0

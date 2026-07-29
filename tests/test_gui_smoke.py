@@ -1,5 +1,6 @@
 import importlib
 import argparse
+from pathlib import Path
 import queue
 import sys
 from types import SimpleNamespace
@@ -87,6 +88,49 @@ def test_build_flash_request_parses_bin_address(tmp_path):
     request = build_flash_request(firmware, "0x08004000")
 
     assert request.base_address == 0x08004000
+
+
+def test_build_flash_read_request_uses_complete_primary_flash(tmp_path):
+    from keiltool.gui.workbench_model import build_flash_read_request
+
+    facts = SimpleNamespace(
+        flash_origin=0x08000000,
+        flash_size=0x40000,
+        flash_range_complete=True,
+    )
+    output = tmp_path / "board-flash.bin"
+
+    request = build_flash_read_request(facts, output)
+
+    assert request.output == output
+    assert request.address == 0x08000000
+    assert request.size == 0x40000
+
+
+def test_build_flash_read_request_rejects_unknown_flash_range(tmp_path):
+    from keiltool.gui.workbench_model import build_flash_read_request
+
+    facts = SimpleNamespace(
+        flash_origin=None,
+        flash_size=None,
+        flash_range_complete=False,
+    )
+
+    with pytest.raises(ValueError, match="Flash range"):
+        build_flash_read_request(facts, tmp_path / "board-flash.bin")
+
+
+def test_build_flash_read_request_rejects_unverified_project_partition(tmp_path):
+    from keiltool.gui.workbench_model import build_flash_read_request
+
+    facts = SimpleNamespace(
+        flash_origin=0x08005800,
+        flash_size=150 * 1024,
+        flash_range_complete=False,
+    )
+
+    with pytest.raises(ValueError, match="complete physical Flash"):
+        build_flash_read_request(facts, tmp_path / "board-flash.bin")
 
 
 def test_build_rtt_request_uses_project_ram_in_auto_mode():
@@ -241,13 +285,17 @@ def test_high_rate_rtt_poll_yields_to_unrelated_tk_callback():
     assert unrelated_ran == [True]
 
 
-def test_gui_applies_theme_and_filters_structured_rtt_records(tmp_path):
+def test_gui_applies_theme_and_filters_structured_rtt_records(tmp_path, monkeypatch):
     import tkinter as tk
 
+    from keiltool.core.openocd_backend import ConnectionResult
     from keiltool.core.rtt import RttEvent
     from keiltool.core.rtt_log import RttLevel
     from keiltool.gui.app import KeilToolGui
+    from keiltool.gui.operation_feedback import OperationFeedback, ProgressMode
+    from keiltool.gui.rtt_display import RttDisplayBuffer
     from keiltool.gui.settings import SettingsStore
+    from keiltool.gui.state import SessionState
     from keiltool.gui.theme import PALETTE
 
     root = tk.Tk()
@@ -264,6 +312,75 @@ def test_gui_applies_theme_and_filters_structured_rtt_records(tmp_path):
             "ASSERT",
         )
         assert root.cget("background") == PALETTE["background"]
+        assert gui.operation_status.winfo_reqheight() >= 96
+        feedback = OperationFeedback()
+        feedback.begin("检查连接", "OpenOCD 执行中", started_at=10.0)
+        feedback.set_stage("OpenOCD 执行中", ProgressMode.INDETERMINATE)
+        gui.operation_status.update(feedback, now=12.0)
+        assert gui.operation_status.state_var.get() == "执行中"
+        assert gui.operation_status.stage_var.get() == "OpenOCD 执行中"
+        assert gui.operation_status.elapsed_var.get() == "00:00:02"
+        assert str(gui.operation_status.progress.cget("mode")) == "indeterminate"
+
+        feedback.fail("无法连接目标", detail="init mode failed", returncode=1, finished_at=13.0)
+        gui.operation_status.update(feedback, now=20.0)
+        assert gui.operation_status.state_var.get() == "失败"
+        assert gui.operation_status.summary_var.get() == "无法连接目标"
+        assert str(gui.operation_status.copy_button.cget("state")) == "normal"
+
+        gui.output.select_openocd()
+        assert gui.output.notebook.index("current") == 1
+
+        info_dialogs = []
+        error_dialogs = []
+        monkeypatch.setattr(
+            "keiltool.gui.app.messagebox.showinfo",
+            lambda *args, **kwargs: info_dialogs.append((args, kwargs)),
+        )
+        monkeypatch.setattr(
+            "keiltool.gui.app.messagebox.showerror",
+            lambda *args, **kwargs: error_dialogs.append((args, kwargs)),
+        )
+        gui._begin_feedback("检查连接", "准备配置")
+        gui.gate.begin(SessionState.CONNECT)
+        gui._finish_connection(
+            ConnectionResult(
+                success=True,
+                returncode=0,
+                command=["openocd"],
+                stdout="connected\n",
+                stderr="",
+                stdout_log=tmp_path / "connect.out.log",
+                stderr_log=tmp_path / "connect.err.log",
+                findings=[],
+                outcome="succeeded",
+            )
+        )
+        assert gui.operation_feedback.state.value == "succeeded"
+        assert gui.operation_feedback.progress_value == 100
+        assert info_dialogs == []
+
+        gui.output.notebook.select(0)
+        gui._begin_feedback("检查连接", "准备配置")
+        gui.gate.begin(SessionState.CONNECT)
+        gui._finish_connection(
+            ConnectionResult(
+                success=False,
+                returncode=1,
+                command=["openocd"],
+                stdout="",
+                stderr="init mode failed\n",
+                stdout_log=tmp_path / "connect-fail.out.log",
+                stderr_log=tmp_path / "connect-fail.err.log",
+                findings=[],
+                outcome="failed",
+            )
+        )
+        assert gui.operation_feedback.state.value == "failed"
+        assert gui.operation_feedback.returncode == 1
+        assert gui.output.notebook.index("current") == 1
+        assert error_dialogs == []
+        assert gui.controls.flash_read_button.cget("text") == "读取完整 Flash"
         assert gui.output._rtt_text.tag_cget("ERROR", "foreground") == PALETTE["error"]
         label = next(
             value
@@ -275,6 +392,69 @@ def test_gui_applies_theme_and_filters_structured_rtt_records(tmp_path):
         assert gui._current_settings().device_name == "GD32F303CC"
         assert "官方目录" in gui.device_source_var.get()
 
+        project_device = gui._catalog.lookup_any_vendor("GD32F303CC")
+        assert project_device is not None
+        gui.device_source_mode_var.set("project")
+        gui.project_var.set("D:/firmware/app.uvprojx")
+        gui.target_var.set("Dragon_debug")
+        gui.firmware_var.set("D:/firmware/project.hex")
+        gui._facts = SimpleNamespace(
+            device="GD32F303CC",
+            ram_origin=None,
+            ram_size=None,
+            ready=False,
+            openocd_executable="",
+            target_cfg="",
+        )
+        gui._refresh_controls()
+        assert str(gui.controls.device_combo.cget("state")) == "disabled"
+
+        other_label = next(
+            value
+            for value in gui.controls.device_combo.cget("values")
+            if value.startswith("GD32F303ZK ")
+        )
+        gui.device_choice_var.set(other_label)
+        gui._select_catalog_device()
+        assert gui.device_choice_var.get() == gui._device_label(project_device)
+        assert "Keil 工程" in gui.device_source_var.get()
+
+        gui.device_source_mode_var.set("device")
+        gui._change_device_source()
+        assert gui.project_var.get() == "D:/firmware/app.uvprojx"
+        assert gui.target_var.get() == ""
+        assert gui.firmware_var.get() == ""
+        assert gui._visible_fact_inputs().project == ""
+        assert str(gui.controls.target_combo.cget("state")) == "disabled"
+        assert str(gui.controls.device_combo.cget("state")) == "normal"
+
+        gui.device_choice_var.set(other_label)
+        gui._select_catalog_device()
+        independent_inputs = gui._visible_fact_inputs()
+        assert independent_inputs.project == ""
+        assert independent_inputs.target == ""
+        assert independent_inputs.device_name == "GD32F303ZK"
+        gui.firmware_var.set("D:/firmware/device.bin")
+
+        loaded_projects = []
+        monkeypatch.setattr(
+            gui,
+            "_load_project",
+            lambda path, restored=False: loaded_projects.append(path),
+        )
+        gui.device_source_mode_var.set("project")
+        gui._change_device_source()
+        assert gui.target_var.get() == "Dragon_debug"
+        assert gui.firmware_var.get() == "D:/firmware/project.hex"
+        assert gui._visible_fact_inputs().project == "D:/firmware/app.uvprojx"
+        assert loaded_projects == [Path("D:/firmware/app.uvprojx")]
+        saved = gui._current_settings()
+        assert saved.device_source_mode == "project"
+        assert saved.project_firmware == "D:/firmware/project.hex"
+        assert saved.device_firmware == "D:/firmware/device.bin"
+        assert saved.device_name == "GD32F303ZK"
+
+        gui.output.clear_openocd()
         gui.output.append_openocd("alpha\nbeta\n")
         view = gui.output.openocd_view
         view.text.tag_add("sel", "1.0", "1.5")
@@ -293,24 +473,7 @@ def test_gui_applies_theme_and_filters_structured_rtt_records(tmp_path):
 
         assert gui.output._rtt_text.get("1.0", "end-1c") == "I/ready\n"
         assert gui.rtt_visible_counts_var.get() == "1 可见 / 2 缓存"
-    finally:
-        if not gui._destroyed:
-            gui._on_close()
 
-
-def test_gui_removes_visible_record_evicted_from_rtt_cache(tmp_path):
-    import tkinter as tk
-
-    from keiltool.core.rtt import RttEvent
-    from keiltool.core.rtt_log import RttLevel
-    from keiltool.gui.app import KeilToolGui
-    from keiltool.gui.rtt_display import RttDisplayBuffer
-    from keiltool.gui.settings import SettingsStore
-
-    root = tk.Tk()
-    root.withdraw()
-    gui = KeilToolGui(root, settings_store=SettingsStore(tmp_path / "settings.json"))
-    try:
         gui._rtt_display = RttDisplayBuffer(max_records=2)
         gui._clear_rtt_display()
         for text in ("I/one\n", "I/two\n", "I/three\n"):
@@ -320,6 +483,144 @@ def test_gui_removes_visible_record_evicted_from_rtt_cache(tmp_path):
 
         assert gui.output._rtt_text.get("1.0", "end-1c") == "I/two\nI/three\n"
         assert gui.rtt_visible_counts_var.get() == "2 可见 / 2 缓存"
+
+        gui._begin_feedback("RTT 日志采集", "扫描 RTT 控制块")
+        gui.gate.begin(SessionState.RTT_SCAN)
+        gui._handle_rtt_event(RttEvent("connected", message="RTT connected"))
+        assert gui.operation_feedback.state.value == "running"
+        assert gui.operation_feedback.stage == "正在采集 RTT 日志"
+        gui._handle_rtt_event(RttEvent("data", text="I/live\n", level=RttLevel.INFO, terminal=0))
+        assert "字节" in gui.operation_feedback.summary
+        assert "行" in gui.operation_feedback.summary
+        gui.gate.finish()
+
+        stopped_sessions = []
+        session = SimpleNamespace()
+        gui._rtt_session = session
+        gui._rtt_lifecycle.begin_start(session)
+        gui._rtt_lifecycle.start_settled(session)
+        gui.gate.begin(SessionState.RTT)
+        gui._begin_feedback("RTT 日志采集", "正在采集 RTT 日志")
+        gui._rtt_bytes = 128
+        gui._rtt_lines = 4
+        monkeypatch.setattr(gui, "_dispatch_rtt_stop", stopped_sessions.append)
+        gui._stop_rtt()
+        assert stopped_sessions == [session]
+        assert gui.operation_feedback.state.value == "stopping"
+        gui._handle_rtt_event(RttEvent("stopped", message="clean", outcome="clean"))
+        assert gui.operation_feedback.state.value == "succeeded"
+        assert "128 字节 / 4 行" in gui.operation_feedback.summary
+
+        incomplete_session = SimpleNamespace()
+        gui._rtt_session = incomplete_session
+        gui._rtt_lifecycle.begin_start(incomplete_session)
+        gui._rtt_lifecycle.start_settled(incomplete_session)
+        gui.gate.begin(SessionState.RTT)
+        gui._begin_feedback("RTT 日志采集", "正在采集 RTT 日志")
+        gui._handle_rtt_event(
+            RttEvent("stopped", message="cleanup incomplete", outcome="incomplete")
+        )
+        assert gui.operation_feedback.state.value == "incomplete"
+        assert error_dialogs == []
+        gui._handle_rtt_event(RttEvent("stopped", message="clean", outcome="clean"))
+
+        failed_session = SimpleNamespace()
+        gui._rtt_session = failed_session
+        gui._rtt_lifecycle.begin_start(failed_session)
+        gui.gate.begin(SessionState.RTT_SCAN)
+        gui._begin_feedback("RTT 日志采集", "扫描 RTT 控制块")
+        gui._handle_worker_error(
+            "rtt-start-settled",
+            RuntimeError("RTT startup worker failed"),
+            failed_session,
+        )
+        assert gui.operation_feedback.state.value == "failed"
+        assert "RTT startup worker failed" in gui.operation_feedback.detail
+        gui._handle_rtt_event(
+            RttEvent("stopped", message="startup failed", outcome="startup_failed")
+        )
+        assert gui.operation_feedback.state.value == "failed"
+        assert error_dialogs == []
+
+        firmware = tmp_path / "external.bin"
+        firmware.write_bytes(b"version-1")
+        gui.device_source_mode_var.set("device")
+        gui.firmware_var.set(str(firmware))
+        gui._current_firmware_freshness().accept(firmware)
+        firmware.write_bytes(b"version-2-longer")
+        reload_answers = []
+        monkeypatch.setattr(
+            "keiltool.gui.app.messagebox.askyesno",
+            lambda title, message, **_kwargs: reload_answers.append((title, message)) or False,
+        )
+
+        assert gui._check_firmware_external_change() is False
+        assert gui._current_firmware_freshness().stale
+        assert len(reload_answers) == 1
+        assert "SHA-256" in reload_answers[0][1]
+        assert gui._check_firmware_external_change() is False
+        assert len(reload_answers) == 1
+
+        gui._current_firmware_freshness().accept(firmware)
+        firmware.write_bytes(b"version-3")
+        monkeypatch.setattr(
+            "keiltool.gui.app.messagebox.askyesno",
+            lambda *_args, **_kwargs: True,
+        )
+        assert gui._check_firmware_external_change() is True
+        assert not gui._current_firmware_freshness().stale
+
+        read_output = tmp_path / "complete-flash.bin"
+        read_snapshot = SimpleNamespace(
+            facts=SimpleNamespace(
+                device="GD32F303CC",
+                flash_origin=0x08000000,
+                flash_size=0x40000,
+                flash_range_complete=True,
+            ),
+            target=None,
+        )
+        read_config = SimpleNamespace(interface_cfg="interface/stlink.cfg", target_cfg="target/stm32f3x.cfg")
+        dispatched = []
+        monkeypatch.setattr(gui, "_obtain_fresh_snapshot", lambda: read_snapshot)
+        monkeypatch.setattr(gui, "_build_openocd_config", lambda _snapshot: read_config)
+        monkeypatch.setattr(gui, "_log_dir", lambda: tmp_path)
+        monkeypatch.setattr(
+            "keiltool.gui.app.filedialog.asksaveasfilename",
+            lambda **_kwargs: str(read_output),
+        )
+        monkeypatch.setattr(
+            gui,
+            "_begin_one_shot",
+            lambda state, operation: dispatched.append(("begin", state, operation)),
+        )
+        monkeypatch.setattr(
+            gui,
+            "_start_worker",
+            lambda kind, action, *, owner=None: dispatched.append((kind, action, owner)),
+        )
+
+        gui._read_flash()
+
+        assert dispatched[0][1] is SessionState.FLASH_READ
+        assert dispatched[0][2]._background is True
+        assert dispatched[1][0] == "flash-read-result"
+        assert gui.operation_feedback.task == "读取完整 Flash"
+        assert gui.operation_feedback.state.value == "running"
+        assert gui.operation_feedback.stage == "OpenOCD 执行中"
+        assert gui.operation_feedback.log_dir is not None
+
+        error_dialogs.clear()
+        monkeypatch.setattr(
+            gui,
+            "_obtain_fresh_snapshot",
+            lambda: (_ for _ in ()).throw(ValueError("缺少目标芯片配置")),
+        )
+        gui._check_connection()
+        assert gui.operation_feedback.state.value == "failed"
+        assert gui.operation_feedback.summary == "无法检查连接"
+        assert "缺少目标芯片配置" in gui.operation_feedback.detail
+        assert error_dialogs == []
     finally:
         if not gui._destroyed:
             gui._on_close()

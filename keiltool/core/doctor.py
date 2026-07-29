@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass
 from pathlib import Path
+import re
 import subprocess
 from time import strftime
 
@@ -244,15 +245,30 @@ def classify_openocd_log(text: str, openocd_path: str, target: KeilTargetModel, 
             )
         )
 
-    if "pc: 0xfffffffe" in lower or "msp: 0xfffffffc" in lower:
+    pc = _openocd_register_value(text, "pc")
+    msp = _openocd_register_value(text, "msp")
+    flash_ranges = _target_memory_ranges(target, "flash")
+    ram_ranges = _target_memory_ranges(target, "ram")
+    uses_fallback_flash = not flash_ranges
+    uses_fallback_ram = not ram_ranges
+    if not flash_ranges:
+        flash_ranges = [(0x08000000, 0x10000000)]
+    if not ram_ranges:
+        ram_ranges = [(0x20000000, 0x40000000)]
+    range_source = _range_source_text(uses_fallback_flash, uses_fallback_ram)
+
+    if pc == 0xFFFFFFFE or msp == 0xFFFFFFFC:
         findings.append(
             DoctorFinding(
                 stage="debug",
                 severity="fail",
                 code="RESET_VECTOR_APPEARS_EMPTY",
                 title="复位后 PC/MSP 像空 Flash 向量表",
-                message="OpenOCD 已经能连接并 halt，但复位现场显示 PC=0xFFFFFFFE 或 MSP=0xFFFFFFFC，程序通常不会正常进入 Reset_Handler。",
-                evidence=_first_matching_line(text, ["pc: 0xfffffffe", "msp: 0xfffffffc"]),
+                message=(
+                    f"OpenOCD reset/halt 实测 PC={_hex32(pc)}，MSP={_hex32(msp)}。"
+                    "该值符合擦除态向量表的典型结果，程序通常不会正常进入 Reset_Handler。"
+                ),
+                evidence=_first_matching_line(text, ["pc:", "msp:"]),
                 suggestion=(
                     "先执行一次 OpenOCD program/verify，把当前 ELF 烧进 Flash；"
                     "然后再 reset halt 并读取 0x08000000 前两个 word。"
@@ -261,17 +277,56 @@ def classify_openocd_log(text: str, openocd_path: str, target: KeilTargetModel, 
                 ),
             )
         )
-    elif "pc: 0x080" in lower and "msp: 0x200" in lower:
-        findings.append(
-            DoctorFinding(
-                stage="debug",
-                severity="pass",
-                code="RESET_STATE_LOOKS_VALID",
-                title="复位后 PC/MSP 看起来有效",
-                message="OpenOCD reset/halt 后 PC 落在 Flash 区，MSP 落在 SRAM 区，启动向量状态基本可信。",
-                evidence=_first_matching_line(text, ["pc: 0x080", "msp: 0x200"]),
+    elif pc is not None and msp is not None:
+        normalized_pc = pc & ~1
+        pc_in_flash = _address_in_ranges(normalized_pc, flash_ranges)
+        msp_in_ram = _stack_pointer_in_ranges(msp, ram_ranges)
+        flash_text = _format_ranges("FLASH", flash_ranges, upper_inclusive=False)
+        ram_text = _format_ranges("RAM", ram_ranges, upper_inclusive=True)
+        evidence = _first_matching_line(text, ["pc:", "msp:"])
+        if not (pc_in_flash and msp_in_ram):
+            failed = []
+            if not pc_in_flash:
+                failed.append(f"PC={_hex32(pc)} 不在 {flash_text}")
+            if not msp_in_ram:
+                failed.append(f"MSP={_hex32(msp)} 不在 {ram_text}")
+            findings.append(
+                DoctorFinding(
+                    stage="debug",
+                    severity="fail",
+                    code="RESET_STATE_OUTSIDE_MEMORY_RANGES",
+                    title="复位寄存器地址范围检查失败",
+                    message=(
+                        f"OpenOCD reset/halt 实测 PC={_hex32(pc)}，MSP={_hex32(msp)}。"
+                        f"{'；'.join(failed)}。"
+                        f"{range_source}"
+                        "该检查只判定寄存器地址与目标内存范围，不代表烧录内容是否正确。"
+                    ),
+                    evidence=evidence,
+                    suggestion=(
+                        "核对工程 Device、Flash/RAM 布局、启动地址和 OpenOCD target cfg；"
+                        "重新执行 program/verify 后再次读取 PC/MSP。"
+                    ),
+                )
             )
-        )
+        else:
+            findings.append(
+                DoctorFinding(
+                    stage="debug",
+                    severity="pass",
+                    code="RESET_STATE_LOOKS_VALID",
+                    title="复位寄存器地址范围检查通过",
+                    message=(
+                        f"OpenOCD reset/halt 实测 PC={_hex32(pc)}，MSP={_hex32(msp)}。"
+                        f"PC 判定: {_hex32(normalized_pc)} 位于 {flash_text}；"
+                        f"MSP 判定: {_hex32(msp)} 位于 {ram_text}。"
+                        f"{range_source}"
+                        "该项仅验证地址范围，不等同于固件内容或功能正确；"
+                        "烧录成功必须以 OpenOCD program/verify 通过为准。"
+                    ),
+                    evidence=evidence,
+                )
+            )
 
     return findings
 
@@ -415,6 +470,77 @@ def _first_matching_line(text: str, tokens: list[str]) -> str:
         if any(token.lower() in line.lower() for token in tokens):
             lines.append(line)
     return "\n".join(lines[:6])
+
+
+def _openocd_register_value(text: str, register: str) -> int | None:
+    match = re.search(rf"\b{re.escape(register)}\s*:\s*(0x[0-9a-f]+)", text, re.IGNORECASE)
+    return int(match.group(1), 16) if match else None
+
+
+def _target_memory_ranges(target: KeilTargetModel, kind: str) -> list[tuple[int, int]]:
+    ranges: list[tuple[int, int]] = []
+    for region in target.memory:
+        name = region.name.upper()
+        if kind == "flash" and "FLASH" not in name:
+            continue
+        if kind == "ram" and "RAM" not in name:
+            continue
+        origin = _memory_integer(region.origin)
+        length = _memory_integer(region.length)
+        if origin is not None and length is not None and length > 0:
+            ranges.append((origin, origin + length))
+    return ranges
+
+
+def _memory_integer(value: str) -> int | None:
+    normalized = value.strip().upper()
+    multiplier = 1
+    if normalized.endswith("K"):
+        normalized, multiplier = normalized[:-1], 1024
+    elif normalized.endswith("M"):
+        normalized, multiplier = normalized[:-1], 1024 * 1024
+    try:
+        return int(normalized, 0) * multiplier
+    except ValueError:
+        return None
+
+
+def _address_in_ranges(address: int, ranges: list[tuple[int, int]]) -> bool:
+    return any(start <= address < end for start, end in ranges)
+
+
+def _stack_pointer_in_ranges(address: int, ranges: list[tuple[int, int]]) -> bool:
+    return any(start <= address <= end for start, end in ranges)
+
+
+def _format_ranges(
+    name: str,
+    ranges: list[tuple[int, int]],
+    *,
+    upper_inclusive: bool,
+) -> str:
+    closing = "]" if upper_inclusive else ")"
+    values = ", ".join(f"[0x{start:08X}, 0x{end:08X}{closing}" for start, end in ranges)
+    return f"{name} {values}"
+
+
+def _hex32(value: int | None) -> str:
+    return "未读取" if value is None else f"0x{value:08X}"
+
+
+def _range_source_text(fallback_flash: bool, fallback_ram: bool) -> str:
+    fallback = []
+    if fallback_flash:
+        fallback.append("FLASH")
+    if fallback_ram:
+        fallback.append("RAM")
+    if not fallback:
+        return "范围来源: Keil 工程内存定义。"
+    names = "/".join(fallback)
+    return (
+        f"范围来源: 工程未提供 {names} 精确范围，相关判定使用 Cortex-M 通用地址窗口，"
+        "只能作为初步筛查。"
+    )
 
 
 def _sanitize_name(name: str) -> str:

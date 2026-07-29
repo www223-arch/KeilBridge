@@ -16,6 +16,7 @@ FAMILY_TARGET_MAP = {
     "gd32f1": "target/stm32f1x.cfg",
     "gd32f3": "target/stm32f3x.cfg",
     "gd32f4": "target/stm32f4x.cfg",
+    "gd32e2": "target/gd32e23x.cfg",
 }
 
 

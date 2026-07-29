@@ -1,11 +1,18 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import lru_cache
 import os
 from pathlib import Path
 import shutil
 
-from keiltool.core.device_catalog import CatalogDevice, CatalogMemory
+from keiltool.core.device_catalog import (
+    CatalogDevice,
+    CatalogMemory,
+    DeviceCatalog,
+    load_embedded_catalog,
+)
+from keiltool.core.device_import import load_user_catalog
 from keiltool.core.keil_parser import parse_uvprojx
 from keiltool.core.openocd_target_resolver import resolve_openocd_target
 from keiltool.core.project_model import KeilTargetModel, MemoryRegion
@@ -26,6 +33,10 @@ class ProjectTargetFacts:
     target_name: str
     device: str
     flash_summary: str
+    flash_origin: int | None
+    flash_size: int | None
+    flash_range_complete: bool
+    flash_range_source: str
     ram_summary: str
     ram_origin: int | None
     ram_size: int | None
@@ -65,6 +76,7 @@ def resolve_target_facts(
     openocd_path: str | Path = "",
     scripts_dir: str | Path = "",
     target_override: str | Path = "",
+    catalog_device: CatalogDevice | None = None,
 ) -> ProjectTargetFacts:
     """Resolve GUI facts while refusing every unverified OpenOCD target cfg."""
 
@@ -75,11 +87,37 @@ def resolve_target_facts(
     resolution_reason = "; ".join(item for item in (reason, *readiness_diagnostics) if item)
     flash_regions = _regions_named(target.memory, "FLASH")
     ram_regions = _regions_named(target.memory, "RAM")
+    project_flash = flash_regions[0] if flash_regions else None
+    catalog_match = catalog_device or _lookup_target_catalog_device(target)
+    catalog_flash_regions = _catalog_flash_regions(catalog_match) if catalog_match else []
+    main_catalog_flash = catalog_flash_regions[0] if catalog_flash_regions else None
     main_ram = ram_regions[0] if ram_regions else None
+    if main_catalog_flash is not None:
+        flash_summary = f"芯片 {_catalog_summary(catalog_flash_regions)}"
+        project_summary = _summary(flash_regions)
+        if project_summary and (
+            _integer_value(project_flash.origin) != main_catalog_flash.start
+            or _size_value(project_flash.length) != main_catalog_flash.size
+        ):
+            flash_summary += f" | 工程 {project_summary}"
+        flash_origin = main_catalog_flash.start
+        flash_size = main_catalog_flash.size
+        flash_range_complete = True
+        flash_range_source = "device_catalog"
+    else:
+        flash_summary = f"工程范围（未确认整片）: {_summary(flash_regions)}"
+        flash_origin = _integer_value(project_flash.origin) if project_flash else None
+        flash_size = _size_value(project_flash.length) if project_flash else None
+        flash_range_complete = False
+        flash_range_source = "keil_irom"
     return ProjectTargetFacts(
         target_name=target.name,
         device=target.device,
-        flash_summary=_summary(flash_regions),
+        flash_summary=flash_summary,
+        flash_origin=flash_origin,
+        flash_size=flash_size,
+        flash_range_complete=flash_range_complete,
+        flash_range_source=flash_range_source,
         ram_summary=_summary(ram_regions),
         ram_origin=_integer_value(main_ram.origin) if main_ram else None,
         ram_size=_size_value(main_ram.length) if main_ram else None,
@@ -112,6 +150,10 @@ def facts_from_catalog_device(
     elif device.openocd_target:
         target_cfg, override_status, reason = _resolve_override(device.openocd_target, scripts)
         status = "catalog_verified" if override_status == "override_verified" else f"catalog_{override_status}"
+        reason = reason.replace(
+            "OpenOCD target override",
+            "Device catalog OpenOCD target mapping",
+        )
     else:
         target_cfg = ""
         status = "catalog_unresolved"
@@ -121,9 +163,18 @@ def facts_from_catalog_device(
         )
 
     readiness_diagnostics = _validate_hardware_paths(executable, scripts, INTERFACE_CFG, target_cfg)
-    flash_regions = [item for item in device.memory if "x" in item.access.lower()]
+    flash_regions = [
+        item
+        for item in device.memory
+        if "x" in item.access.lower() and "w" not in item.access.lower()
+    ]
     ram_regions = [item for item in device.memory if "w" in item.access.lower()]
+    ordered_flash = sorted(
+        flash_regions,
+        key=lambda item: (not item.startup, not item.default, item.start),
+    )
     ordered_ram = sorted(ram_regions, key=lambda item: (not item.default, item.start))
+    main_flash = ordered_flash[0] if ordered_flash else None
     main_ram = ordered_ram[0] if ordered_ram else None
     informational = () if main_ram else ("Device catalog does not provide writable RAM for automatic RTT scanning.",)
     resolution_reason = "; ".join(
@@ -133,6 +184,10 @@ def facts_from_catalog_device(
         target_name="",
         device=device.device,
         flash_summary=_catalog_summary(flash_regions),
+        flash_origin=main_flash.start if main_flash else None,
+        flash_size=main_flash.size if main_flash else None,
+        flash_range_complete=main_flash is not None,
+        flash_range_source="device_catalog" if main_flash else "unresolved",
         ram_summary=_catalog_summary(ram_regions),
         ram_origin=main_ram.start if main_ram else None,
         ram_size=main_ram.size if main_ram else None,
@@ -226,6 +281,42 @@ def _catalog_summary(regions: list[CatalogMemory]) -> str:
         f"{region.name}: 0x{region.start:08X} (0x{region.size:X})"
         for region in regions
     )
+
+
+def _catalog_flash_regions(device: CatalogDevice) -> list[CatalogMemory]:
+    regions = [
+        item
+        for item in device.memory
+        if "x" in item.access.lower() and "w" not in item.access.lower()
+    ]
+    return sorted(
+        regions,
+        key=lambda item: (not item.startup, not item.default, item.start),
+    )
+
+
+def _lookup_target_catalog_device(target: KeilTargetModel) -> CatalogDevice | None:
+    if not target.device:
+        return None
+    from keiltool.gui.settings import default_devices_path
+
+    catalog = _project_device_catalog(str(default_devices_path().resolve()))
+    if target.vendor:
+        selected = catalog.lookup(target.vendor, target.device)
+        if selected is not None:
+            return selected
+    return catalog.lookup_any_vendor(target.device)
+
+
+@lru_cache(maxsize=4)
+def _project_device_catalog(user_catalog_path: str) -> DeviceCatalog:
+    embedded = load_embedded_catalog()
+    user = load_user_catalog(Path(user_catalog_path))
+    return DeviceCatalog(embedded=embedded.devices, user=user.devices)
+
+
+def clear_project_device_catalog_cache() -> None:
+    _project_device_catalog.cache_clear()
 
 
 def _default_catalog_log_dir() -> Path:

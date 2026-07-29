@@ -3,20 +3,36 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import queue
 import subprocess
+import sys
+import time
 from dataclasses import asdict
 from pathlib import Path
+from typing import BinaryIO
 
 from .core.armclang_workspace import configure_armclang_workspace
 from .core.backend_recommender import recommend_backends, render_backend_recommendation_markdown
 from .core.diagnostics import diagnose_target
+from .core.cli_output import operation_payload, render_operation
 from .core.doctor import render_flash_doctor_markdown, run_flash_doctor
 from .core.debug_only_workspace import configure_debug_only_workspace
 from .core.elf_doctor import render_elf_doctor_markdown, run_elf_doctor
 from .core.keil_parser import parse_uvprojx
 from .core.keil_cli import run_keil_cli
+from .core.hardware_context import HardwareSelection, resolve_hardware_context
 from .core.openocd_target_resolver import resolve_openocd_target
-from .core.openocd_backend import FlashRequest, OpenOcdConfig, parse_address, run_flash
+from .core.openocd_backend import (
+    FlashReadRequest,
+    FlashRequest,
+    OpenOcdConfig,
+    parse_address,
+    run_connection_check,
+    run_flash,
+    run_flash_read,
+)
+from .core.session_logs import create_session_logs
+from .core.rtt import RttEvent, RttRequest, RttSession
 from .core.scatter import generate_gnu_ld, parse_scatter_memory
 from .core.tool_finder import armclang_environment, find_arm_gcc_root, find_armclang_tools, find_cmake, find_ninja, find_openocd, find_openocd_scripts
 from .core.workspace import configure_workspace
@@ -274,6 +290,394 @@ def cmd_openocd(args: argparse.Namespace) -> int:
     return 0
 
 
+def _hardware_selection(args: argparse.Namespace) -> HardwareSelection:
+    project = getattr(args, "project", None)
+    device = str(getattr(args, "device", "") or "")
+    target = str(getattr(args, "target", "") or "")
+    vendor = str(getattr(args, "vendor", "") or "")
+    if device and target:
+        raise SystemExit("--target is valid only with --project.")
+    if project and vendor:
+        raise SystemExit("--vendor is valid only with --device.")
+    try:
+        return HardwareSelection(
+            project=Path(project) if project else None,
+            target=target,
+            device=device,
+            vendor=vendor,
+            openocd=str(getattr(args, "openocd", "") or ""),
+            scripts=str(getattr(args, "scripts", "") or ""),
+            target_cfg=str(getattr(args, "target_cfg", "") or ""),
+            logs_dir=(
+                Path(getattr(args, "logs_dir"))
+                if getattr(args, "logs_dir", None)
+                else None
+            ),
+        )
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
+
+
+def _resolve_hardware(args: argparse.Namespace):
+    try:
+        return resolve_hardware_context(_hardware_selection(args))
+    except (OSError, ValueError) as exc:
+        raise SystemExit(str(exc)) from exc
+
+
+def _run_hardware_operation(
+    command_name: str,
+    context: object,
+    args: argparse.Namespace,
+    action,
+    *,
+    metadata: dict[str, object] | None = None,
+    artifact=None,
+) -> int:
+    config = getattr(context, "config")
+    log_context = create_session_logs(
+        getattr(context, "logs_dir"),
+        device=str(getattr(context, "device")),
+        task=command_name.upper().replace("-", "_"),
+        metadata={
+            "target_cfg": str(getattr(config, "target_cfg", "")),
+            "interface_cfg": str(getattr(config, "interface_cfg", "")),
+            **(metadata or {}),
+        },
+    )
+    try:
+        result = action(log_context)
+    except (OSError, ValueError) as exc:
+        log_context.finalize("operation_error")
+        raise SystemExit(str(exc)) from exc
+    outcome = str(getattr(result, "outcome", "failed"))
+    log_context.finalize(outcome)
+    artifact_payload = artifact(result) if artifact is not None else None
+    payload = operation_payload(
+        command_name,
+        context,
+        result,
+        artifact=artifact_payload,
+    )
+    render_operation(payload, str(getattr(args, "output_format", "text")))
+    return 0 if bool(getattr(result, "success", False)) else int(getattr(result, "returncode", 0)) or 1
+
+
+def cmd_connect(args: argparse.Namespace) -> int:
+    context = _resolve_hardware(args)
+    return _run_hardware_operation(
+        "connect",
+        context,
+        args,
+        lambda logs: run_connection_check(
+            context.config,
+            logs.directory,
+            cwd=context.workspace_root,
+            target=context.target,
+            target_name=context.target_name,
+            stdout_log_path=logs.stdout_log,
+            stderr_log_path=logs.stderr_log,
+        ),
+    )
+
+
+def cmd_flash_read(args: argparse.Namespace) -> int:
+    context = _resolve_hardware(args)
+    if context.flash is None:
+        raise SystemExit("The selected target does not provide a verified primary Flash range.")
+    request = FlashReadRequest(
+        output=Path(args.output).expanduser(),
+        address=context.flash.origin,
+        size=context.flash.size,
+    )
+    return _run_hardware_operation(
+        "flash-read",
+        context,
+        args,
+        lambda logs: run_flash_read(
+            context.config,
+            request,
+            logs.directory,
+            cwd=context.workspace_root,
+            target=context.target,
+            target_name=context.target_name,
+            stdout_log_path=logs.stdout_log,
+            stderr_log_path=logs.stderr_log,
+        ),
+        metadata={
+            "output": str(request.output.expanduser().resolve()),
+            "address": f"0x{request.address:08X}",
+            "size": request.size,
+        },
+        artifact=lambda result: {
+            "path": str(result.output),
+            "address": f"0x{result.address:08X}",
+            "requested_size": result.requested_size,
+            "size": result.actual_size,
+            "sha256": result.sha256,
+        },
+    )
+
+
+def _cmd_flash_hardware(args: argparse.Namespace) -> int:
+    firmware_arg = getattr(args, "firmware", None)
+    if firmware_arg is None:
+        raise SystemExit("Device-based flash requires --firmware with a .hex or .bin file.")
+    if getattr(args, "probe", None) not in {None, "", "stlink"}:
+        raise SystemExit("HEX/BIN hardware flash supports only the ST-Link OpenOCD probe.")
+    context = _resolve_hardware(args)
+    request = FlashRequest(
+        firmware=Path(firmware_arg).expanduser(),
+        base_address=args.base_address,
+    )
+
+
+_RTT_RAW_FILE_BUFFER_SIZE = 1024 * 1024
+
+
+class _RttRawSink:
+    def __init__(self, output: Path | None) -> None:
+        self.output = output.expanduser() if output is not None else None
+        self.received_bytes = 0
+        self.file_bytes = 0
+        self._stream: BinaryIO | None = None
+
+    def open(self) -> None:
+        if self.output is None:
+            return
+        self.output.parent.mkdir(parents=True, exist_ok=True)
+        self._stream = self.output.open("wb", buffering=_RTT_RAW_FILE_BUFFER_SIZE)
+
+    def write(self, data: bytes) -> None:
+        self.received_bytes += len(data)
+        if self._stream is None:
+            stream = sys.stdout.buffer
+            stream.write(data)
+            stream.flush()
+            return
+        written = self._stream.write(data)
+        if written != len(data):
+            raise OSError(f"Short RTT raw write: expected {len(data)} bytes, wrote {written}.")
+        self.file_bytes += written
+
+    def close(self) -> None:
+        stream = self._stream
+        self._stream = None
+        close_error: OSError | None = None
+        if stream is not None:
+            try:
+                stream.flush()
+            except OSError as exc:
+                close_error = exc
+            try:
+                stream.close()
+            except OSError as exc:
+                if close_error is None:
+                    close_error = exc
+        if self.output is not None and self.output.exists():
+            self.file_bytes = self.output.stat().st_size
+        if close_error is not None:
+            raise close_error
+
+
+def _write_rtt_payload(
+    event: RttEvent,
+    output_format: str,
+    raw_sink: _RttRawSink | None = None,
+) -> None:
+    if output_format == "raw":
+        if event.kind == "raw" and event.data:
+            if raw_sink is None:
+                raw_sink = _RttRawSink(None)
+            raw_sink.write(event.data)
+        return
+    if event.kind != "data":
+        return
+    if output_format == "jsonl":
+        payload = {
+            "schema": "keiltool.rtt.v1",
+            "type": "data",
+            "level": event.level.name if event.level is not None else "INFO",
+            "terminal": event.terminal if event.terminal is not None else 0,
+            "text": event.text,
+        }
+        print(json.dumps(payload, ensure_ascii=False), flush=True)
+        return
+    print(event.text, end="", flush=True)
+
+
+def _persist_rtt_openocd_event(event: RttEvent, log_context) -> None:
+    if event.kind != "openocd" or event.stream not in {"stdout", "stderr"}:
+        return
+    path = log_context.stdout_log if event.stream == "stdout" else log_context.stderr_log
+    with path.open("a", encoding="utf-8", newline="") as stream:
+        stream.write(event.text)
+
+
+def cmd_rtt(args: argparse.Namespace) -> int:
+    if args.output is not None and args.format != "raw":
+        raise SystemExit("--output requires --format raw.")
+    context = _resolve_hardware(args)
+    if args.address is None:
+        if context.ram is None:
+            raise SystemExit("The selected target does not provide a verified RAM range for RTT scan.")
+        scan_address = context.ram.origin
+        scan_size = context.ram.size
+    else:
+        scan_address = args.address
+        scan_size = args.scan_size if args.scan_size is not None else 0x100
+    request = RttRequest(
+        scan_address=scan_address,
+        scan_size=scan_size,
+        port=args.port,
+        channel=args.channel,
+    )
+    log_context = create_session_logs(
+        context.logs_dir,
+        device=context.device,
+        task="RTT",
+        metadata={
+            "target_cfg": context.config.target_cfg,
+            "scan_address": f"0x{request.scan_address:08X}",
+            "scan_size": request.scan_size,
+            "channel": request.channel,
+            "port": request.port,
+            "format": args.format,
+        },
+    )
+    session = RttSession(
+        context.config,
+        request,
+        log_context.rtt_log,
+        connect_timeout=args.connect_timeout,
+        stop_timeout=args.stop_timeout,
+        parse_records=args.format != "raw",
+    )
+    raw_sink = _RttRawSink(args.output) if args.format == "raw" else None
+    if raw_sink is not None:
+        try:
+            raw_sink.open()
+        except OSError as exc:
+            raise SystemExit(f"Unable to open RTT raw output: {exc}") from exc
+    print(f"RTT log: {log_context.rtt_log}", file=sys.stderr, flush=True)
+    print(f"Session metadata: {log_context.metadata_log}", file=sys.stderr, flush=True)
+    if raw_sink is not None and raw_sink.output is not None:
+        print(f"RTT raw output: {raw_sink.output.resolve()}", file=sys.stderr, flush=True)
+    connected = False
+    failed = False
+    interrupted = False
+    cleanup_outcome = "clean"
+    error_message = "none"
+    disconnect_message = "none"
+    deadline = time.monotonic() + args.duration if args.duration is not None else None
+    try:
+        session.start()
+        while True:
+            if deadline is not None and time.monotonic() >= deadline:
+                break
+            timeout = 0.1
+            if deadline is not None:
+                timeout = max(0.001, min(timeout, deadline - time.monotonic()))
+            try:
+                event = session.events.get(timeout=timeout)
+            except queue.Empty:
+                continue
+            _persist_rtt_openocd_event(event, log_context)
+            _write_rtt_payload(event, args.format, raw_sink)
+            if event.kind == "connected":
+                connected = True
+                print(event.message, file=sys.stderr, flush=True)
+            elif event.kind == "error":
+                failed = True
+                error_message = event.message or "unspecified RTT error"
+                print(f"RTT error: {event.message}", file=sys.stderr, flush=True)
+                break
+            elif event.kind == "eof":
+                disconnect_message = event.message or "RTT TCP connection closed"
+                break
+            elif event.kind == "stopped":
+                cleanup_outcome = event.outcome or "clean"
+                failed = failed or cleanup_outcome == "incomplete"
+                break
+    except KeyboardInterrupt:
+        interrupted = True
+        print("RTT interrupted; stopping session.", file=sys.stderr, flush=True)
+    except OSError as exc:
+        failed = True
+        error_message = f"raw output write failed: {exc}"
+        print(f"RTT error: {error_message}", file=sys.stderr, flush=True)
+    finally:
+        session.stop()
+        session.wait(timeout=args.stop_timeout + 1.0)
+        while True:
+            try:
+                event = session.events.get_nowait()
+            except queue.Empty:
+                break
+            _persist_rtt_openocd_event(event, log_context)
+            try:
+                _write_rtt_payload(event, args.format, raw_sink)
+            except OSError as exc:
+                failed = True
+                error_message = f"raw output write failed: {exc}"
+                print(f"RTT cleanup error: {error_message}", file=sys.stderr, flush=True)
+            if event.kind == "error":
+                failed = True
+                error_message = event.message or "unspecified RTT cleanup error"
+                print(f"RTT cleanup error: {event.message}", file=sys.stderr, flush=True)
+            elif event.kind == "eof":
+                disconnect_message = event.message or "RTT TCP connection closed"
+            elif event.kind == "stopped":
+                cleanup_outcome = event.outcome or cleanup_outcome
+                failed = failed or cleanup_outcome == "incomplete"
+        if raw_sink is not None:
+            try:
+                raw_sink.close()
+            except OSError as exc:
+                failed = True
+                error_message = f"raw output close failed: {exc}"
+                print(f"RTT cleanup error: {error_message}", file=sys.stderr, flush=True)
+        outcome = "interrupted" if interrupted else "failed" if failed or not connected else cleanup_outcome
+        log_context.finalize(outcome)
+        if raw_sink is not None:
+            print(
+                "RTT capture summary: "
+                f"received_bytes={raw_sink.received_bytes} "
+                f"file_bytes={raw_sink.file_bytes} "
+                f"error={error_message} "
+                f"disconnect={disconnect_message} "
+                f"cleanup={cleanup_outcome}",
+                file=sys.stderr,
+                flush=True,
+            )
+    if interrupted:
+        return 130
+    return 1 if failed or not connected else 0
+    return _run_hardware_operation(
+        "flash",
+        context,
+        args,
+        lambda logs: run_flash(
+            context.config,
+            request,
+            logs.directory,
+            cwd=context.workspace_root,
+            target=context.target,
+            target_name=context.target_name,
+            stdout_log_path=logs.stdout_log,
+            stderr_log_path=logs.stderr_log,
+        ),
+        metadata={
+            "firmware": str(request.firmware.expanduser().resolve()),
+            "base_address": f"0x{request.base_address:08X}",
+        },
+        artifact=lambda _result: {
+            "path": str(request.firmware.expanduser().resolve()),
+            "base_address": f"0x{request.base_address:08X}",
+        },
+    )
+
+
 def cmd_flash(args: argparse.Namespace) -> int:
     """通过 ST-Link/OpenOCD 下载现有 HEX 或 BIN 固件。
 
@@ -281,6 +685,9 @@ def cmd_flash(args: argparse.Namespace) -> int:
     这里提供明确的 flash 命令，内部调用 OpenOCD `program <firmware> verify reset exit`，
     成功标准就是 OpenOCD 返回 0 且输出 program/verify 通过。
     """
+
+    if getattr(args, "device", "") or getattr(args, "firmware", None) is not None:
+        return _cmd_flash_hardware(args)
 
     model = parse_uvprojx(args.project)
     target = _pick_target(model, args.target)
@@ -523,6 +930,29 @@ def _resolve_build_dirs(args: argparse.Namespace) -> tuple[Path, Path]:
     return generated_dir, build_dir
 
 
+def _add_hardware_arguments(
+    parser: argparse.ArgumentParser,
+    *,
+    include_output_format: bool = True,
+) -> None:
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument("--project", type=Path, help="Path to a Keil .uvprojx project")
+    source.add_argument("--device", default="", help="Exact device name from the device catalog")
+    parser.add_argument("--target", help="Keil target name; valid with --project")
+    parser.add_argument("--vendor", default="", help="Optional exact device vendor; valid with --device")
+    parser.add_argument("--openocd", help="Path to OpenOCD executable")
+    parser.add_argument("--scripts", help="Path to OpenOCD scripts directory")
+    parser.add_argument("--target-cfg", help="Verified OpenOCD target cfg override")
+    parser.add_argument("--logs-dir", type=Path, help="Hardware session log root")
+    if include_output_format:
+        parser.add_argument(
+            "--output-format",
+            choices=["text", "json"],
+            default="text",
+            help="Command result format (default: text)",
+        )
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="k2c", description="Keil external CMake adapter")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -575,17 +1005,73 @@ def build_parser() -> argparse.ArgumentParser:
     openocd_cmd.add_argument("--run", action="store_true", help="Run OpenOCD instead of only printing the command")
     openocd_cmd.set_defaults(func=cmd_openocd)
 
+    connect_cmd = subparsers.add_parser(
+        "connect",
+        help="Check ST-Link/OpenOCD connectivity without resetting the target",
+    )
+    _add_hardware_arguments(connect_cmd)
+    connect_cmd.set_defaults(func=cmd_connect)
+
+    flash_read_cmd = subparsers.add_parser(
+        "flash-read",
+        help="Read the complete verified primary Flash range without resetting",
+    )
+    _add_hardware_arguments(flash_read_cmd)
+    flash_read_cmd.add_argument("--output", required=True, type=Path, help="Output .bin image")
+    flash_read_cmd.set_defaults(func=cmd_flash_read)
+
     flash_cmd = subparsers.add_parser("flash", help="Program the generated ELF or an existing HEX/BIN file with OpenOCD")
-    flash_cmd.add_argument("--project", required=True, type=Path, help="Path to .uvprojx")
-    flash_cmd.add_argument("--target", help="Keil target name")
+    _add_hardware_arguments(flash_cmd)
     flash_cmd.add_argument("--probe", help="Probe profile for legacy generated ELF; HEX/BIN supports ST-Link.")
     flash_cmd.add_argument("--workspace-root", help="Override .keilbridge location; defaults to inferred Keil project root")
-    flash_cmd.add_argument("--openocd", help="Path to openocd executable")
     image_group = flash_cmd.add_mutually_exclusive_group()
     image_group.add_argument("--elf", type=Path, help="Override ELF path; defaults to .keilbridge/build/gcc-debug/<target>.elf")
     image_group.add_argument("--firmware", type=Path, help="Existing .hex or .bin firmware file")
     flash_cmd.add_argument("--base-address", type=parse_address, default=0x08000000, help="BIN flash base address (default: 0x08000000)")
     flash_cmd.set_defaults(func=cmd_flash)
+
+    rtt_cmd = subparsers.add_parser(
+        "rtt",
+        help="Stream SEGGER RTT through ST-Link/OpenOCD without resetting the target",
+    )
+    _add_hardware_arguments(rtt_cmd, include_output_format=False)
+    rtt_cmd.add_argument(
+        "--format",
+        choices=["text", "jsonl", "raw"],
+        default="text",
+        help="RTT payload format written to stdout (default: text)",
+    )
+    rtt_cmd.add_argument(
+        "--output",
+        type=Path,
+        help="Raw binary output file; requires --format raw and suppresses raw stdout",
+    )
+    rtt_cmd.add_argument("--address", type=parse_address, help="Manual RTT scan start address")
+    rtt_cmd.add_argument(
+        "--scan-size",
+        type=parse_address,
+        help="Manual RTT scan size (default: 0x100 with --address)",
+    )
+    rtt_cmd.add_argument("--channel", type=int, default=0, help="RTT up-channel (default: 0)")
+    rtt_cmd.add_argument("--port", type=int, default=19021, help="Local RTT TCP port")
+    rtt_cmd.add_argument(
+        "--duration",
+        type=float,
+        help="Stop after this many seconds; default captures until Ctrl+C or EOF",
+    )
+    rtt_cmd.add_argument(
+        "--connect-timeout",
+        type=float,
+        default=10.0,
+        help="Seconds to wait for RTT control block (default: 10)",
+    )
+    rtt_cmd.add_argument(
+        "--stop-timeout",
+        type=float,
+        default=2.0,
+        help="Bounded OpenOCD cleanup timeout (default: 2)",
+    )
+    rtt_cmd.set_defaults(func=cmd_rtt)
 
     gui_cmd = subparsers.add_parser("gui", help="Launch the ST-Link flash and RTT workbench")
     gui_cmd.set_defaults(func=cmd_gui)

@@ -9,13 +9,16 @@ import threading
 import pytest
 
 from keiltool.core.openocd_backend import (
+    FlashReadRequest,
     FlashRequest,
     OpenOcdConfig,
     build_connection_command,
     build_flash_command,
+    build_flash_read_command,
     parse_address,
     run_connection_check,
     run_flash,
+    run_flash_read,
 )
 
 
@@ -76,6 +79,66 @@ def test_build_flash_command_quotes_tcl_metacharacters_in_firmware_path(tmp_path
 
     path = firmware.resolve().as_posix()
     assert command[-1] == f'program "{path.replace("$", "\\$").replace("[", "\\[").replace("]", "\\]")}" verify reset exit'
+
+
+def test_build_flash_read_command_preserves_state_and_never_resets(tmp_path):
+    output = tmp_path / "backup [board one].bin"
+
+    command = build_flash_read_command(
+        CONFIG,
+        FlashReadRequest(output=output, address=0x08000000, size=0x40000),
+    )
+
+    script = command[-1]
+    assert "curstate" in script
+    assert "halt" in script
+    assert "dump_image" in script
+    assert "0x08000000 0x40000" in script
+    assert "resume" in script
+    assert "catch" in script
+    assert "reset" not in script.lower()
+    assert "\\[board one\\]" in script
+
+
+def test_run_flash_read_requires_exact_size_and_reports_sha256(tmp_path):
+    output = tmp_path / "full.bin"
+    payload = bytes(range(256)) * 4
+
+    def runner(command, **kwargs):
+        output.write_bytes(payload)
+        return FakeCompletedProcess(0, "dumped 1024 bytes\n", "")
+
+    result = run_flash_read(
+        CONFIG,
+        FlashReadRequest(output=output, address=0x08000000, size=len(payload)),
+        tmp_path / "logs",
+        runner=runner,
+    )
+
+    assert result.success is True
+    assert result.actual_size == len(payload)
+    assert result.sha256 == __import__("hashlib").sha256(payload).hexdigest()
+    assert result.output == output
+
+
+def test_run_flash_read_rejects_partial_output_but_keeps_evidence(tmp_path):
+    output = tmp_path / "partial.bin"
+
+    def runner(command, **kwargs):
+        output.write_bytes(b"partial")
+        return FakeCompletedProcess(0, "dumped bytes\n", "")
+
+    result = run_flash_read(
+        CONFIG,
+        FlashReadRequest(output=output, address=0x08000000, size=0x100),
+        tmp_path / "logs",
+        runner=runner,
+    )
+
+    assert result.success is False
+    assert result.actual_size == len(b"partial")
+    assert output.read_bytes() == b"partial"
+    assert any(item.code == "OPENOCD_FLASH_READ_SIZE_MISMATCH" for item in result.findings)
 
 
 def test_connection_check_does_not_reset_or_halt():
@@ -246,6 +309,23 @@ class HungProcess:
         return self.returncode
 
 
+class ImmediateProcess:
+    def __init__(self) -> None:
+        self.returncode = 0
+
+    def communicate(self, timeout=None):
+        return ("", "")
+
+    def poll(self):
+        return self.returncode
+
+    def terminate(self):
+        self.returncode = 0
+
+    def kill(self):
+        self.returncode = -9
+
+
 class KillFailingProcess(HungProcess):
     def communicate(self, timeout=None):
         self.communicate_entered.set()
@@ -389,3 +469,54 @@ def test_launch_failure_returns_structured_result_with_command_and_logs(tmp_path
     evidence = result.stderr_log.read_text(encoding="utf-8")
     assert "鏃犳硶鍚姩 OpenOCD" in evidence
     assert "Command:" in evidence
+
+
+def test_background_openocd_operation_passes_hidden_window_options(tmp_path, monkeypatch):
+    from keiltool.core import openocd_backend
+    from keiltool.core.openocd_backend import OpenOcdOperation
+
+    process = ImmediateProcess()
+    captured = {}
+    monkeypatch.setattr(
+        openocd_backend,
+        "background_process_kwargs",
+        lambda: {"creationflags": 0x08000000},
+    )
+
+    def popen(command, **kwargs):
+        captured.update(kwargs)
+        return process
+
+    result = run_connection_check(
+        CONFIG,
+        tmp_path,
+        operation=OpenOcdOperation(popen_factory=popen, background=True),
+    )
+
+    assert result.returncode == 0
+    assert captured["creationflags"] == 0x08000000
+
+
+def test_foreground_openocd_operation_keeps_cli_launch_options_unchanged(tmp_path, monkeypatch):
+    from keiltool.core import openocd_backend
+    from keiltool.core.openocd_backend import OpenOcdOperation
+
+    process = ImmediateProcess()
+    captured = {}
+    monkeypatch.setattr(
+        openocd_backend,
+        "background_process_kwargs",
+        lambda: {"creationflags": 0x08000000},
+    )
+
+    def popen(command, **kwargs):
+        captured.update(kwargs)
+        return process
+
+    run_connection_check(
+        CONFIG,
+        tmp_path,
+        operation=OpenOcdOperation(popen_factory=popen),
+    )
+
+    assert "creationflags" not in captured

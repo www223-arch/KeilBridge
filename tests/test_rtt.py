@@ -190,12 +190,45 @@ def test_session_emits_structured_levels_and_persists_all_text(tmp_path):
     session.stop()
 
     data = [event for event in events if event.kind == "data"]
+    raw = b"".join(event.data for event in events if event.kind == "raw")
     assert [(event.level, event.terminal, event.text) for event in data] == [
         (RttLevel.INFO, 0, "I/ready\n"),
         (RttLevel.DEBUG, 1, "D/control loop\n"),
         (RttLevel.VERBOSE, 2, "V/sample\n"),
     ]
+    assert raw == payload
     assert log_path.read_text(encoding="utf-8") == "I/ready\nD/control loop\nV/sample\n"
+
+
+def test_raw_only_session_preserves_bytes_without_text_parsing(tmp_path):
+    payload = b"\x00\x80\xffbinary\n\xff1not-terminal-data\x00"
+    port, server = _start_rtt_server(payload)
+    process = FakeProcess(stdout_lines=("Info : rtt: Found control block at 0x20000000\n",))
+    log_path = tmp_path / "rtt.log"
+    session = RttSession(
+        CONFIG,
+        RttRequest(scan_address=0x20000000, scan_size=0x10000, port=port),
+        log_path,
+        popen_factory=lambda *args, **kwargs: process,
+        connect_timeout=0.5,
+        parse_records=False,
+    )
+
+    session.start()
+    events = []
+    while True:
+        event = session.events.get(timeout=1)
+        events.append(event)
+        if event.kind == "eof":
+            break
+        if event.kind == "error":
+            raise AssertionError(event.message)
+    server.join(timeout=1)
+    session.stop()
+
+    assert b"".join(event.data for event in events if event.kind == "raw") == payload
+    assert not [event for event in events if event.kind == "data"]
+    assert log_path.read_bytes() == b""
 
 
 class FakeClock:
@@ -450,6 +483,35 @@ def test_stop_before_start_prevents_openocd_launch(tmp_path):
         session.start()
 
     assert launches == []
+
+
+def test_background_rtt_session_passes_hidden_window_options(tmp_path, monkeypatch):
+    from keiltool.core import rtt
+
+    process = FakeProcess(returncode=0)
+    captured = {}
+    monkeypatch.setattr(
+        rtt,
+        "background_process_kwargs",
+        lambda: {"creationflags": 0x08000000},
+    )
+
+    def popen(*args, **kwargs):
+        captured.update(kwargs)
+        return process
+
+    session = RttSession(
+        CONFIG,
+        RttRequest(scan_address=0x20000000, scan_size=0x10000),
+        tmp_path / "rtt.log",
+        popen_factory=popen,
+        background=True,
+    )
+
+    session.start()
+    session.stop()
+
+    assert captured["creationflags"] == 0x08000000
 
 
 def test_stop_handles_process_exit_race_and_emits_one_clean_event(tmp_path):

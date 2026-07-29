@@ -25,6 +25,25 @@ PROJECT_XML = """<?xml version="1.0" encoding="UTF-8"?>
 """
 
 
+GD32E235_PROJECT_XML = """<?xml version="1.0" encoding="UTF-8"?>
+<Project>
+  <Targets>
+    <Target>
+      <TargetName>DragonFocus_app_debug</TargetName>
+      <TargetOption>
+        <TargetCommonOption>
+          <Device>GD32E235CB</Device>
+          <Vendor>GigaDevice</Vendor>
+          <Cpu>IRAM(0x20000000,0x04000) IROM(0x08002000,0x0A000) CPUTYPE("Cortex-M23") CLOCK(72000000) ELITTLE</Cpu>
+          <FlashDriverDll>UL2CM3(-FN1 -FF0GD32E23x -FS08000000 -FL020000 -FP0($$Device:GD32E235CB$Flash\\GD32E23x.FLM))</FlashDriverDll>
+        </TargetCommonOption>
+      </TargetOption>
+    </Target>
+  </Targets>
+</Project>
+"""
+
+
 def _project_file(tmp_path: Path, name: str = "motor") -> Path:
     tmp_path.mkdir(parents=True, exist_ok=True)
     project_file = tmp_path / f"{name}.uvprojx"
@@ -74,9 +93,60 @@ def test_resolve_target_facts_uses_verified_family_mapping(tmp_path):
     assert facts.ready is True
     assert facts.target_cfg == "target/stm32f3x.cfg"
     assert facts.resolution_status == "family_mapping_verified"
+    assert facts.flash_origin == 0x08000000
+    assert facts.flash_size == 0x40000
     assert facts.ram_origin == 0x20000000
     assert facts.ram_size == 0x10000
     assert facts.default_log_dir == str(tmp_path / ".keilbridge" / "logs")
+
+
+def test_unlisted_gd32e235_uses_keil_facts_and_verified_openocd_family_mapping(tmp_path):
+    project_file = tmp_path / "DragonFocus_userapp.uvprojx"
+    project_file.write_text(GD32E235_PROJECT_XML, encoding="utf-8")
+    loaded = load_project_targets(project_file)
+    target = loaded.targets[0]
+    scripts = _scripts_dir(tmp_path)
+    (scripts / "target" / "gd32e23x.cfg").write_text("# gd32e23x\n", encoding="utf-8")
+
+    facts = resolve_target_facts(
+        target,
+        loaded.project_root,
+        openocd_path=_openocd_file(tmp_path),
+        scripts_dir=scripts,
+    )
+
+    assert target.device == "GD32E235CB"
+    assert target.device_info.matched is False
+    assert target.core == "cortex-m23"
+    assert [(region.name, region.origin, region.length) for region in target.memory] == [
+        ("RAM", "0x20000000", "16K"),
+        ("FLASH", "0x08002000", "40K"),
+    ]
+    assert target.flash_algorithm == "GD32E23x.FLM"
+    assert facts.target_cfg == "target/gd32e23x.cfg"
+    assert facts.resolution_status == "family_mapping_verified"
+    assert facts.ready is True
+
+
+def test_complete_flash_range_prefers_exact_device_catalog_over_project_partition(tmp_path):
+    loaded = load_project_targets(_project_file(tmp_path))
+    target = loaded.targets[0]
+    target.memory[0] = target.memory[0].__class__("FLASH", "0x08005800", "150K")
+
+    facts = resolve_target_facts(
+        target,
+        loaded.project_root,
+        openocd_path=_openocd_file(tmp_path),
+        scripts_dir=_scripts_dir(tmp_path),
+        catalog_device=_catalog_device(),
+    )
+
+    assert facts.flash_origin == 0x08000000
+    assert facts.flash_size == 0x40000
+    assert facts.flash_range_complete is True
+    assert facts.flash_range_source == "device_catalog"
+    assert "工程" in facts.flash_summary
+    assert "0x08005800" in facts.flash_summary
 
 
 def test_resolve_target_facts_accepts_verified_relative_and_absolute_overrides(tmp_path):
@@ -259,10 +329,13 @@ def test_catalog_device_resolves_ready_hardware_facts_without_project(tmp_path):
 
     assert facts.target_name == ""
     assert facts.device == "GD32F303CC"
+    assert facts.flash_origin == 0x08000000
+    assert facts.flash_size == 0x40000
     assert facts.ram_origin == 0x20000000
     assert facts.ram_size == 0x10000
     assert facts.target_cfg == "target/stm32f3x.cfg"
     assert facts.resolution_status == "catalog_verified"
+    assert facts.resolution_reason == "Device catalog OpenOCD target mapping was verified."
     assert facts.ready is True
 
 

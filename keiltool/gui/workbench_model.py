@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 
-from keiltool.core.openocd_backend import FlashRequest, parse_address
+from keiltool.core.openocd_backend import FlashReadRequest, FlashRequest, parse_address
 from keiltool.core.rtt import RttRequest
 from keiltool.gui.project_config import ProjectTargetFacts
 
@@ -35,6 +35,23 @@ def build_flash_request(firmware: str | Path, bin_address: str) -> FlashRequest:
     if path.suffix.lower() == ".hex":
         return FlashRequest(path)
     return FlashRequest(path, base_address=parse_address(bin_address))
+
+
+def build_flash_read_request(
+    facts: ProjectTargetFacts,
+    output: str | Path,
+) -> FlashReadRequest:
+    if not facts.flash_range_complete:
+        raise ValueError(
+            "A complete physical Flash range is not verified for the selected target."
+        )
+    if facts.flash_origin is None or facts.flash_size is None or facts.flash_size <= 0:
+        raise ValueError("Flash range is unavailable for the selected target.")
+    return FlashReadRequest(
+        output=Path(output).expanduser(),
+        address=facts.flash_origin,
+        size=facts.flash_size,
+    )
 
 
 def build_rtt_request(
@@ -123,6 +140,7 @@ def safe_filename(value: str) -> str:
 __all__ = [
     "RttLogPaths",
     "TargetFactsDisplay",
+    "build_flash_read_request",
     "build_flash_request",
     "build_rtt_log_paths",
     "build_rtt_request",

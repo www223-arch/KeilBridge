@@ -5,6 +5,11 @@ from tkinter import ttk
 from typing import Callable, Protocol
 
 from keiltool.core.rtt_log import RttLogRecord
+from keiltool.gui.operation_feedback import (
+    OperationFeedback,
+    OperationVisualState,
+    ProgressMode,
+)
 from keiltool.gui.rtt_display import RTT_LEVEL_NAMES
 from keiltool.gui.theme import configure_log_text
 
@@ -38,6 +43,7 @@ class WorkbenchVariables(Protocol):
     device_var: tk.StringVar
     device_choice_var: tk.StringVar
     device_source_var: tk.StringVar
+    device_source_mode_var: tk.StringVar
     flash_summary_var: tk.StringVar
     ram_summary_var: tk.StringVar
     target_cfg_var: tk.StringVar
@@ -53,6 +59,101 @@ class WorkbenchVariables(Protocol):
     target_override_var: tk.StringVar
     rtt_port_var: tk.StringVar
     rtt_timeout_var: tk.StringVar
+
+
+class OperationStatusPane(ttk.Frame):
+    _STATE_PRESENTATION = {
+        OperationVisualState.IDLE: ("空闲", "Idle"),
+        OperationVisualState.RUNNING: ("执行中", "Running"),
+        OperationVisualState.SUCCEEDED: ("完成", "Succeeded"),
+        OperationVisualState.FAILED: ("失败", "Failed"),
+        OperationVisualState.STOPPING: ("停止中", "Stopping"),
+        OperationVisualState.INCOMPLETE: ("清理不完整", "Incomplete"),
+    }
+
+    def __init__(self, parent: tk.Misc) -> None:
+        super().__init__(parent, height=112, padding=(10, 7), style="Operation.TFrame")
+        self.grid_propagate(False)
+        self.columnconfigure(1, weight=1)
+        self.task_var = tk.StringVar(value="当前任务")
+        self.state_var = tk.StringVar(value="空闲")
+        self.stage_var = tk.StringVar(value="等待操作")
+        self.elapsed_var = tk.StringVar(value="00:00:00")
+        self.summary_var = tk.StringVar(value="")
+        self._active_progress: tuple[ProgressMode, str] | None = None
+
+        ttk.Label(self, textvariable=self.task_var, style="OperationTitle.TLabel").grid(
+            row=0, column=0, sticky="w"
+        )
+        self.state_label = ttk.Label(
+            self,
+            textvariable=self.state_var,
+            style="OperationIdle.TLabel",
+        )
+        self.state_label.grid(row=0, column=1, sticky="w", padx=(10, 0))
+        ttk.Label(self, textvariable=self.elapsed_var, style="Operation.TLabel").grid(
+            row=0, column=2, sticky="e"
+        )
+        ttk.Label(self, textvariable=self.stage_var, style="Operation.TLabel").grid(
+            row=1, column=0, columnspan=3, sticky="w", pady=(5, 2)
+        )
+        self.progress = ttk.Progressbar(
+            self,
+            orient="horizontal",
+            mode="determinate",
+            maximum=100,
+            style="OperationIdle.Horizontal.TProgressbar",
+        )
+        self.progress.grid(row=2, column=0, columnspan=3, sticky="ew")
+        footer = ttk.Frame(self, style="Operation.TFrame")
+        footer.grid(row=3, column=0, columnspan=3, sticky="ew", pady=(5, 0))
+        footer.columnconfigure(0, weight=1)
+        ttk.Label(
+            footer,
+            textvariable=self.summary_var,
+            width=1,
+            style="Operation.TLabel",
+        ).grid(row=0, column=0, sticky="ew")
+        self.copy_button = ttk.Button(footer, text="复制错误", state="disabled")
+        self.copy_button.grid(row=0, column=1, padx=(6, 0))
+        self.logs_button = ttk.Button(footer, text="打开日志", state="disabled")
+        self.logs_button.grid(row=0, column=2, padx=(6, 0))
+
+    def set_copy_command(self, callback: Callable[[], None]) -> None:
+        self.copy_button.configure(command=callback)
+
+    def set_open_logs_command(self, callback: Callable[[], None]) -> None:
+        self.logs_button.configure(command=callback)
+
+    def update(self, feedback: OperationFeedback, *, now: float | None = None) -> None:
+        state_text, style_name = self._STATE_PRESENTATION[feedback.state]
+        self.task_var.set(feedback.task)
+        self.state_var.set(state_text)
+        self.stage_var.set(feedback.stage)
+        self.elapsed_var.set(_format_elapsed(feedback.elapsed(now)))
+        self.summary_var.set(feedback.summary)
+        self.state_label.configure(style=f"Operation{style_name}.TLabel")
+        self.progress.configure(style=f"Operation{style_name}.Horizontal.TProgressbar")
+        active = (feedback.progress_mode, style_name)
+        if active != self._active_progress:
+            self.progress.stop()
+            if feedback.progress_mode is ProgressMode.INDETERMINATE:
+                self.progress.configure(mode="indeterminate")
+                self.progress.start(12)
+            else:
+                self.progress.configure(mode="determinate")
+            self._active_progress = active
+        if feedback.progress_mode is not ProgressMode.INDETERMINATE:
+            self.progress.configure(value=feedback.progress_value)
+        self.copy_button.configure(state="normal" if feedback.copyable_error else "disabled")
+        self.logs_button.configure(state="normal" if feedback.log_dir else "disabled")
+
+
+def _format_elapsed(seconds: float) -> str:
+    total = max(0, int(seconds))
+    hours, remainder = divmod(total, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
 
 
 class ConfigurationPane(ttk.Frame):
@@ -88,39 +189,60 @@ class ConfigurationPane(ttk.Frame):
         )
         self.target_combo.grid(row=1, column=1, columnspan=2, sticky="ew", pady=3)
 
-        ttk.Label(section, text="Device").grid(row=2, column=0, sticky="w", pady=3)
+        ttk.Label(section, text="配置来源").grid(row=2, column=0, sticky="w", pady=3)
+        source_modes = ttk.Frame(section)
+        source_modes.grid(row=2, column=1, columnspan=2, sticky="w", pady=3)
+        self.project_source_radio = ttk.Radiobutton(
+            source_modes,
+            text="Keil 工程",
+            variable=variables.device_source_mode_var,
+            value="project",
+        )
+        self.project_source_radio.grid(row=0, column=0, sticky="w")
+        self.device_source_radio = ttk.Radiobutton(
+            source_modes,
+            text="独立 Device",
+            variable=variables.device_source_mode_var,
+            value="device",
+        )
+        self.device_source_radio.grid(row=0, column=1, sticky="w", padx=(12, 0))
+
+        self.device_label = ttk.Label(section, text="Device")
+        self.device_label.grid(row=3, column=0, sticky="w", pady=3)
         self.device_combo = ttk.Combobox(
             section,
             textvariable=variables.device_choice_var,
             state="normal",
             width=34,
         )
-        self.device_combo.grid(row=2, column=1, sticky="ew", pady=3)
+        self.device_combo.grid(row=3, column=1, sticky="ew", pady=3)
         self.device_import_button = ttk.Button(section, text="导入", width=6)
-        self.device_import_button.grid(row=2, column=2, sticky="e", padx=(6, 0), pady=3)
-        readonly_row(section, 3, "来源", variables.device_source_var)
-        readonly_row(section, 4, "Flash", variables.flash_summary_var)
-        readonly_row(section, 5, "RAM", variables.ram_summary_var)
-        readonly_row(section, 6, "Target cfg", variables.target_cfg_var)
-        readonly_row(section, 7, "解析", variables.resolution_var)
+        self.device_import_button.grid(row=3, column=2, sticky="e", padx=(6, 0), pady=3)
+        readonly_row(section, 4, "来源", variables.device_source_var)
+        readonly_row(section, 5, "Flash", variables.flash_summary_var)
+        readonly_row(section, 6, "RAM", variables.ram_summary_var)
+        readonly_row(section, 7, "Target cfg", variables.target_cfg_var)
+        readonly_row(section, 8, "解析", variables.resolution_var)
 
         self.firmware_entry, self.firmware_button = path_row(
             section,
-            8,
+            9,
             "固件",
             variables.firmware_var,
         )
-        ttk.Label(section, text="BIN 地址").grid(row=9, column=0, sticky="w", pady=3)
+        ttk.Label(section, text="BIN 地址").grid(row=10, column=0, sticky="w", pady=3)
         self.bin_address_entry = ttk.Entry(section, textvariable=variables.bin_address_var, width=34)
-        self.bin_address_entry.grid(row=9, column=1, columnspan=2, sticky="ew", pady=3)
+        self.bin_address_entry.grid(row=10, column=1, columnspan=2, sticky="ew", pady=3)
 
         actions = ttk.Frame(section)
-        actions.grid(row=10, column=0, columnspan=3, sticky="ew", pady=(7, 0))
-        actions.columnconfigure((0, 1), weight=1)
+        actions.grid(row=11, column=0, columnspan=3, sticky="ew", pady=(7, 0))
+        actions.columnconfigure((0, 1, 2), weight=1)
         self.connect_button = ttk.Button(actions, text="检查连接")
-        self.connect_button.grid(row=0, column=0, sticky="ew", padx=(0, 4))
+        self.connect_button.grid(row=0, column=0, sticky="ew", padx=(0, 3))
+        self.flash_read_button = ttk.Button(actions, text="读取完整 Flash")
+        self.flash_read_button.grid(row=0, column=1, sticky="ew", padx=3)
         self.flash_button = ttk.Button(actions, text="烧录并校验", style="Primary.TButton")
-        self.flash_button.grid(row=0, column=1, sticky="ew", padx=(4, 0))
+        self.flash_button.grid(row=0, column=2, sticky="ew", padx=(3, 0))
 
         self._remember_editable(
             self.project_entry,
@@ -129,6 +251,8 @@ class ConfigurationPane(ttk.Frame):
             self.firmware_button,
         )
         self.editable_widgets.append((self.target_combo, "readonly"))
+        self.editable_widgets.append((self.project_source_radio, "normal"))
+        self.editable_widgets.append((self.device_source_radio, "normal"))
         self.editable_widgets.append((self.device_combo, "normal"))
         self.editable_widgets.append((self.device_import_button, "normal"))
         self.editable_widgets.append((self.bin_address_entry, "normal"))
@@ -273,12 +397,13 @@ class OutputNotebook(ttk.Frame):
         self.rowconfigure(0, weight=1)
         self.columnconfigure(0, weight=1)
 
-        notebook = ttk.Notebook(self, style="Console.TNotebook")
-        notebook.grid(row=0, column=0, sticky="nsew")
-        rtt_tab = ttk.Frame(notebook, padding=8, style="Console.TFrame")
-        openocd_tab = ttk.Frame(notebook, padding=8, style="Console.TFrame")
-        notebook.add(rtt_tab, text="RTT 日志")
-        notebook.add(openocd_tab, text="OpenOCD 输出")
+        self.notebook = ttk.Notebook(self, style="Console.TNotebook")
+        self.notebook.grid(row=0, column=0, sticky="nsew")
+        rtt_tab = ttk.Frame(self.notebook, padding=8, style="Console.TFrame")
+        openocd_tab = ttk.Frame(self.notebook, padding=8, style="Console.TFrame")
+        self.notebook.add(rtt_tab, text="RTT 日志")
+        self.notebook.add(openocd_tab, text="OpenOCD 输出")
+        self._openocd_tab = openocd_tab
 
         rtt_tab.columnconfigure(0, weight=1)
         rtt_tab.rowconfigure(2, weight=1)
@@ -345,6 +470,9 @@ class OutputNotebook(ttk.Frame):
         )
         self.openocd_view = LogTextView(openocd_tab, row=1)
         self._openocd_text = self.openocd_view.text
+
+    def select_openocd(self) -> None:
+        self.notebook.select(self._openocd_tab)
 
     def append_rtt(self, text: str) -> None:
         _append_text(self._rtt_text, text)

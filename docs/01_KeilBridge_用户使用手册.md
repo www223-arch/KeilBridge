@@ -197,7 +197,7 @@ python -m keiltool.cli doctor flash --project "C:\Path\To\Project\MDK-ARM\App.uv
 
 - OpenOCD 是否能启动。
 - 探针是否能连接目标芯片。
-- reset/halt 后 PC/MSP 是否像有效启动向量。
+- reset/halt 后 PC/MSP 的原始值及其是否落入工程声明的 Flash/RAM 范围。
 - 常见 OpenOCD、CMSIS-DAP、ST-Link 通信错误。
 
 它不会下载固件。
@@ -268,25 +268,30 @@ python -m keiltool.cli gui
 %APPDATA%\KeilTool\gui-settings.json
 ```
 
-Keil 工程在图形工作台中是可选的。只想连接、烧录现有 HEX/BIN 或采集 RTT 时，可直接在 Device 输入框搜索并选择精确芯片型号；选择 Keil `.uvprojx` 工程和 Target 后，Device 会自动切换为工程里的芯片并锁定。清空工程路径后恢复手动选择。芯片选择、OpenOCD 路径和自定义日志根目录都会在关闭时记住。
+Keil 工程在图形工作台中是可选的。“配置来源”明确区分 `Keil 工程` 和 `独立 Device`，两种来源不会混用。工程模式中的 Device、Target、Flash/RAM 和固件属于当前工程上下文；切到独立 Device 后，工程 Target 和工程固件立即退出活动配置，再从目录选择精确芯片和对应固件。切回工程模式时重新解析并恢复此前的工程 Target。两种模式及各自固件、芯片选择、OpenOCD 路径和自定义日志根目录都会在关闭时记住。
 
 内置设备目录由仓库中的官方 GigaDevice、STMicroelectronics CMSIS-Pack/PDSC 快照生成，记录来源、版本、core、FPU、Flash/RAM 和 flash algorithm。点击 Device 旁的“导入”可添加 `.pdsc`、`.pack` 或自定义 JSON；用户文件保存在 `%APPDATA%\KeilTool\devices\`，同厂商同型号的用户条目优先于内置条目。PACK 只读取其中的 PDSC，不解压到磁盘。损坏或不安全的导入会被拒绝，不影响已有目录。
 
-CMSIS-Pack 本身不提供 OpenOCD target cfg。KeilBridge 只为已明确维护的兼容系列填写 target；没有映射的芯片仍可查看信息，但硬件按钮保持禁用。可在高级设置中指定 OpenOCD、scripts 目录和 target override。override 必须是实际存在的 `.cfg` 文件：相对路径必须位于 scripts 目录内，绝对路径必须指向现有文件。任何无法验证、文件缺失或越出 scripts 目录的配置都会阻止“检查连接”“烧录并校验”和 RTT，而不是猜测芯片类型继续执行。
+CMSIS-Pack 本身不提供 OpenOCD target cfg。KeilBridge 只为已明确维护的兼容系列填写 target；没有映射的芯片仍可查看信息，但硬件按钮保持禁用。可在高级设置中指定 OpenOCD、scripts 目录和 target override。override 必须是实际存在的 `.cfg` 文件：相对路径必须位于 scripts 目录内，绝对路径必须指向现有文件。任何无法验证、文件缺失或越出 scripts 目录的配置都会阻止“检查连接”“读取完整 Flash”“烧录并校验”和 RTT，而不是猜测芯片类型继续执行。
 
 烧录区只接受已经生成的 `.hex` 或 `.bin` 文件，不负责编译、合并或从 `.axf/.elf` 转换固件：
 
 - `.hex` 使用文件内嵌地址，BIN 基地址输入框不参与烧录。
 - `.bin` 使用可编辑的 BIN 基地址，默认值为 `0x08000000`。
 - “烧录并校验”要求 OpenOCD 同时给出程序写入和校验成功证据；成功日志通常包含 `Programming Finished` 与 `Verified OK`。
+- 已选择的固件被外部编译器更新后，窗口回到前台时会显示旧/新文件大小、修改时间和 SHA-256，并询问是否 reload。选择“否”会把固件标记为过期并禁用烧录；重新选择文件或接受后才恢复。点击烧录时还会再校验一次，防止检查后文件再次变化。
 
-“检查连接”和“烧录并校验”是独立动作。“检查连接”不下载固件；“烧录并校验”会改写 Flash，且完成后会按 OpenOCD 烧录命令复位目标。
+“检查连接”“读取完整 Flash”和“烧录并校验”是独立动作。“检查连接”不下载固件。“读取完整 Flash”读取已验证的主用户 Flash，不读取 option bytes、OTP 或系统 ROM；为保证镜像一致，它会记录目标运行状态，必要时暂停内核，读取后仅在目标原本运行时恢复运行，且不复位。“烧录并校验”会改写 Flash，且完成后会按 OpenOCD 烧录命令复位目标。
 
 RTT 也是独立动作。点击“开始 RTT”后，工作台在 Keil Target 或所选目录芯片的可写 RAM 范围中寻找 `SEGGER RTT` 控制块并附着到 RTT TCP 通道；该流程不包含 reset、halt 或 resume，因此不会为了采集 RTT 主动改变 MCU 运行状态。自动扫描使用已验证的 RAM 范围；选择手动地址时只搜索该地址起始的 `0x100` 字节窗口。
 
 RTT 页会解析 SEGGER 虚拟 Terminal，并优先使用 EasyLogger 已有的 `ASSERT`、`ERROR`、`WARN`、`INFO`、`DEBUG`、`VERBOSE` 等级，不由 GUI 重新定义日志等级。“显示等级”是严重度阈值：例如选择 `INFO` 时显示 `ASSERT` 到 `INFO`，隐藏 `DEBUG` 和 `VERBOSE`。默认值为 `VERBOSE`，关闭工作台时会记住当前阈值；切换阈值会立即重绘最近 20,000 行 GUI 缓存，不会中断 RTT。
 
-Flash、连接检查和 RTT 共享同一支 ST-Link，但任何时刻只允许一个操作拥有它。RTT 正在扫描、采集或停止清理时，烧录和连接检查会禁用；烧录或连接检查进行时，RTT 启动和配置编辑会禁用。先停止 RTT 并等待其清理完成，才能进行烧录。
+Flash 读取、烧录、连接检查和 RTT 共享同一支 ST-Link，但任何时刻只允许一个操作拥有它。RTT 正在扫描、采集或停止清理时，其他硬件动作会禁用；Flash 读取、烧录或连接检查进行时，RTT 启动和配置编辑会禁用。
+
+右侧日志页上方的“当前任务”区域持续显示任务名称、明确的执行阶段、耗时和最终结果。参数准备、结果分析等可验证阶段使用阶段进度；OpenOCD 执行和 RTT 扫描/采集使用活动进度条，不按时间虚构完成百分比。普通成功和失败不会反复弹出对话框：成功结果保留在绿色状态中，失败结果保留在红色状态中并自动切到 OpenOCD 输出，可点击“复制错误”取得摘要、返回码和原始错误，也可点击“打开日志”进入本次任务目录。只有烧录确认、固件 reload、安全关闭和设置保存等确实需要决定的流程才弹窗。
+
+Windows GUI 启动的 OpenOCD 进程使用后台窗口模式，连接检查、Flash 读取、烧录和 RTT 期间不会额外弹出终端窗口。该策略只作用于 GUI；CLI 仍保持标准 stdout/stderr 和中断处理，便于脚本、AI 自动化调试和第三方工具集成。
 
 默认日志目录为：
 
@@ -294,13 +299,34 @@ Flash、连接检查和 RTT 共享同一支 ST-Link，但任何时刻只允许�
 <keil-project-root>\.keilbridge\logs\
 ```
 
-无工程时默认使用 `%APPDATA%\KeilTool\logs\`。可以在工作台中改为其他根目录，修改会被记住。每次连接、烧录和 RTT 都创建独立目录：
+无工程时默认使用 `%APPDATA%\KeilTool\logs\`。可以在工作台中改为其他根目录，修改会被记住。每次连接、Flash 读取、烧录和 RTT 都创建独立目录：
 
 ```text
-YYYYMMDD-HHMMSS-fff_<device>_<CONNECT|FLASH|RTT>\
+YYYYMMDD-HHMMSS-fff_<device>_<CONNECT|FLASH_READ|FLASH|RTT>\
 ```
 
 目录中包含任务日志、`openocd.stdout.log`、`openocd.stderr.log` 和 `session.json`；元数据写明开始/结束时间、芯片、任务、target cfg 和结果。RTT 通道完整内容保存在 `rtt.log`。等级过滤和“清空显示”只影响 GUI，不删除或截断完整日志。RTT 和 OpenOCD 文本区支持 `Ctrl+C`、右键复制/全选/复制全部，工具栏也可直接复制全部可见文本。
+
+### 4.5 面向自动化的硬件 CLI
+
+连接、烧录、完整 Flash 读取和 RTT 都可不打开 GUI。硬件来源必须二选一：Keil 工程加可选 Target，或设备目录中的精确 Device 加可选 Vendor。
+
+```powershell
+k2c connect --project "C:\Path\App.uvprojx" --target Debug --output-format json
+k2c connect --device GD32F303CC --vendor GigaDevice --output-format json
+k2c flash --device GD32F303CC --firmware "C:\Path\app.hex" --output-format json
+k2c flash-read --device GD32F303CC --output "C:\Logs\GD32F303CC_flash.bin" --output-format json
+k2c rtt --device GD32F303CC --format jsonl
+k2c rtt --device STM32G431CBUx --vendor Keil --channel 1 --port 19022 --format raw --output "C:\Logs\foc_sweep.bin" --duration 8
+```
+
+`connect`、`flash` 和 `flash-read` 的 JSON schema 为 `keiltool.hardware.v1`，包含成功状态、设备、来源、target cfg、OpenOCD 返回码、证据日志和产物信息。`flash-read` 只有在输出文件字节数与主 Flash 容量完全一致时才成功，并返回 SHA-256；失败时保留已有的部分文件作为诊断证据。
+
+RTT 默认持续采集到 `Ctrl+C`、RTT EOF 或错误，也可用 `--duration <秒>` 限时。`--format text` 输出解析后的日志，`jsonl` 输出 schema 为 `keiltool.rtt.v1` 的逐条记录；`raw` 不做 UTF-8 解码、换行或终端帧处理，原样处理 RTT TCP 字节。raw 未指定 `--output` 时仍写 stdout；指定 `--output PATH` 时使用至少 1 MiB 的主机文件缓冲直接写入该二进制文件，并抑制 raw stdout。输出文件在每次启动时截断，退出时 flush/close。OpenOCD 状态、累计接收字节数、最终文件字节数、异常和断连信息写 stderr。`Ctrl+C` 会清理 RTT/OpenOCD 后返回退出码 `130`。
+
+`--channel 1` 可让 FOC 二进制记录独占 RTT 上行通道 1，`--port 19022` 指定 KeilTool 连接的本地 OpenOCD RTT TCP 端口。该采集命令只执行 `rtt setup`、`rtt start` 和 `rtt server start`，目标运行期间不发送 reset、halt 或 resume。主机字节计数只能证明 KeilTool 收到和写入了多少字节，不能检测 MCU 产生记录之前或 RTT 缓冲区内发生的漏记录；扫频有效性仍应由记录内 timestamp 连续性判定。
+
+高级覆盖参数在这些命令中保持一致：`--openocd`、`--scripts`、`--target-cfg` 和 `--logs-dir`。无法验证设备内存范围或 target cfg 时命令会失败，不会猜测配置继续访问硬件。
 
 ## 5. VS Code 使用方式
 
@@ -384,7 +410,7 @@ python -m keiltool.cli doctor flash `
 
 ```text
 OpenOCD 可连接 STM32G431CBUx
-reset/halt 后 PC/MSP 有效
+reset/halt 实测 PC/MSP 均位于工程声明的 Flash/RAM 范围
 arm-none-eabi-gdb 可读取 Keil AXF 符号
 GDB 可对 main 设置硬件断点
 VS Code 可正常打断点

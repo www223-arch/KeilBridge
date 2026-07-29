@@ -7,7 +7,7 @@ from pathlib import Path
 from .device_database import lookup_device
 from .device_override import apply_device_override
 from .device_inference import infer_core, infer_family, infer_fpu, infer_vendor, parse_memory_regions
-from .keil_option_parser import parse_uvoptx_debug_options
+from .keil_option_parser import parse_flash_algorithm, parse_uvoptx_debug_options
 from .path_resolver import infer_project_root, normalize_path, resolve_keil_path
 from .project_classifier import classify_project
 from .project_model import KeilFile, KeilProjectModel, KeilTargetModel
@@ -131,6 +131,7 @@ def parse_uvprojx(uvprojx_path: str | Path) -> KeilProjectModel:
 
         cpu = _target_option_text(target, "Cpu")
         device = _target_option_text(target, "Device")
+        flash_driver = _target_option_text(target, "FlashDriverDll")
         define_text = _compiler_option_text(target, "Define")
         include_text = _compiler_option_text(target, "IncludePath")
         scatter_text = _target_option_text(target, "ScatterFile")
@@ -162,6 +163,7 @@ def parse_uvprojx(uvprojx_path: str | Path) -> KeilProjectModel:
         ]
         features = classify_project(str(project_root), sources, includes, _split_defines(define_text))
         debug_options = parse_uvoptx_debug_options(project_path.with_suffix(".uvoptx"), target_name)
+        flash_algorithm = debug_options.flash_algorithm or parse_flash_algorithm(flash_driver)
 
         target_model = KeilTargetModel(
             name=target_name,
@@ -182,7 +184,7 @@ def parse_uvprojx(uvprojx_path: str | Path) -> KeilProjectModel:
             scatter_candidates=scatter_candidates,
             debug_probe=debug_options.probe,
             keil_debug_dll=debug_options.debug_dll,
-            flash_algorithm=debug_options.flash_algorithm,
+            flash_algorithm=flash_algorithm,
             device_info=device_info,
             features=features,
             c_standard="c99" if c99_mode == "1" else "c11",

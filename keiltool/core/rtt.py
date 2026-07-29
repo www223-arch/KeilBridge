@@ -10,6 +10,7 @@ import time
 from typing import Callable, Protocol, TextIO
 
 from .openocd_backend import OpenOcdConfig
+from .process_launch import background_process_kwargs
 from .rtt_log import RttLevel, RttLogRecord, SeggerRttLogParser
 
 
@@ -50,6 +51,7 @@ def build_rtt_command(config: OpenOcdConfig, request: RttRequest) -> list[str]:
 @dataclass(frozen=True, slots=True)
 class RttEvent:
     kind: str
+    data: bytes = b""
     text: str = ""
     message: str = ""
     stream: str = ""
@@ -98,6 +100,8 @@ class RttSession:
         stop_timeout: float = 2.0,
         retry_interval: float = 0.05,
         host: str = "127.0.0.1",
+        background: bool = False,
+        parse_records: bool = True,
     ) -> None:
         if connect_timeout <= 0:
             raise ValueError("RTT connect timeout must be positive.")
@@ -117,6 +121,8 @@ class RttSession:
         self._stop_timeout = stop_timeout
         self._retry_interval = retry_interval
         self._host = host
+        self._background = background
+        self._parse_records = parse_records
         self._port = request.port
         self._socket_lock = threading.Lock()
         self._log_lock = threading.Lock()
@@ -158,6 +164,7 @@ class RttSession:
                     text=True,
                     encoding="utf-8",
                     errors="replace",
+                    **(background_process_kwargs() if self._background else {}),
                 )
             except OSError as exc:
                 self._finish_startup_failure(f"Unable to start OpenOCD: {exc}")
@@ -275,24 +282,27 @@ class RttSession:
                 self._control_block_found.set()
 
     def _read_rtt_socket(self, connection: socket.socket) -> None:
-        parser = SeggerRttLogParser()
+        parser = SeggerRttLogParser() if self._parse_records else None
         parser_finalized = False
         try:
             while not self._stop_requested.is_set():
                 data = connection.recv(4096)
                 if not data:
-                    for record in parser.finish():
-                        self._write_record(record)
-                    parser_finalized = True
+                    if parser is not None:
+                        for record in parser.finish():
+                            self._write_record(record)
+                        parser_finalized = True
                     self._emit("eof", message="RTT TCP connection closed.")
                     return
-                for record in parser.feed(data):
-                    self._write_record(record)
+                self._emit("raw", data=data)
+                if parser is not None:
+                    for record in parser.feed(data):
+                        self._write_record(record)
         except OSError as exc:
             if not self._stop_requested.is_set():
                 self._emit("error", message=f"RTT TCP receive failed: {exc}")
         finally:
-            if not parser_finalized:
+            if parser is not None and not parser_finalized:
                 for record in parser.finish():
                     self._write_record(record)
             self._close_socket(connection)
@@ -422,6 +432,7 @@ class RttSession:
         self,
         kind: str,
         *,
+        data: bytes = b"",
         text: str = "",
         message: str = "",
         stream: str = "",
@@ -432,6 +443,7 @@ class RttSession:
         self.events.put(
             RttEvent(
                 kind=kind,
+                data=data,
                 text=text,
                 message=message,
                 stream=stream,

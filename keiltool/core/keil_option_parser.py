@@ -26,7 +26,7 @@ def parse_uvoptx_debug_options(uvoptx_path: str | Path, target_name: str) -> Kei
         return KeilDebugOptions(
             probe=_probe_from_debug_dll(debug_dll),
             debug_dll=debug_dll,
-            flash_algorithm=_flash_algorithm_from_registry(registry_text),
+            flash_algorithm=parse_flash_algorithm(registry_text),
         )
     return KeilDebugOptions()
 
@@ -48,6 +48,6 @@ def _probe_from_debug_dll(debug_dll: str) -> str:
     return ""
 
 
-def _flash_algorithm_from_registry(text: str) -> str:
+def parse_flash_algorithm(text: str) -> str:
     matches = re.findall(r"([^\\/$()\s]+\.FLM)", text, flags=re.IGNORECASE)
     return matches[-1] if matches else ""

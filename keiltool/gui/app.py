@@ -404,7 +404,7 @@ class KeilToolGui:
         else:
             self.device_choice_var.set(facts.device)
             self.device_source_var.set(
-                f"Keil 工程 · {facts.device} · 设备目录无精确匹配"
+                f"Keil 工程 · {facts.device} · 直接使用工程信息（设备目录未收录）"
             )
 
     def _change_device_source(self) -> None:

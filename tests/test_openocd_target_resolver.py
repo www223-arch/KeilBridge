@@ -18,6 +18,19 @@ def test_resolve_gd32f3_family_to_verified_stm32f3_target(tmp_path):
     assert result.status == "family_mapping_verified"
 
 
+def test_resolve_gd32e2_family_to_verified_gd32e23x_target(tmp_path):
+    scripts = tmp_path / "scripts"
+    target_dir = scripts / "target"
+    target_dir.mkdir(parents=True)
+    (target_dir / "gd32e23x.cfg").write_text("# gd32e23x\n", encoding="utf-8")
+    target = KeilTargetModel(name="App", device="GD32E235CB", vendor="gd", family="gd32e2")
+
+    result = resolve_openocd_target(target, scripts)
+
+    assert result.target_cfg == "target/gd32e23x.cfg"
+    assert result.status == "family_mapping_verified"
+
+
 def test_resolve_target_rejects_a_cfg_directory(tmp_path):
     scripts = tmp_path / "scripts"
     (scripts / "target" / "stm32f3x.cfg").mkdir(parents=True)

@@ -41,6 +41,20 @@ def test_manual_address_uses_0x100_search_window():
     assert "rtt setup 0x20006CAC 0x100" in " ".join(build_rtt_command(CONFIG, request))
 
 
+def test_expected_channel_name_lists_channels_before_starting_server():
+    request = RttRequest(
+        scan_address=0x20000000,
+        scan_size=0x10000,
+        port=19022,
+        channel=1,
+        expected_channel_name="Scope",
+    )
+
+    command = build_rtt_command(CONFIG, request)
+
+    assert command.index("rtt channels") < command.index("rtt server start 19022 1")
+
+
 class FakeProcess:
     def __init__(self, stdout_lines: tuple[str, ...] = (), stderr_lines: tuple[str, ...] = (), returncode: int | None = None):
         self.stdout = _LineStream(stdout_lines)
@@ -74,6 +88,87 @@ class _LineStream:
 
     def readline(self) -> str:
         return self._lines.pop(0) if self._lines else ""
+
+
+def test_session_refuses_channel_name_mismatch_before_tcp_connect(tmp_path):
+    process = FakeProcess(
+        stdout_lines=(
+            "Info : rtt: Control block found at 0x20008fc0\n",
+            "Channels: up=2, down=2\n",
+            "Up-channels:\n",
+            "0: Terminal 1024 0\n",
+            "1: TextLog 2048 0\n",
+            "Down-channels:\n",
+        )
+    )
+    connect_calls = []
+    session = RttSession(
+        CONFIG,
+        RttRequest(
+            scan_address=0x20000000,
+            scan_size=0x10000,
+            port=19022,
+            channel=1,
+            expected_channel_name="Scope",
+        ),
+        tmp_path / "rtt.log",
+        popen_factory=lambda *args, **kwargs: process,
+        socket_factory=lambda *args, **kwargs: connect_calls.append(args),
+        connect_timeout=0.5,
+    )
+
+    session.start()
+    event = _next_event(session, "error")
+    session.stop()
+
+    assert connect_calls == []
+    assert "channel 1" in event.message
+    assert "Scope" in event.message
+    assert "TextLog" in event.message
+
+
+def test_session_validates_scope_channel_before_tcp_connect(tmp_path):
+    payload = b"scope-data"
+    port, server = _start_rtt_server(payload)
+    process = FakeProcess(
+        stdout_lines=(
+            "Info : rtt: Control block found at 0x20008fc0\n",
+            "Channels: up=2, down=2\n",
+            "Up-channels:\n",
+            "0: Terminal 1024 0\n",
+            "1: Scope 2048 0\n",
+            "Down-channels:\n",
+        )
+    )
+    session = RttSession(
+        CONFIG,
+        RttRequest(
+            scan_address=0x20000000,
+            scan_size=0x10000,
+            port=port,
+            channel=1,
+            expected_channel_name="Scope",
+        ),
+        tmp_path / "rtt.log",
+        popen_factory=lambda *args, **kwargs: process,
+        connect_timeout=0.5,
+        parse_records=False,
+    )
+
+    session.start()
+    verified = _next_event(session, "channel_verified")
+    chunks = []
+    while True:
+        event = session.events.get(timeout=1)
+        if event.kind == "raw":
+            chunks.append(event.data)
+        if event.kind == "eof":
+            break
+    server.join(timeout=1)
+    session.stop()
+
+    assert verified.message == "RTT up-channel 1 verified as 'Scope'."
+    assert b"".join(chunks) == payload
 
 
 def _start_rtt_server(payload: bytes) -> tuple[int, threading.Thread]:

@@ -61,6 +61,7 @@ class WorkbenchVariables(Protocol):
     rtt_timeout_var: tk.StringVar
     vofa_path_var: tk.StringVar
     vofa_listen_var: tk.StringVar
+    vofa_verify_scope_name_var: tk.BooleanVar
 
 
 class OperationStatusPane(ttk.Frame):
@@ -369,6 +370,23 @@ class ConfigurationPane(ttk.Frame):
             width=20,
         )
         self.vofa_listen_entry.grid(row=6, column=1, sticky="w", pady=3)
+        self.vofa_verify_scope_check = ttk.Checkbutton(
+            self.advanced_frame,
+            text="校验 RTT channel 1 名称为 Scope",
+            variable=variables.vofa_verify_scope_name_var,
+        )
+        self.vofa_verify_scope_check.grid(
+            row=7,
+            column=1,
+            columnspan=2,
+            sticky="w",
+            pady=3,
+        )
+        self.scope_guide_button = ttk.Button(
+            self.advanced_frame,
+            text="打开 BilboPro 通道说明",
+        )
+        self.scope_guide_button.grid(row=8, column=1, sticky="w", pady=3)
 
         self._remember_editable(
             self.openocd_entry,
@@ -382,6 +400,8 @@ class ConfigurationPane(ttk.Frame):
             self.vofa_entry,
             self.vofa_button,
             self.vofa_listen_entry,
+            self.vofa_verify_scope_check,
+            self.scope_guide_button,
         )
         self.editable_widgets.append((self.advanced_button, "normal"))
 

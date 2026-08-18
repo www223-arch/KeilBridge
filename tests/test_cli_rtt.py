@@ -245,6 +245,7 @@ def test_rtt_parser_exposes_vofa_bridge_options():
 
     assert args.vofa_listen == "127.0.0.1:1347"
     assert args.vofa_executable == Path("D:/tools/vofa+.exe")
+    assert args.no_verify_channel_name is False
 
 
 def test_rtt_does_not_start_vofa_bridge_before_hardware_validation(monkeypatch):
@@ -292,8 +293,9 @@ def test_rtt_vofa_bridge_receives_raw_events(tmp_path, monkeypatch, capsysbinary
     class FakeBridge:
         last = None
 
-        def __init__(self, host, port):
+        def __init__(self, host, port, **kwargs):
             self.listen_address = (host, port)
+            self.kwargs = kwargs
             self.payloads = []
             self.started = False
             self.stopped = False
@@ -336,9 +338,42 @@ def test_rtt_vofa_bridge_receives_raw_events(tmp_path, monkeypatch, capsysbinary
     assert FakeBridge.last.started
     assert FakeBridge.last.stopped
     assert FakeBridge.last.payloads == [payload]
+    assert FakeBridge.last.kwargs["expected_float_count"] == 15
+    assert FakeRttSession.last.request.expected_channel_name == "Scope"
     assert FakeRttSession.last.kwargs["parse_records"] is False
     assert b"frames_forwarded=1" in capture.err
     assert FakeRttSession.last.stopped
+    guides = tuple((tmp_path / "logs").glob("*/scope-channels.txt"))
+    assert len(guides) == 1
+    assert "I14 = euler_9dof_deg.yaw" in guides[0].read_text(encoding="utf-8")
+
+
+def test_rtt_vofa_allows_explicitly_disabling_channel_name_verification(
+    tmp_path,
+    monkeypatch,
+    capsysbinary,
+):
+    FakeRttSession.event_list = (
+        RttEvent("connected", message="connected"),
+        RttEvent("eof", message="closed"),
+    )
+
+    assert (
+        _run(
+            tmp_path,
+            monkeypatch,
+            "raw",
+            "--output",
+            str(tmp_path / "capture.bin"),
+            "--vofa-listen",
+            "127.0.0.1:1347",
+            "--no-verify-channel-name",
+        )
+        == 0
+    )
+
+    capsysbinary.readouterr()
+    assert FakeRttSession.last.request.expected_channel_name is None
 
 
 class InterruptingEvents:

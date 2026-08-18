@@ -19,15 +19,25 @@ class JustFloatDecoderStats:
     payload_bytes: int = 0
     invalid_frames: int = 0
     discarded_bytes: int = 0
+    frame_size_mismatches: int = 0
+    last_frame_float_count: int | None = None
 
 
 class JustFloatFrameDecoder:
     """Incrementally split VOFA+ JustFloat frames without decoding their values."""
 
-    def __init__(self, *, max_frame_bytes: int = 1024 * 1024) -> None:
+    def __init__(
+        self,
+        *,
+        max_frame_bytes: int = 1024 * 1024,
+        expected_float_count: int | None = None,
+    ) -> None:
         if max_frame_bytes < 8:
             raise ValueError("JustFloat maximum frame size must be at least 8 bytes.")
+        if expected_float_count is not None and expected_float_count <= 0:
+            raise ValueError("Expected JustFloat float count must be positive.")
         self._max_frame_bytes = max_frame_bytes
+        self._expected_float_count = expected_float_count
         self._buffer = bytearray()
         self.stats = JustFloatDecoderStats()
 
@@ -47,6 +57,13 @@ class JustFloatFrameDecoder:
             payload_size = marker
             if payload_size == 0 or payload_size % 4 != 0 or frame_size > self._max_frame_bytes:
                 self.stats.invalid_frames += 1
+                self.stats.discarded_bytes += frame_size
+                continue
+            float_count = payload_size // 4
+            if self._expected_float_count is not None and float_count != self._expected_float_count:
+                self.stats.invalid_frames += 1
+                self.stats.frame_size_mismatches += 1
+                self.stats.last_frame_float_count = float_count
                 self.stats.discarded_bytes += frame_size
                 continue
             self.stats.frames += 1
@@ -72,6 +89,8 @@ class VofaBridgeStats:
     bytes_forwarded: int = 0
     frames_dropped: int = 0
     invalid_frames: int = 0
+    frame_size_mismatches: int = 0
+    last_frame_float_count: int | None = None
     clients_connected: int = 0
     active_clients: int = 0
     disconnects: int = 0
@@ -88,6 +107,7 @@ class VofaTcpBridge:
         *,
         raw_output: Path | None = None,
         queued_frames: int = 2048,
+        expected_float_count: int | None = None,
     ) -> None:
         if not 0 <= port <= 65535:
             raise ValueError("VOFA TCP port must be between 0 and 65535.")
@@ -96,7 +116,8 @@ class VofaTcpBridge:
         self._host = host
         self._port = port
         self._raw_output = Path(raw_output) if raw_output is not None else None
-        self._decoder = JustFloatFrameDecoder()
+        self._decoder = JustFloatFrameDecoder(expected_float_count=expected_float_count)
+        self._expected_float_count = expected_float_count
         self._frames: queue.Queue[bytes] = queue.Queue(maxsize=queued_frames)
         self._stats = VofaBridgeStats()
         self._stats_lock = threading.Lock()
@@ -119,6 +140,8 @@ class VofaTcpBridge:
         with self._stats_lock:
             snapshot = replace(self._stats)
         snapshot.invalid_frames = self._decoder.stats.invalid_frames
+        snapshot.frame_size_mismatches = self._decoder.stats.frame_size_mismatches
+        snapshot.last_frame_float_count = self._decoder.stats.last_frame_float_count
         return snapshot
 
     def start(self) -> None:
@@ -155,7 +178,16 @@ class VofaTcpBridge:
         self._write_raw(data)
         with self._stats_lock:
             self._stats.raw_bytes += len(data)
-        for frame in self._decoder.feed(data):
+        mismatches_before = self._decoder.stats.frame_size_mismatches
+        frames = self._decoder.feed(data)
+        if self._decoder.stats.frame_size_mismatches > mismatches_before:
+            actual = self._decoder.stats.last_frame_float_count
+            with self._stats_lock:
+                self._stats.last_error = (
+                    "JustFloat frame size mismatch: "
+                    f"expected {self._expected_float_count} float32 values, received {actual}."
+                )
+        for frame in frames:
             with self._stats_lock:
                 self._stats.frames_received += 1
             self._enqueue_latest(frame)

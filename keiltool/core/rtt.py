@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 import queue
+import re
 import socket
 import subprocess
 import threading
@@ -20,6 +21,7 @@ class RttRequest:
     scan_size: int
     port: int = 19021
     channel: int = 0
+    expected_channel_name: str | None = None
 
     def __post_init__(self) -> None:
         if not 0 <= self.scan_address <= 0xFFFFFFFF:
@@ -30,12 +32,19 @@ class RttRequest:
             raise ValueError("RTT port must be between 1 and 65535.")
         if self.channel < 0:
             raise ValueError("RTT channel must be non-negative.")
+        if self.expected_channel_name is not None:
+            if not self.expected_channel_name:
+                raise ValueError("Expected RTT channel name must not be empty.")
+            try:
+                self.expected_channel_name.encode("ascii")
+            except UnicodeEncodeError as exc:
+                raise ValueError("Expected RTT channel name must be ASCII.") from exc
 
 
 def build_rtt_command(config: OpenOcdConfig, request: RttRequest) -> list[str]:
     """Build a non-invasive OpenOCD RTT command for ST-Link over SWD."""
 
-    return [
+    command = [
         *config.base_command(),
         "-c",
         "init",
@@ -43,9 +52,11 @@ def build_rtt_command(config: OpenOcdConfig, request: RttRequest) -> list[str]:
         f'rtt setup 0x{request.scan_address:08X} 0x{request.scan_size:X} "SEGGER RTT"',
         "-c",
         "rtt start",
-        "-c",
-        f"rtt server start {request.port} {request.channel}",
     ]
+    if request.expected_channel_name is not None:
+        command.extend(("-c", "rtt channels"))
+    command.extend(("-c", f"rtt server start {request.port} {request.channel}"))
+    return command
 
 
 @dataclass(frozen=True, slots=True)
@@ -124,12 +135,18 @@ class RttSession:
         self._background = background
         self._parse_records = parse_records
         self._port = request.port
+        self._channel = request.channel
+        self._expected_channel_name = request.expected_channel_name
         self._socket_lock = threading.Lock()
         self._log_lock = threading.Lock()
         self._workers_lock = threading.Lock()
         self._lifecycle = threading.Condition(threading.RLock())
         self._stop_requested = threading.Event()
         self._control_block_found = threading.Event()
+        self._channel_verified = threading.Event()
+        self._channel_validation_failed = threading.Event()
+        self._channel_parse_lock = threading.Lock()
+        self._channel_section = ""
         self._process: RttProcess | None = None
         self._socket: socket.socket | None = None
         self._log_file: TextIO | None = None
@@ -237,14 +254,28 @@ class RttSession:
     def _wait_for_control_block(self) -> None:
         deadline = self._monotonic() + self._connect_timeout
         while not self._stop_requested.is_set():
-            if self._control_block_found.is_set():
+            control_block_ready = self._control_block_found.is_set()
+            channel_ready = (
+                self._expected_channel_name is None or self._channel_verified.is_set()
+            )
+            if control_block_ready and channel_ready:
                 self._connect_rtt_server(deadline)
                 return
+            if self._channel_validation_failed.is_set():
+                return
             if self._process_exited():
-                self._emit("error", message="OpenOCD exited before the RTT control block was found.")
+                if control_block_ready and self._expected_channel_name is not None:
+                    message = "OpenOCD exited before the RTT channel name was verified."
+                else:
+                    message = "OpenOCD exited before the RTT control block was found."
+                self._emit("error", message=message)
                 return
             if self._monotonic() >= deadline:
-                self._emit("error", message="Timed out waiting for the OpenOCD RTT control block.")
+                if control_block_ready and self._expected_channel_name is not None:
+                    message = "Timed out waiting for the OpenOCD RTT channel list."
+                else:
+                    message = "Timed out waiting for the OpenOCD RTT control block."
+                self._emit("error", message=message)
                 return
             self._sleep(self._retry_interval)
 
@@ -280,6 +311,47 @@ class RttSession:
             normalized = line.casefold()
             if "rtt" in normalized and "control block" in normalized and "found" in normalized:
                 self._control_block_found.set()
+            self._parse_channel_listing(line)
+
+    def _parse_channel_listing(self, line: str) -> None:
+        expected = self._expected_channel_name
+        if expected is None or self._channel_verified.is_set() or self._channel_validation_failed.is_set():
+            return
+        text = re.sub(r"^(?:info|debug|warn|error)\s*:\s*", "", line.strip(), flags=re.IGNORECASE)
+        with self._channel_parse_lock:
+            if text == "Up-channels:":
+                self._channel_section = "up"
+                return
+            if text == "Down-channels:":
+                if self._channel_section == "up":
+                    self._reject_channel(
+                        f"RTT up-channel {self._channel} is not active; expected name '{expected}'."
+                    )
+                self._channel_section = "down"
+                return
+            if self._channel_section != "up":
+                return
+            match = re.fullmatch(r"(\d+):\s+(.*?)\s+(\d+)\s+(\d+)", text)
+            if match is None or int(match.group(1)) != self._channel:
+                return
+            actual = match.group(2)
+            if actual != expected:
+                self._reject_channel(
+                    f"RTT up-channel {self._channel} name mismatch: "
+                    f"expected '{expected}', actual '{actual}'."
+                )
+                return
+            self._channel_verified.set()
+            self._emit(
+                "channel_verified",
+                message=f"RTT up-channel {self._channel} verified as '{actual}'.",
+            )
+
+    def _reject_channel(self, message: str) -> None:
+        if self._channel_validation_failed.is_set():
+            return
+        self._channel_validation_failed.set()
+        self._emit("error", message=message)
 
     def _read_rtt_socket(self, connection: socket.socket) -> None:
         parser = SeggerRttLogParser() if self._parse_records else None

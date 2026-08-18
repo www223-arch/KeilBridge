@@ -40,6 +40,16 @@ def test_justfloat_decoder_rejects_non_float_aligned_frame_and_resynchronizes():
     assert decoder.stats.frames == 1
 
 
+def test_bilbopro_decoder_rejects_frames_that_are_not_15_floats():
+    wrong = _frame(*(b"\x00\x00\x00\x00" for _ in range(14)))
+    valid = _frame(*(b"\x00\x00\x00\x00" for _ in range(15)))
+    decoder = JustFloatFrameDecoder(expected_float_count=15)
+
+    assert decoder.feed(wrong + valid) == (valid,)
+    assert decoder.stats.frame_size_mismatches == 1
+    assert decoder.stats.invalid_frames == 1
+
+
 def test_vofa_bridge_forwards_complete_frames_to_tcp_client(tmp_path):
     bridge = VofaTcpBridge("127.0.0.1", 0, raw_output=tmp_path / "capture.bin")
     bridge.start()
@@ -64,6 +74,35 @@ def test_vofa_bridge_forwards_complete_frames_to_tcp_client(tmp_path):
     assert bridge.stats.frames_forwarded == 2
     assert bridge.stats.bytes_forwarded == len(first + second)
     assert bridge.stats.clients_connected == 1
+
+
+def test_bilbopro_bridge_does_not_forward_wrong_float_count(tmp_path):
+    bridge = VofaTcpBridge(
+        "127.0.0.1",
+        0,
+        raw_output=tmp_path / "capture.bin",
+        expected_float_count=15,
+    )
+    bridge.start()
+    client = socket.create_connection(bridge.listen_address, timeout=2)
+    client.settimeout(2)
+    wrong = _frame(*(b"\x00\x00\x00\x00" for _ in range(14)))
+    valid = _frame(*(b"\x00\x00\x00\x00" for _ in range(15)))
+
+    try:
+        bridge.feed(wrong[:17])
+        bridge.feed(wrong[17:] + valid[:31])
+        bridge.feed(valid[31:])
+        received = client.recv(len(valid))
+    finally:
+        client.close()
+        bridge.stop()
+
+    assert received == valid
+    assert (tmp_path / "capture.bin").read_bytes() == wrong + valid
+    assert bridge.stats.frames_forwarded == 1
+    assert bridge.stats.frame_size_mismatches == 1
+    assert "expected 15" in bridge.stats.last_error
 
 
 def test_parse_listen_address_accepts_host_port_and_rejects_invalid_port():

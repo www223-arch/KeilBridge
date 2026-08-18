@@ -303,10 +303,11 @@ def test_one_click_vofa_uses_dedicated_rtt_channel_and_ports(tmp_path, monkeypat
     launches = []
 
     class FakeBridge:
-        def __init__(self, host, port, *, raw_output):
+        def __init__(self, host, port, *, raw_output, expected_float_count):
             self.host = host
             self.port = port
             self.raw_output = raw_output
+            self.expected_float_count = expected_float_count
             self.started = False
             self.stats = SimpleNamespace(
                 frames_received=0,
@@ -370,11 +371,19 @@ def test_one_click_vofa_uses_dedicated_rtt_channel_and_ports(tmp_path, monkeypat
         assert len(sessions) == 1
         assert sessions[0].request.channel == 1
         assert sessions[0].request.port == 19022
+        assert sessions[0].request.expected_channel_name == "Scope"
         assert sessions[0].kwargs["parse_records"] is False
         assert bridges[0].host == "127.0.0.1"
         assert bridges[0].port == 1347
         assert bridges[0].raw_output.name == "rtt-justfloat.bin"
+        assert bridges[0].expected_float_count == 15
         assert bridges[0].started
+        guide = sessions[0].log_path.parent / "scope-channels.txt"
+        assert guide.is_file()
+        assert "I0  = acc_g.x" in guide.read_text(encoding="utf-8")
+        assert "I14 = euler_9dof_deg.yaw" in gui.output._openocd_text.get("1.0", "end")
+        assert gui.vofa_verify_scope_name_var.get() is True
+        assert "Scope" in gui.controls.vofa_verify_scope_check.cget("text")
         assert launches[0][0] == [str(executable.resolve())]
         assert workers[0][0] == "rtt-start-settled"
         assert workers[0][2] is sessions[0]

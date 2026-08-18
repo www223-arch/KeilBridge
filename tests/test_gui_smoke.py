@@ -285,6 +285,105 @@ def test_high_rate_rtt_poll_yields_to_unrelated_tk_callback():
     assert unrelated_ran == [True]
 
 
+def test_one_click_vofa_uses_dedicated_rtt_channel_and_ports(tmp_path, monkeypatch):
+    import tkinter as tk
+
+    import keiltool.gui.app as app
+    from keiltool.gui.app import KeilToolGui
+    from keiltool.gui.settings import SettingsStore
+
+    executable = tmp_path / "vofa+.exe"
+    executable.write_bytes(b"MZ")
+    root = tk.Tk()
+    root.withdraw()
+    gui = KeilToolGui(root, settings_store=SettingsStore(tmp_path / "settings.json"))
+    bridges = []
+    sessions = []
+    workers = []
+    launches = []
+
+    class FakeBridge:
+        def __init__(self, host, port, *, raw_output):
+            self.host = host
+            self.port = port
+            self.raw_output = raw_output
+            self.started = False
+            self.stats = SimpleNamespace(
+                frames_received=0,
+                frames_forwarded=0,
+                frames_dropped=0,
+                invalid_frames=0,
+                clients_connected=0,
+                active_clients=0,
+                last_error="",
+            )
+            bridges.append(self)
+
+        def start(self):
+            self.started = True
+
+        def stop(self):
+            self.started = False
+
+    class FakeSession:
+        def __init__(self, config, request, log_path, **kwargs):
+            self.config = config
+            self.request = request
+            self.log_path = log_path
+            self.kwargs = kwargs
+            self.command = ["openocd", "rtt"]
+            sessions.append(self)
+
+        def start(self):
+            pass
+
+    facts = SimpleNamespace(
+        device="GD32F303CC",
+        ram_origin=0x20000000,
+        ram_size=0x10000,
+    )
+    config = SimpleNamespace(
+        target_cfg="target/stm32f3x.cfg",
+        interface_cfg="interface/stlink.cfg",
+    )
+    gui.logs_dir_var.set(str(tmp_path / "logs"))
+    gui.vofa_path_var.set(str(executable))
+    gui.vofa_listen_var.set("127.0.0.1:1347")
+    monkeypatch.setattr(gui, "_obtain_fresh_snapshot", lambda: SimpleNamespace(facts=facts))
+    monkeypatch.setattr(gui, "_build_openocd_config", lambda _snapshot: config)
+    monkeypatch.setattr(app, "VofaTcpBridge", FakeBridge)
+    monkeypatch.setattr(app, "RttSession", FakeSession)
+    monkeypatch.setattr(
+        app.subprocess,
+        "Popen",
+        lambda command, **kwargs: launches.append((command, kwargs)) or SimpleNamespace(),
+    )
+    monkeypatch.setattr(
+        gui,
+        "_start_worker",
+        lambda kind, action, owner=None: workers.append((kind, action, owner)),
+    )
+
+    try:
+        gui._start_vofa_rtt()
+
+        assert len(sessions) == 1
+        assert sessions[0].request.channel == 1
+        assert sessions[0].request.port == 19022
+        assert sessions[0].kwargs["parse_records"] is False
+        assert bridges[0].host == "127.0.0.1"
+        assert bridges[0].port == 1347
+        assert bridges[0].raw_output.name == "rtt-justfloat.bin"
+        assert bridges[0].started
+        assert launches[0][0] == [str(executable.resolve())]
+        assert workers[0][0] == "rtt-start-settled"
+        assert workers[0][2] is sessions[0]
+    finally:
+        if gui._vofa_bridge is not None:
+            gui._vofa_bridge.stop()
+        root.destroy()
+
+
 def test_gui_applies_theme_and_filters_structured_rtt_records(tmp_path, monkeypatch):
     import tkinter as tk
 
@@ -303,6 +402,7 @@ def test_gui_applies_theme_and_filters_structured_rtt_records(tmp_path, monkeypa
     gui = KeilToolGui(root, settings_store=SettingsStore(tmp_path / "settings.json"))
     try:
         assert gui.rtt_display_level_var.get() == "VERBOSE"
+        assert gui.controls.vofa_start_button.cget("text") == "VOFA+ 曲线"
         assert tuple(gui.output.rtt_level_combo.cget("values")) == (
             "VERBOSE",
             "DEBUG",
@@ -453,6 +553,11 @@ def test_gui_applies_theme_and_filters_structured_rtt_records(tmp_path, monkeypa
         assert saved.project_firmware == "D:/firmware/project.hex"
         assert saved.device_firmware == "D:/firmware/device.bin"
         assert saved.device_name == "GD32F303ZK"
+        gui.vofa_path_var.set("D:/tools/VOFA+/vofa+.exe")
+        gui.vofa_listen_var.set("127.0.0.1:1347")
+        saved = gui._current_settings()
+        assert saved.vofa_path == "D:/tools/VOFA+/vofa+.exe"
+        assert saved.vofa_listen == "127.0.0.1:1347"
 
         gui.output.clear_openocd()
         gui.output.append_openocd("alpha\nbeta\n")
@@ -473,6 +578,24 @@ def test_gui_applies_theme_and_filters_structured_rtt_records(tmp_path, monkeypa
 
         assert gui.output._rtt_text.get("1.0", "end-1c") == "I/ready\n"
         assert gui.rtt_visible_counts_var.get() == "1 可见 / 2 缓存"
+
+        forwarded = []
+        gui._vofa_bridge = SimpleNamespace(
+            feed=forwarded.append,
+            stats=SimpleNamespace(
+                frames_received=1,
+                frames_forwarded=1,
+                frames_dropped=0,
+                invalid_frames=0,
+                clients_connected=1,
+                active_clients=1,
+                last_error="",
+            ),
+        )
+        gui._handle_rtt_event(RttEvent("raw", data=b"\x00\x00\x80?\x00\x00\x80\x7f"))
+        assert forwarded == [b"\x00\x00\x80?\x00\x00\x80\x7f"]
+        assert "1 帧" in gui.counts_var.get()
+        gui._vofa_bridge = None
 
         gui._rtt_display = RttDisplayBuffer(max_records=2)
         gui._clear_rtt_display()

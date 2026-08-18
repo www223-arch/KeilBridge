@@ -32,6 +32,8 @@ class GuiSettings:
     device_source_mode: str = "device"
     project_firmware: str = ""
     device_firmware: str = ""
+    vofa_path: str = ""
+    vofa_listen: str = "127.0.0.1:1347"
 
     def to_dict(self) -> dict[str, object]:
         return {"version": SETTINGS_VERSION, **asdict(self)}
@@ -71,6 +73,8 @@ class GuiSettings:
                 data.get("device_firmware"),
                 firmware if not project else "",
             ),
+            vofa_path=_string(data.get("vofa_path"), defaults.vofa_path),
+            vofa_listen=_string(data.get("vofa_listen"), defaults.vofa_listen),
         )
 
 

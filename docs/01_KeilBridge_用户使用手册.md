@@ -293,6 +293,10 @@ Flash 读取、烧录、连接检查和 RTT 共享同一支 ST-Link，但任何�
 
 Windows GUI 启动的 OpenOCD 进程使用后台窗口模式，连接检查、Flash 读取、烧录和 RTT 期间不会额外弹出终端窗口。该策略只作用于 GUI；CLI 仍保持标准 stdout/stderr 和中断处理，便于脚本、AI 自动化调试和第三方工具集成。
 
+RTT 区域的“VOFA+ 曲线”按钮提供一键 JustFloat 桥接。它固定读取 RTT up-channel 1，通过 OpenOCD 本地端口 `19022` 接收字节，在 `127.0.0.1:1347` 建立 TCP 服务，然后启动已记忆的 VOFA+。首次使用时如果没有找到 `vofa+.exe`，工作台会要求选择一次，关闭时自动保存路径。VOFA+ 中首次建立一个 TCP 客户端连接，目标为 `127.0.0.1:1347`，协议引擎选择 JustFloat；VOFA+ 保存该工程后，后续只需点击工作台按钮。普通“开始采集”仍使用当前通道和文本日志解析，不受曲线模式影响。
+
+曲线模式不会 reset、halt 或 resume MCU。工作台按 JustFloat 帧尾切分完整帧，在独立线程中转发，VOFA+ 未连接或绘制变慢不会阻塞 RTT 接收。转发队列满时只丢弃用于实时显示的完整帧，并显示转发、丢弃和无效帧计数；RTT 原始字节仍优先写入本次会话的 `rtt-justfloat.bin`。停止采集会关闭 OpenOCD 和本地 TCP bridge，但不会强制关闭 VOFA+。
+
 默认日志目录为：
 
 ```text
@@ -302,7 +306,7 @@ Windows GUI 启动的 OpenOCD 进程使用后台窗口模式，连接检查、Fl
 无工程时默认使用 `%APPDATA%\KeilTool\logs\`。可以在工作台中改为其他根目录，修改会被记住。每次连接、Flash 读取、烧录和 RTT 都创建独立目录：
 
 ```text
-YYYYMMDD-HHMMSS-fff_<device>_<CONNECT|FLASH_READ|FLASH|RTT>\
+YYYYMMDD-HHMMSS-fff_<device>_<CONNECT|FLASH_READ|FLASH|RTT|RTT_VOFA>\
 ```
 
 目录中包含任务日志、`openocd.stdout.log`、`openocd.stderr.log` 和 `session.json`；元数据写明开始/结束时间、芯片、任务、target cfg 和结果。RTT 通道完整内容保存在 `rtt.log`。等级过滤和“清空显示”只影响 GUI，不删除或截断完整日志。RTT 和 OpenOCD 文本区支持 `Ctrl+C`、右键复制/全选/复制全部，工具栏也可直接复制全部可见文本。
@@ -318,6 +322,7 @@ k2c flash --device GD32F303CC --firmware "C:\Path\app.hex" --output-format json
 k2c flash-read --device GD32F303CC --output "C:\Logs\GD32F303CC_flash.bin" --output-format json
 k2c rtt --device GD32F303CC --format jsonl
 k2c rtt --device STM32G431CBUx --vendor Keil --channel 1 --port 19022 --format raw --output "C:\Logs\foc_sweep.bin" --duration 8
+k2c rtt --device GD32F303CC --channel 1 --port 19022 --format raw --output "C:\Logs\scope.bin" --vofa-listen 127.0.0.1:1347 --vofa-executable "C:\Tools\VOFA+\vofa+.exe"
 ```
 
 `connect`、`flash` 和 `flash-read` 的 JSON schema 为 `keiltool.hardware.v1`，包含成功状态、设备、来源、target cfg、OpenOCD 返回码、证据日志和产物信息。`flash-read` 只有在输出文件字节数与主 Flash 容量完全一致时才成功，并返回 SHA-256；失败时保留已有的部分文件作为诊断证据。
@@ -325,6 +330,8 @@ k2c rtt --device STM32G431CBUx --vendor Keil --channel 1 --port 19022 --format r
 RTT 默认持续采集到 `Ctrl+C`、RTT EOF 或错误，也可用 `--duration <秒>` 限时。`--format text` 输出解析后的日志，`jsonl` 输出 schema 为 `keiltool.rtt.v1` 的逐条记录；`raw` 不做 UTF-8 解码、换行或终端帧处理，原样处理 RTT TCP 字节。raw 未指定 `--output` 时仍写 stdout；指定 `--output PATH` 时使用至少 1 MiB 的主机文件缓冲直接写入该二进制文件，并抑制 raw stdout。输出文件在每次启动时截断，退出时 flush/close。OpenOCD 状态、累计接收字节数、最终文件字节数、异常和断连信息写 stderr。`Ctrl+C` 会清理 RTT/OpenOCD 后返回退出码 `130`。
 
 `--channel 1` 可让 FOC 二进制记录独占 RTT 上行通道 1，`--port 19022` 指定 KeilTool 连接的本地 OpenOCD RTT TCP 端口。该采集命令只执行 `rtt setup`、`rtt start` 和 `rtt server start`，目标运行期间不发送 reset、halt 或 resume。主机字节计数只能证明 KeilTool 收到和写入了多少字节，不能检测 MCU 产生记录之前或 RTT 缓冲区内发生的漏记录；扫频有效性仍应由记录内 timestamp 连续性判定。
+
+`--vofa-listen HOST:PORT` 把 raw RTT 中的完整 JustFloat 帧转发给连接到该地址的 VOFA+ TCP 客户端；必须与 `--format raw` 配合。可选的 `--vofa-executable PATH` 会在监听成功后启动 VOFA+。命令结束时 stderr 额外报告收到、转发、丢弃、无效帧和连接次数。
 
 高级覆盖参数在这些命令中保持一致：`--openocd`、`--scripts`、`--target-cfg` 和 `--logs-dir`。无法验证设备内存范围或 target cfg 时命令会失败，不会猜测配置继续访问硬件。
 

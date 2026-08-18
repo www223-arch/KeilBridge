@@ -228,6 +228,116 @@ def test_rtt_duration_stops_a_connected_session(tmp_path, monkeypatch):
     )
 
     assert args.func(args) == 0
+
+
+def test_rtt_parser_exposes_vofa_bridge_options():
+    args = cli.build_parser().parse_args(
+        [
+            "rtt",
+            "--device",
+            "GD32F303CC",
+            "--vofa-listen",
+            "127.0.0.1:1347",
+            "--vofa-executable",
+            "D:/tools/vofa+.exe",
+        ]
+    )
+
+    assert args.vofa_listen == "127.0.0.1:1347"
+    assert args.vofa_executable == Path("D:/tools/vofa+.exe")
+
+
+def test_rtt_does_not_start_vofa_bridge_before_hardware_validation(monkeypatch):
+    started = []
+
+    class FakeBridge:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def start(self):
+            started.append(True)
+
+    monkeypatch.setattr(cli, "VofaTcpBridge", FakeBridge)
+    monkeypatch.setattr(
+        cli,
+        "resolve_hardware_context",
+        lambda _selection: (_ for _ in ()).throw(SystemExit("invalid target")),
+    )
+    args = cli.build_parser().parse_args(
+        [
+            "rtt",
+            "--device",
+            "UNKNOWN",
+            "--format",
+            "raw",
+            "--vofa-listen",
+            "127.0.0.1:1347",
+        ]
+    )
+
+    with pytest.raises(SystemExit, match="invalid target"):
+        args.func(args)
+
+    assert started == []
+
+
+def test_rtt_vofa_bridge_receives_raw_events(tmp_path, monkeypatch, capsysbinary):
+    payload = b"\x00\x00\x80?\x00\x00\x80\x7f"
+    FakeRttSession.event_list = (
+        RttEvent("connected", message="connected"),
+        RttEvent("raw", data=payload),
+        RttEvent("eof", message="closed"),
+    )
+
+    class FakeBridge:
+        last = None
+
+        def __init__(self, host, port):
+            self.listen_address = (host, port)
+            self.payloads = []
+            self.started = False
+            self.stopped = False
+            self.stats = SimpleNamespace(
+                frames_received=1,
+                frames_forwarded=1,
+                frames_dropped=0,
+                invalid_frames=0,
+                clients_connected=1,
+                last_error="",
+            )
+            FakeBridge.last = self
+
+        def start(self):
+            self.started = True
+
+        def feed(self, data):
+            self.payloads.append(data)
+
+        def stop(self):
+            self.stopped = True
+
+    monkeypatch.setattr(cli, "VofaTcpBridge", FakeBridge)
+    output = tmp_path / "capture.bin"
+
+    assert (
+        _run(
+            tmp_path,
+            monkeypatch,
+            "raw",
+            "--output",
+            str(output),
+            "--vofa-listen",
+            "127.0.0.1:1347",
+        )
+        == 0
+    )
+
+    capture = capsysbinary.readouterr()
+    assert FakeBridge.last.started
+    assert FakeBridge.last.stopped
+    assert FakeBridge.last.payloads == [payload]
+    assert FakeRttSession.last.kwargs["parse_records"] is False
+    assert b"frames_forwarded=1" in capture.err
     assert FakeRttSession.last.stopped
 
 

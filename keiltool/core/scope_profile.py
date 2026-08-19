@@ -58,8 +58,8 @@ def render_scope_guide(profile: ScopeProfile) -> str:
         "\n"
         "VOFA+ first use\n"
         "---------------\n"
-        "1. Select a TCP client connection to 127.0.0.1:1347.\n"
-        "2. Select the JustFloat protocol engine.\n"
+        "1. KeilTool auto-fills TCP Client 127.0.0.1:1347 and JustFloat for VOFA+ 1.3.\n"
+        "2. In the newly opened VOFA+ window, click the connection button.\n"
         "3. Add or rename curves using the I0-I14 mapping above.\n"
         "4. Keep this profile fixed for the complete capture session.\n"
     )

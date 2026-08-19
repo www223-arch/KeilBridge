@@ -62,6 +62,7 @@ class WorkbenchVariables(Protocol):
     vofa_path_var: tk.StringVar
     vofa_listen_var: tk.StringVar
     vofa_verify_scope_name_var: tk.BooleanVar
+    vofa_connection_hint_var: tk.StringVar
 
 
 class OperationStatusPane(ttk.Frame):
@@ -313,6 +314,22 @@ class ConfigurationPane(ttk.Frame):
         self.vofa_start_button.grid(row=0, column=1, sticky="ew", padx=3)
         self.rtt_stop_button = ttk.Button(actions, text="停止采集")
         self.rtt_stop_button.grid(row=0, column=2, sticky="ew", padx=(3, 0))
+
+        vofa_hint = ttk.Frame(section)
+        vofa_hint.grid(row=5, column=0, columnspan=3, sticky="ew", pady=(6, 0))
+        vofa_hint.columnconfigure(0, weight=1)
+        ttk.Label(
+            vofa_hint,
+            textvariable=variables.vofa_connection_hint_var,
+            style="Accent.TLabel",
+            wraplength=270,
+            justify="left",
+        ).grid(row=0, column=0, sticky="w")
+        self.copy_vofa_connection_button = ttk.Button(
+            vofa_hint,
+            text="复制连接参数",
+        )
+        self.copy_vofa_connection_button.grid(row=0, column=1, sticky="e", padx=(8, 0))
 
         self._remember_editable(
             self.auto_radio,

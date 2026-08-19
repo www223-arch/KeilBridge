@@ -301,6 +301,7 @@ def test_one_click_vofa_uses_dedicated_rtt_channel_and_ports(tmp_path, monkeypat
     sessions = []
     workers = []
     launches = []
+    configurations = []
 
     class FakeBridge:
         def __init__(self, host, port, *, raw_output, expected_float_count):
@@ -355,6 +356,12 @@ def test_one_click_vofa_uses_dedicated_rtt_channel_and_ports(tmp_path, monkeypat
     monkeypatch.setattr(app, "VofaTcpBridge", FakeBridge)
     monkeypatch.setattr(app, "RttSession", FakeSession)
     monkeypatch.setattr(
+        app,
+        "prepare_installed_vofa_connection",
+        lambda executable, host, port: configurations.append((executable, host, port))
+        or SimpleNamespace(configured=True, changed=True, config_path=tmp_path / "vofa.json"),
+    )
+    monkeypatch.setattr(
         app.subprocess,
         "Popen",
         lambda command, **kwargs: launches.append((command, kwargs)) or SimpleNamespace(),
@@ -385,6 +392,9 @@ def test_one_click_vofa_uses_dedicated_rtt_channel_and_ports(tmp_path, monkeypat
         assert gui.vofa_verify_scope_name_var.get() is True
         assert "Scope" in gui.controls.vofa_verify_scope_check.cget("text")
         assert launches[0][0] == [str(executable.resolve())]
+        assert configurations == [(executable.resolve(), "127.0.0.1", 1347)]
+        assert "127.0.0.1:1347" in gui.vofa_connection_hint_var.get()
+        assert "JustFloat" in gui.vofa_connection_hint_var.get()
         assert workers[0][0] == "rtt-start-settled"
         assert workers[0][2] is sessions[0]
     finally:

@@ -64,6 +64,12 @@ def configure_theme(root: tk.Tk) -> ttk.Style:
     style.configure("Background.TFrame", background=PALETTE["background"])
     style.configure("TLabel", background=PALETTE["surface"], foreground=PALETTE["text"])
     style.configure("Muted.TLabel", background=PALETTE["surface"], foreground=PALETTE["muted"])
+    style.configure(
+        "Accent.TLabel",
+        background=PALETTE["surface"],
+        foreground=PALETTE["primary"],
+        font=("Microsoft YaHei UI", 9, "bold"),
+    )
     style.configure("TRadiobutton", background=PALETTE["surface"], foreground=PALETTE["text"])
     style.map("TRadiobutton", background=[("active", PALETTE["surface"])])
     style.configure(

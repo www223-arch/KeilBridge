@@ -39,6 +39,10 @@ from keiltool.core.vofa_bridge import (
     discover_vofa_executable,
     parse_listen_address,
 )
+from keiltool.core.vofa_config import (
+    VofaConnectionConfigResult,
+    prepare_installed_vofa_connection,
+)
 from keiltool.gui.project_config import (
     ProjectTargetFacts,
     clear_project_device_catalog_cache,
@@ -263,6 +267,8 @@ class KeilToolGui:
         self.vofa_verify_scope_name_var = tk.BooleanVar(
             value=settings.vofa_verify_scope_name
         )
+        self.vofa_connection_hint_var = tk.StringVar()
+        self._update_vofa_connection_hint()
         self.status_var = tk.StringVar(value=_STATE_TEXT[SessionState.IDLE])
         self.elapsed_var = tk.StringVar(value="00:00:00")
         self.counts_var = tk.StringVar(value="0 字节 / 0 行")
@@ -340,6 +346,7 @@ class KeilToolGui:
         controls.rtt_stop_button.configure(command=self._stop_rtt)
         controls.vofa_button.configure(command=self._choose_vofa)
         controls.scope_guide_button.configure(command=self._open_scope_guide)
+        controls.copy_vofa_connection_button.configure(command=self._copy_vofa_connection)
         controls.auto_radio.configure(command=self._refresh_controls)
         controls.manual_radio.configure(command=self._refresh_controls)
         controls.project_source_radio.configure(command=self._change_device_source)
@@ -349,6 +356,7 @@ class KeilToolGui:
         controls.device_combo.bind("<KeyRelease>", self._filter_device_choices)
         controls.device_combo.bind("<Return>", lambda _event: self._select_catalog_device())
         self.firmware_var.trace_add("write", lambda *_args: self._refresh_controls())
+        self.vofa_listen_var.trace_add("write", lambda *_args: self._update_vofa_connection_hint())
         controls.firmware_entry.bind("<FocusOut>", self._accept_typed_firmware)
         controls.firmware_entry.bind("<Return>", self._accept_typed_firmware)
         for variable in (
@@ -1091,6 +1099,7 @@ class KeilToolGui:
         self._begin_feedback(task_name, "准备 RTT 配置")
         bridge: VofaTcpBridge | None = None
         vofa_process: subprocess.Popen | None = None
+        vofa_setup: VofaConnectionConfigResult | None = None
         log_context: SessionLogContext | None = None
         try:
             snapshot = self._obtain_fresh_snapshot()
@@ -1164,6 +1173,11 @@ class KeilToolGui:
                     expected_float_count=BILBOPRO_IMU_SCOPE_V1.expected_float_count,
                 )
                 bridge.start()
+                vofa_setup = prepare_installed_vofa_connection(
+                    vofa_executable,
+                    vofa_host,
+                    vofa_port,
+                )
                 vofa_process = subprocess.Popen(
                     [str(vofa_executable)],
                     cwd=vofa_executable.parent,
@@ -1207,6 +1221,12 @@ class KeilToolGui:
         self._set_feedback_stage("扫描 RTT 控制块", ProgressMode.INDETERMINATE)
         self.elapsed_var.set("00:00:00")
         self.counts_var.set("0 字节 / 0 帧 / 等待 VOFA+" if vofa else "0 字节 / 0 行")
+        vofa_setup_status = ""
+        if vofa and vofa_setup is not None:
+            vofa_setup_status = "成功" if vofa_setup.configured else "未完成"
+            detail = getattr(vofa_setup, "message", "")
+            if detail:
+                vofa_setup_status += f" · {detail}"
         self._append_openocd(
             "[RTT]\n"
             f"命令: {subprocess.list2cmdline(session.command)}\n"
@@ -1215,6 +1235,7 @@ class KeilToolGui:
             f"OpenOCD stderr: {log_paths.stderr}\n"
             + (
                 f"VOFA+ TCP: {self.vofa_listen_var.get().strip()} (JustFloat)\n"
+                f"VOFA+ 自动配置: {vofa_setup_status}\n"
                 f"RTT 原始数据: {log_context.directory / 'rtt-justfloat.bin'}\n"
                 f"通道说明: {self._scope_guide_path}\n"
                 f"{render_scope_guide(BILBOPRO_IMU_SCOPE_V1)}\n"
@@ -1225,6 +1246,55 @@ class KeilToolGui:
         self._set_status()
         self._refresh_controls()
         self._start_worker("rtt-start-settled", session.start, owner=session)
+        if vofa and vofa_setup is not None:
+            self.root.after_idle(
+                lambda setup=vofa_setup, host=vofa_host, port=vofa_port: self._show_vofa_connection_help(
+                    setup,
+                    host,
+                    port,
+                )
+            )
+
+    def _update_vofa_connection_hint(self) -> None:
+        try:
+            host, port = parse_listen_address(self.vofa_listen_var.get())
+            text = f"VOFA+：TCP 客户端 · {host}:{port} · JustFloat"
+        except ValueError:
+            text = "VOFA+：连接地址无效，请在高级设置中修正"
+        self.vofa_connection_hint_var.set(text)
+
+    def _copy_vofa_connection(self) -> None:
+        try:
+            host, port = parse_listen_address(self.vofa_listen_var.get())
+        except ValueError as exc:
+            self._fail_feedback("无法复制 VOFA+ 连接参数", str(exc))
+            return
+        text = f"TCP Client | {host}:{port} | JustFloat"
+        self.root.clipboard_clear()
+        self.root.clipboard_append(text)
+        self.status_var.set(f"已复制 VOFA+ 连接参数：{text}")
+
+    def _show_vofa_connection_help(
+        self,
+        setup: VofaConnectionConfigResult,
+        host: str,
+        port: int,
+    ) -> None:
+        if setup.configured:
+            config_status = "已自动填入 VOFA+" if setup.changed else "VOFA+ 已是正确配置"
+        else:
+            config_status = f"未能自动填写：{setup.message}"
+        messagebox.showinfo(
+            "VOFA+ 连接参数",
+            f"{config_status}\n\n"
+            "连接方式：TCP 客户端\n"
+            f"服务器：{host}\n"
+            f"端口：{port}\n"
+            "协议：JustFloat\n\n"
+            "请在本次新打开的 VOFA+ 窗口点击连接按钮。\n"
+            "连接参数也会一直显示在 KeilTool 的 RTT 采集区域。",
+            parent=self.root,
+        )
 
     def _stop_rtt(self) -> None:
         session = self._rtt_session

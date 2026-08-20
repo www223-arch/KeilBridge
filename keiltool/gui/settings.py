@@ -34,6 +34,7 @@ class GuiSettings:
     device_firmware: str = ""
     vofa_path: str = ""
     vofa_listen: str = "127.0.0.1:1347"
+    vofa_scope_profile: str = "bilbopro-imu-scope-v1"
     vofa_verify_scope_name: bool = True
 
     def to_dict(self) -> dict[str, object]:
@@ -76,6 +77,10 @@ class GuiSettings:
             ),
             vofa_path=_string(data.get("vofa_path"), defaults.vofa_path),
             vofa_listen=_string(data.get("vofa_listen"), defaults.vofa_listen),
+            vofa_scope_profile=_string(
+                data.get("vofa_scope_profile"),
+                defaults.vofa_scope_profile,
+            ),
             vofa_verify_scope_name=_boolean(
                 data.get("vofa_verify_scope_name"),
                 defaults.vofa_verify_scope_name,

@@ -33,7 +33,12 @@ from .core.openocd_backend import (
 )
 from .core.session_logs import create_session_logs
 from .core.rtt import RttChannelConfig, RttEvent, RttRequest, RttSession
-from .core.scope_profile import BILBOPRO_IMU_SCOPE_V1, write_scope_guide
+from .core.scope_profile import (
+    BILBOPRO_IMU_SCOPE_V1,
+    SCOPE_PROFILES,
+    get_scope_profile,
+    write_scope_guide,
+)
 from .core.process_launch import background_process_kwargs
 from .core.vofa_bridge import VofaTcpBridge, parse_listen_address
 from .core.scatter import generate_gnu_ld, parse_scatter_memory
@@ -524,10 +529,14 @@ def cmd_rtt(args: argparse.Namespace) -> int:
         raise SystemExit("--vofa-listen requires --format raw.")
     if args.vofa_executable is not None and args.vofa_listen is None:
         raise SystemExit("--vofa-executable requires --vofa-listen.")
-    scope_profile = BILBOPRO_IMU_SCOPE_V1 if args.vofa_listen is not None else None
+    if args.scope_profile != BILBOPRO_IMU_SCOPE_V1.profile_id and args.vofa_listen is None:
+        raise SystemExit("--scope-profile requires --vofa-listen.")
+    scope_profile = (
+        get_scope_profile(args.scope_profile) if args.vofa_listen is not None else None
+    )
     port = args.port
     if port is None:
-        port = 19022 if scope_profile is not None else 19021
+        port = scope_profile.rtt_port if scope_profile is not None else 19021
     channel = args.channel
     if channel is None:
         channel = scope_profile.rtt_channel if scope_profile is not None else 0
@@ -557,6 +566,28 @@ def cmd_rtt(args: argparse.Namespace) -> int:
     else:
         scan_address = args.address
         scan_size = args.scan_size if args.scan_size is not None else 0x100
+    additional_channels: list[RttChannelConfig] = []
+    if scope_profile is not None:
+        additional_channels.append(
+            RttChannelConfig(port=args.text_port, channel=0, parse_records=True)
+        )
+        if scope_profile.rtt_down_channel != scope_profile.rtt_channel:
+            additional_channels.append(
+                RttChannelConfig(
+                    port=scope_profile.rtt_down_port,
+                    channel=scope_profile.rtt_down_channel,
+                    expected_channel_name=(
+                        BILBOPRO_IMU_SCOPE_V1.rtt_channel_name
+                        if not args.no_verify_channel_name
+                        else None
+                    ),
+                    expected_down_channel_name=(
+                        scope_profile.rtt_down_channel_name
+                        if not args.no_verify_channel_name
+                        else None
+                    ),
+                )
+            )
     request = RttRequest(
         scan_address=scan_address,
         scan_size=scan_size,
@@ -567,11 +598,7 @@ def cmd_rtt(args: argparse.Namespace) -> int:
             if scope_profile is not None and not args.no_verify_channel_name
             else None
         ),
-        additional_channels=(
-            RttChannelConfig(port=args.text_port, channel=0, parse_records=True),
-        )
-        if scope_profile is not None
-        else (),
+        additional_channels=tuple(additional_channels),
     )
     log_context = create_session_logs(
         context.logs_dir,
@@ -587,7 +614,9 @@ def cmd_rtt(args: argparse.Namespace) -> int:
             "vofa_listen": args.vofa_listen or "",
             "scope_profile": scope_profile.profile_id if scope_profile is not None else "",
             "expected_channel_name": request.expected_channel_name or "",
-            "rtt_down_channel": scope_profile.rtt_channel if scope_profile is not None else "",
+            "rtt_down_channel": (
+                scope_profile.rtt_down_channel if scope_profile is not None else ""
+            ),
             "rtt_down_channel_name": (
                 scope_profile.rtt_down_channel_name if scope_profile is not None else ""
             ),
@@ -622,7 +651,10 @@ def cmd_rtt(args: argparse.Namespace) -> int:
             *vofa_endpoint,
             expected_float_count=scope_profile.expected_float_count if scope_profile else None,
             reverse_output=log_context.directory / "vofa-to-mcu.bin",
-            reverse_sink=lambda data: session.send_bytes(data, channel=scope_profile.rtt_channel),
+            reverse_sink=lambda data: session.send_bytes(
+                data,
+                channel=scope_profile.rtt_down_channel,
+            ),
         )
     print(f"RTT log: {log_context.rtt_log}", file=sys.stderr, flush=True)
     print(f"Session metadata: {log_context.metadata_log}", file=sys.stderr, flush=True)
@@ -1190,7 +1222,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--port",
         type=int,
         default=None,
-        help="Local RTT TCP port (default: 19022 in VOFA mode, otherwise 19021)",
+        help="Local RTT TCP port (default: selected Scope profile port, otherwise 19021)",
     )
     rtt_cmd.add_argument(
         "--text-port",
@@ -1204,6 +1236,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="Bridge JustFloat RTT up-data and transparent RTT down-data with VOFA+",
     )
     rtt_cmd.add_argument(
+        "--scope-profile",
+        choices=tuple(profile.profile_id for profile in SCOPE_PROFILES),
+        default=BILBOPRO_IMU_SCOPE_V1.profile_id,
+        help=(
+            "Scope contract used with --vofa-listen "
+            f"(default: {BILBOPRO_IMU_SCOPE_V1.profile_id})"
+        ),
+    )
+    rtt_cmd.add_argument(
         "--vofa-executable",
         type=Path,
         help="Launch VOFA+ after the TCP bridge starts; requires --vofa-listen",
@@ -1211,7 +1252,7 @@ def build_parser() -> argparse.ArgumentParser:
     rtt_cmd.add_argument(
         "--no-verify-channel-name",
         action="store_true",
-        help="Advanced: disable the default channel name 'Scope' check in VOFA mode",
+        help="Advanced: disable Scope profile RTT up/down channel name checks",
     )
     rtt_cmd.add_argument(
         "--duration",

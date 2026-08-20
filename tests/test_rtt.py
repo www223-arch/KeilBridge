@@ -147,6 +147,54 @@ def test_session_refuses_channel_name_mismatch_before_tcp_connect(tmp_path):
     assert "TextLog" in event.message
 
 
+def test_session_refuses_down_channel_name_mismatch_before_tcp_connect(tmp_path):
+    process = FakeProcess(
+        stdout_lines=(
+            "Info : rtt: Control block found at 0x20008fc0\n",
+            "Channels: up=3, down=2\n",
+            "Up-channels:\n",
+            "0: Terminal 1024 0\n",
+            "1: Scope 2048 0\n",
+            "2: LoopScope 4096 0\n",
+            "Down-channels:\n",
+            "0: Terminal 16 0\n",
+            "1: WrongCmd 256 0\n",
+        )
+    )
+    connect_calls = []
+    session = RttSession(
+        CONFIG,
+        RttRequest(
+            scan_address=0x20000000,
+            scan_size=0x10000,
+            port=19023,
+            channel=2,
+            expected_channel_name="LoopScope",
+            additional_channels=(
+                RttChannelConfig(
+                    port=19022,
+                    channel=1,
+                    expected_channel_name="Scope",
+                    expected_down_channel_name="ScopeCmd",
+                ),
+            ),
+        ),
+        tmp_path / "rtt.log",
+        popen_factory=lambda *args, **kwargs: process,
+        socket_factory=lambda *args, **kwargs: connect_calls.append(args),
+        connect_timeout=0.5,
+    )
+
+    session.start()
+    event = _next_event(session, "error")
+    session.stop()
+
+    assert connect_calls == []
+    assert "down-channel 1" in event.message
+    assert "ScopeCmd" in event.message
+    assert "WrongCmd" in event.message
+
+
 def test_session_validates_scope_channel_before_tcp_connect(tmp_path):
     payload = b"scope-data"
     port, server = _start_rtt_server(payload)

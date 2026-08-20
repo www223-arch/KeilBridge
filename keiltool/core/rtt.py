@@ -20,6 +20,7 @@ class RttChannelConfig:
     port: int = 19021
     channel: int = 0
     expected_channel_name: str | None = None
+    expected_down_channel_name: str | None = None
     parse_records: bool = False
 
     def __post_init__(self) -> None:
@@ -34,6 +35,13 @@ class RttChannelConfig:
                 self.expected_channel_name.encode("ascii")
             except UnicodeEncodeError as exc:
                 raise ValueError("Expected RTT channel name must be ASCII.") from exc
+        if self.expected_down_channel_name is not None:
+            if not self.expected_down_channel_name:
+                raise ValueError("Expected RTT down-channel name must not be empty.")
+            try:
+                self.expected_down_channel_name.encode("ascii")
+            except UnicodeEncodeError as exc:
+                raise ValueError("Expected RTT down-channel name must be ASCII.") from exc
 
 
 @dataclass(frozen=True, slots=True)
@@ -43,6 +51,7 @@ class RttRequest:
     port: int = 19021
     channel: int = 0
     expected_channel_name: str | None = None
+    expected_down_channel_name: str | None = None
     additional_channels: tuple[RttChannelConfig, ...] = ()
 
     def __post_init__(self) -> None:
@@ -54,6 +63,7 @@ class RttRequest:
             port=self.port,
             channel=self.channel,
             expected_channel_name=self.expected_channel_name,
+            expected_down_channel_name=self.expected_down_channel_name,
         )
         channels = (primary, *tuple(self.additional_channels))
         object.__setattr__(self, "additional_channels", tuple(self.additional_channels))
@@ -82,10 +92,15 @@ def build_rtt_command(config: OpenOcdConfig, request: RttRequest) -> list[str]:
             port=request.port,
             channel=request.channel,
             expected_channel_name=request.expected_channel_name,
+            expected_down_channel_name=request.expected_down_channel_name,
         ),
         *request.additional_channels,
     )
-    if any(item.expected_channel_name is not None for item in channels):
+    if any(
+        item.expected_channel_name is not None
+        or item.expected_down_channel_name is not None
+        for item in channels
+    ):
         command.extend(("-c", "rtt channels"))
     for item in channels:
         command.extend(("-c", f"rtt server start {item.port} {item.channel}"))
@@ -173,6 +188,7 @@ class RttSession:
                 port=request.port,
                 channel=request.channel,
                 expected_channel_name=request.expected_channel_name,
+                expected_down_channel_name=request.expected_down_channel_name,
                 parse_records=parse_records,
             ),
             *request.additional_channels,
@@ -182,7 +198,13 @@ class RttSession:
             for item in self._channels
             if item.expected_channel_name is not None
         }
+        self._expected_down_channel_names = {
+            item.channel: item.expected_down_channel_name
+            for item in self._channels
+            if item.expected_down_channel_name is not None
+        }
         self._verified_channels: set[int] = set()
+        self._verified_down_channels: set[int] = set()
         self._socket_lock = threading.Lock()
         self._send_lock = threading.Lock()
         self._log_lock = threading.Lock()
@@ -328,7 +350,10 @@ class RttSession:
         deadline = self._monotonic() + self._connect_timeout
         while not self._stop_requested.is_set():
             control_block_ready = self._control_block_found.is_set()
-            channel_ready = not self._expected_channel_names or self._channel_verified.is_set()
+            channel_ready = (
+                not self._expected_channel_names
+                and not self._expected_down_channel_names
+            ) or self._channel_verified.is_set()
             if control_block_ready and channel_ready:
                 self._connect_rtt_servers(deadline)
                 return
@@ -420,7 +445,10 @@ class RttSession:
             self._parse_channel_listing(line)
 
     def _parse_channel_listing(self, line: str) -> None:
-        if not self._expected_channel_names or self._channel_validation_failed.is_set():
+        if (
+            not self._expected_channel_names
+            and not self._expected_down_channel_names
+        ) or self._channel_validation_failed.is_set():
             return
         text = re.sub(r"^(?:info|debug|warn|error)\s*:\s*", "", line.strip(), flags=re.IGNORECASE)
         with self._channel_parse_lock:
@@ -438,28 +466,39 @@ class RttSession:
                         )
                 self._channel_section = "down"
                 return
-            if self._channel_section != "up":
+            if self._channel_section not in {"up", "down"}:
                 return
             match = re.fullmatch(r"(\d+):\s+(.*?)\s+(\d+)\s+(\d+)", text)
             if match is None:
                 return
             channel = int(match.group(1))
-            expected = self._expected_channel_names.get(channel)
-            if expected is None or channel in self._verified_channels:
+            if self._channel_section == "up":
+                expected_names = self._expected_channel_names
+                verified_channels = self._verified_channels
+                direction = "up"
+            else:
+                expected_names = self._expected_down_channel_names
+                verified_channels = self._verified_down_channels
+                direction = "down"
+            expected = expected_names.get(channel)
+            if expected is None or channel in verified_channels:
                 return
             actual = match.group(2)
             if actual != expected:
                 self._reject_channel(
-                    f"RTT up-channel {channel} name mismatch: "
+                    f"RTT {direction}-channel {channel} name mismatch: "
                     f"expected '{expected}', actual '{actual}'."
                 )
                 return
-            self._verified_channels.add(channel)
-            if self._verified_channels == set(self._expected_channel_names):
+            verified_channels.add(channel)
+            if (
+                self._verified_channels == set(self._expected_channel_names)
+                and self._verified_down_channels == set(self._expected_down_channel_names)
+            ):
                 self._channel_verified.set()
             self._emit(
                 "channel_verified",
-                message=f"RTT up-channel {channel} verified as '{actual}'.",
+                message=f"RTT {direction}-channel {channel} verified as '{actual}'.",
                 channel=channel,
             )
 

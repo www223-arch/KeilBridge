@@ -253,6 +253,7 @@ def test_rtt_parser_exposes_vofa_bridge_options():
     assert args.vofa_executable == Path("D:/tools/vofa+.exe")
     assert args.no_verify_channel_name is False
     assert args.text_port == 19021
+    assert args.scope_profile == "bilbopro-imu-scope-v1"
 
 
 def test_rtt_does_not_start_vofa_bridge_before_hardware_validation(monkeypatch):
@@ -392,6 +393,92 @@ def test_rtt_vofa_allows_explicitly_disabling_channel_name_verification(
 
     capsysbinary.readouterr()
     assert FakeRttSession.last.request.expected_channel_name is None
+
+
+def test_rtt_loop_scope_v2_routes_only_up2_and_sends_commands_to_down1(
+    tmp_path,
+    monkeypatch,
+    capsysbinary,
+):
+    v1_payload = b"v1-scope-must-not-leak"
+    loop_payload = b"\x00" * 160 + b"\x00\x00\x80\x7f"
+    FakeRttSession.event_list = (
+        RttEvent("connected", message="text", channel=0),
+        RttEvent("connected", message="control", channel=1),
+        RttEvent("connected", message="loop", channel=2),
+        RttEvent("raw", data=b"I/ready\n", channel=0),
+        RttEvent("raw", data=v1_payload, channel=1),
+        RttEvent("raw", data=loop_payload, channel=2),
+        RttEvent("eof", message="closed", channel=2),
+    )
+
+    class FakeBridge:
+        last = None
+
+        def __init__(self, host, port, **kwargs):
+            self.listen_address = (host, port)
+            self.kwargs = kwargs
+            self.payloads = []
+            self.stats = SimpleNamespace(
+                frames_received=1,
+                frames_forwarded=1,
+                frames_dropped=0,
+                invalid_frames=0,
+                clients_connected=1,
+                last_error="",
+            )
+            FakeBridge.last = self
+
+        def start(self):
+            pass
+
+        def feed(self, data):
+            self.payloads.append(data)
+
+        def stop(self):
+            pass
+
+    monkeypatch.setattr(cli, "VofaTcpBridge", FakeBridge)
+    output = tmp_path / "loop-scope-v2.bin"
+
+    assert (
+        _run(
+            tmp_path,
+            monkeypatch,
+            "raw",
+            "--output",
+            str(output),
+            "--scope-profile",
+            "bilbopro-imu-loop-scope-v2",
+            "--vofa-listen",
+            "127.0.0.1:1348",
+        )
+        == 0
+    )
+
+    capsysbinary.readouterr()
+    request = FakeRttSession.last.request
+    assert request.channel == 2
+    assert request.port == 19023
+    assert request.expected_channel_name == "LoopScope"
+    assert [(item.channel, item.port) for item in request.additional_channels] == [
+        (0, 19021),
+        (1, 19022),
+    ]
+    control = request.additional_channels[1]
+    assert control.expected_channel_name == "Scope"
+    assert control.expected_down_channel_name == "ScopeCmd"
+    assert FakeBridge.last.kwargs["expected_float_count"] == 40
+    assert FakeBridge.last.payloads == [loop_payload]
+    assert output.read_bytes() == loop_payload
+    command = b"\xb1\x50\x01\x09\x2a\x00\x00\x00"
+    assert FakeBridge.last.kwargs["reverse_sink"](command) == len(command)
+    assert FakeRttSession.last.sent == [(1, command)]
+    guides = tuple((tmp_path / "logs").glob("*/scope-channels.txt"))
+    assert len(guides) == 1
+    guide = guides[0].read_text(encoding="utf-8")
+    assert "BilboPro IMU+Loop Scope v2" in guide
+    assert "I39 = control.last_cmd_result_status_bitmask" in guide
 
 
 class InterruptingEvents:

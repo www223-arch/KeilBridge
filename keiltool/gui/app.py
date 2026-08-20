@@ -28,6 +28,9 @@ from keiltool.core.openocd_backend import (
 from keiltool.core.rtt import RttChannelConfig, RttEvent, RttSession
 from keiltool.core.scope_profile import (
     BILBOPRO_IMU_SCOPE_V1,
+    SCOPE_PROFILES,
+    ScopeProfile,
+    get_scope_profile,
     render_scope_guide,
     write_scope_guide,
 )
@@ -153,6 +156,7 @@ class KeilToolGui:
         self._vofa_rtt_bytes = 0
         self._rtt_error_message = ""
         self._vofa_bridge: VofaTcpBridge | None = None
+        self._vofa_scope_profile: ScopeProfile | None = None
         self._vofa_process: subprocess.Popen | None = None
         self._scope_guide_path: Path | None = None
         self._vofa_mismatch_reported = 0
@@ -266,6 +270,7 @@ class KeilToolGui:
         self.rtt_timeout_var = tk.StringVar(value=str(settings.rtt_timeout_ms))
         self.vofa_path_var = tk.StringVar(value=settings.vofa_path)
         self.vofa_listen_var = tk.StringVar(value=settings.vofa_listen)
+        self.vofa_scope_profile_var = tk.StringVar(value=settings.vofa_scope_profile)
         self.vofa_verify_scope_name_var = tk.BooleanVar(
             value=settings.vofa_verify_scope_name
         )
@@ -347,6 +352,9 @@ class KeilToolGui:
         controls.vofa_start_button.configure(command=self._start_vofa_rtt)
         controls.rtt_stop_button.configure(command=self._stop_rtt)
         controls.vofa_button.configure(command=self._choose_vofa)
+        controls.vofa_scope_profile_combo.configure(
+            values=tuple(profile.profile_id for profile in SCOPE_PROFILES)
+        )
         controls.scope_guide_button.configure(command=self._open_scope_guide)
         controls.copy_vofa_connection_button.configure(command=self._copy_vofa_connection)
         controls.auto_radio.configure(command=self._refresh_controls)
@@ -359,6 +367,11 @@ class KeilToolGui:
         controls.device_combo.bind("<Return>", lambda _event: self._select_catalog_device())
         self.firmware_var.trace_add("write", lambda *_args: self._refresh_controls())
         self.vofa_listen_var.trace_add("write", lambda *_args: self._update_vofa_connection_hint())
+        self.vofa_scope_profile_var.trace_add(
+            "write",
+            lambda *_args: self._on_scope_profile_changed(),
+        )
+        self._on_scope_profile_changed(update_endpoint=False)
         controls.firmware_entry.bind("<FocusOut>", self._accept_typed_firmware)
         controls.firmware_entry.bind("<Return>", self._accept_typed_firmware)
         for variable in (
@@ -1108,9 +1121,11 @@ class KeilToolGui:
             config = self._build_openocd_config(snapshot)
             facts = cast(ProjectTargetFacts, snapshot.facts)
             vofa_executable: Path | None = None
+            scope_profile: ScopeProfile | None = None
             vofa_host = ""
             vofa_port = 0
             if vofa:
+                scope_profile = self._selected_scope_profile()
                 vofa_executable = self._obtain_vofa_executable()
                 vofa_host, vofa_port = parse_listen_address(self.vofa_listen_var.get())
             request = build_rtt_request(
@@ -1118,20 +1133,42 @@ class KeilToolGui:
                 address=self.rtt_address_var.get().strip(),
                 ram_origin=facts.ram_origin,
                 ram_size=facts.ram_size,
-                port="19022" if vofa else self.rtt_port_var.get().strip(),
-                channel="1" if vofa else self.rtt_channel_var.get().strip(),
+                port=str(scope_profile.rtt_port) if scope_profile else self.rtt_port_var.get().strip(),
+                channel=(
+                    str(scope_profile.rtt_channel)
+                    if scope_profile
+                    else self.rtt_channel_var.get().strip()
+                ),
                 expected_channel_name=(
-                    BILBOPRO_IMU_SCOPE_V1.rtt_channel_name
-                    if vofa and self.vofa_verify_scope_name_var.get()
+                    scope_profile.rtt_channel_name
+                    if scope_profile and self.vofa_verify_scope_name_var.get()
                     else None
                 ),
             )
-            if vofa:
+            if scope_profile:
+                additional_channels = [
+                    RttChannelConfig(port=19021, channel=0, parse_records=True),
+                ]
+                if scope_profile.rtt_down_channel != scope_profile.rtt_channel:
+                    additional_channels.append(
+                        RttChannelConfig(
+                            port=scope_profile.rtt_down_port,
+                            channel=scope_profile.rtt_down_channel,
+                            expected_channel_name=(
+                                BILBOPRO_IMU_SCOPE_V1.rtt_channel_name
+                                if self.vofa_verify_scope_name_var.get()
+                                else None
+                            ),
+                            expected_down_channel_name=(
+                                scope_profile.rtt_down_channel_name
+                                if self.vofa_verify_scope_name_var.get()
+                                else None
+                            ),
+                        )
+                    )
                 request = replace(
                     request,
-                    additional_channels=(
-                        RttChannelConfig(port=19021, channel=0, parse_records=True),
-                    ),
+                    additional_channels=tuple(additional_channels),
                 )
             timeout_ms = int(self.rtt_timeout_var.get().strip())
             if timeout_ms <= 0:
@@ -1151,16 +1188,16 @@ class KeilToolGui:
                     "port": request.port,
                     "mode": "vofa_justfloat" if vofa else "text",
                     "vofa_listen": self.vofa_listen_var.get().strip() if vofa else "",
-                    "scope_profile": BILBOPRO_IMU_SCOPE_V1.profile_id if vofa else "",
+                    "scope_profile": scope_profile.profile_id if scope_profile else "",
                     "expected_channel_name": request.expected_channel_name or "",
-                    "rtt_down_channel": BILBOPRO_IMU_SCOPE_V1.rtt_channel if vofa else "",
+                    "rtt_down_channel": scope_profile.rtt_down_channel if scope_profile else "",
                     "rtt_down_channel_name": (
-                        BILBOPRO_IMU_SCOPE_V1.rtt_down_channel_name if vofa else ""
+                        scope_profile.rtt_down_channel_name if scope_profile else ""
                     ),
                     "vofa_reverse_capture": "vofa-to-mcu.bin" if vofa else "",
                     "text_channel": 0 if vofa else request.channel,
                     "text_port": 19021 if vofa else request.port,
-                    "scope_channels": list(BILBOPRO_IMU_SCOPE_V1.channels) if vofa else [],
+                    "scope_channels": list(scope_profile.channels) if scope_profile else [],
                 },
             )
             log_paths = RttLogPaths(
@@ -1176,10 +1213,10 @@ class KeilToolGui:
                 background=True,
                 parse_records=not vofa,
             )
-            if vofa:
+            if scope_profile:
                 self._scope_guide_path = write_scope_guide(
                     log_context.directory / "scope-channels.txt",
-                    BILBOPRO_IMU_SCOPE_V1,
+                    scope_profile,
                 )
                 raw_output = log_context.directory / "rtt-justfloat.bin"
                 bridge = VofaTcpBridge(
@@ -1187,10 +1224,10 @@ class KeilToolGui:
                     vofa_port,
                     raw_output=raw_output,
                     reverse_output=log_context.directory / "vofa-to-mcu.bin",
-                    expected_float_count=BILBOPRO_IMU_SCOPE_V1.expected_float_count,
+                    expected_float_count=scope_profile.expected_float_count,
                     reverse_sink=lambda data: session.send_bytes(
                         data,
-                        channel=BILBOPRO_IMU_SCOPE_V1.rtt_channel,
+                        channel=scope_profile.rtt_down_channel,
                     ),
                 )
                 bridge.start()
@@ -1232,6 +1269,7 @@ class KeilToolGui:
         self._rtt_log_paths = log_paths
         self._rtt_log_context = log_context
         self._vofa_bridge = bridge
+        self._vofa_scope_profile = scope_profile
         self._vofa_process = vofa_process
         self._rtt_started_at = None
         self._rtt_bytes = 0
@@ -1263,12 +1301,17 @@ class KeilToolGui:
             + (
                 f"VOFA+ TCP: {self.vofa_listen_var.get().strip()} (JustFloat)\n"
                 "文字 RTT: Up Channel 0 · OpenOCD TCP 127.0.0.1:19021\n"
-                "曲线 RTT: Up/Down Channel 1 · OpenOCD TCP 127.0.0.1:19022\n"
+                f"曲线 RTT: Up Channel {scope_profile.rtt_channel} "
+                f"({scope_profile.rtt_channel_name}) · OpenOCD TCP "
+                f"127.0.0.1:{scope_profile.rtt_port}\n"
+                f"控制 RTT: Down Channel {scope_profile.rtt_down_channel} "
+                f"({scope_profile.rtt_down_channel_name}) · OpenOCD TCP "
+                f"127.0.0.1:{scope_profile.rtt_down_port}\n"
                 f"VOFA+ 自动配置: {vofa_setup_status}\n"
                 f"RTT 原始数据: {log_context.directory / 'rtt-justfloat.bin'}\n"
                 f"VOFA+ 下行原始数据: {log_context.directory / 'vofa-to-mcu.bin'}\n"
                 f"通道说明: {self._scope_guide_path}\n"
-                f"{render_scope_guide(BILBOPRO_IMU_SCOPE_V1)}\n"
+                f"{render_scope_guide(scope_profile)}\n"
                 if vofa
                 else ""
             )
@@ -1286,12 +1329,40 @@ class KeilToolGui:
             )
 
     def _update_vofa_connection_hint(self) -> None:
+        profile = self._selected_scope_profile()
         try:
             host, port = parse_listen_address(self.vofa_listen_var.get())
-            text = f"VOFA+：双向 TCP 客户端 · {host}:{port} · JustFloat"
+            text = f"VOFA+：{profile.title} · 双向 TCP 客户端 · {host}:{port} · JustFloat"
         except ValueError:
             text = "VOFA+：连接地址无效，请在高级设置中修正"
         self.vofa_connection_hint_var.set(text)
+
+    def _selected_scope_profile(self) -> ScopeProfile:
+        try:
+            return get_scope_profile(self.vofa_scope_profile_var.get().strip())
+        except ValueError:
+            return BILBOPRO_IMU_SCOPE_V1
+
+    def _on_scope_profile_changed(self, *, update_endpoint: bool = True) -> None:
+        profile = self._selected_scope_profile()
+        if self._vofa_bridge is None:
+            self._scope_guide_path = None
+        if update_endpoint:
+            try:
+                host, port = parse_listen_address(self.vofa_listen_var.get())
+            except ValueError:
+                host, port = "127.0.0.1", BILBOPRO_IMU_SCOPE_V1.vofa_port
+            built_in_ports = {item.vofa_port for item in SCOPE_PROFILES}
+            if port in built_in_ports:
+                self.vofa_listen_var.set(f"{host}:{profile.vofa_port}")
+        if hasattr(self, "controls"):
+            self.controls.vofa_verify_scope_check.configure(
+                text=(
+                    f"校验 RTT channel {profile.rtt_channel} 名称为 "
+                    f"{profile.rtt_channel_name}"
+                )
+            )
+        self._update_vofa_connection_hint()
 
     def _copy_vofa_connection(self) -> None:
         try:
@@ -1622,7 +1693,8 @@ class KeilToolGui:
         elif (
             event.kind == "raw"
             and self._vofa_bridge is not None
-            and event.channel == BILBOPRO_IMU_SCOPE_V1.rtt_channel
+            and event.channel
+            == (self._vofa_scope_profile or BILBOPRO_IMU_SCOPE_V1).rtt_channel
         ):
             try:
                 self._vofa_bridge.feed(event.data)
@@ -2067,8 +2139,9 @@ class KeilToolGui:
             path = self._scope_guide_path
             if path is None or not path.is_file():
                 path = write_scope_guide(
-                    self.settings_store.path.parent / "bilbopro-imu-scope-v1.txt",
-                    BILBOPRO_IMU_SCOPE_V1,
+                    self.settings_store.path.parent
+                    / f"{self._selected_scope_profile().profile_id}.txt",
+                    self._selected_scope_profile(),
                 )
                 self._scope_guide_path = path
             if os.name != "nt" or not hasattr(os, "startfile"):
@@ -2185,6 +2258,7 @@ class KeilToolGui:
             device_firmware=self._device_firmware,
             vofa_path=self.vofa_path_var.get().strip(),
             vofa_listen=self.vofa_listen_var.get().strip() or "127.0.0.1:1347",
+            vofa_scope_profile=self._selected_scope_profile().profile_id,
             vofa_verify_scope_name=self.vofa_verify_scope_name_var.get(),
         )
 

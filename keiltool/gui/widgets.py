@@ -61,6 +61,7 @@ class WorkbenchVariables(Protocol):
     rtt_timeout_var: tk.StringVar
     vofa_path_var: tk.StringVar
     vofa_listen_var: tk.StringVar
+    vofa_scope_profile_var: tk.StringVar
     vofa_verify_scope_name_var: tk.BooleanVar
     vofa_connection_hint_var: tk.StringVar
 
@@ -380,20 +381,39 @@ class ConfigurationPane(ttk.Frame):
             "VOFA+",
             variables.vofa_path_var,
         )
-        ttk.Label(self.advanced_frame, text="VOFA 监听").grid(row=6, column=0, sticky="w", pady=3)
+        ttk.Label(self.advanced_frame, text="曲线配置").grid(
+            row=6,
+            column=0,
+            sticky="w",
+            pady=3,
+        )
+        self.vofa_scope_profile_combo = ttk.Combobox(
+            self.advanced_frame,
+            textvariable=variables.vofa_scope_profile_var,
+            state="readonly",
+            width=32,
+        )
+        self.vofa_scope_profile_combo.grid(
+            row=6,
+            column=1,
+            columnspan=2,
+            sticky="ew",
+            pady=3,
+        )
+        ttk.Label(self.advanced_frame, text="VOFA 监听").grid(row=7, column=0, sticky="w", pady=3)
         self.vofa_listen_entry = ttk.Entry(
             self.advanced_frame,
             textvariable=variables.vofa_listen_var,
             width=20,
         )
-        self.vofa_listen_entry.grid(row=6, column=1, sticky="w", pady=3)
+        self.vofa_listen_entry.grid(row=7, column=1, sticky="w", pady=3)
         self.vofa_verify_scope_check = ttk.Checkbutton(
             self.advanced_frame,
             text="校验 RTT channel 1 名称为 Scope",
             variable=variables.vofa_verify_scope_name_var,
         )
         self.vofa_verify_scope_check.grid(
-            row=7,
+            row=8,
             column=1,
             columnspan=2,
             sticky="w",
@@ -403,7 +423,7 @@ class ConfigurationPane(ttk.Frame):
             self.advanced_frame,
             text="打开 BilboPro 通道说明",
         )
-        self.scope_guide_button.grid(row=8, column=1, sticky="w", pady=3)
+        self.scope_guide_button.grid(row=9, column=1, sticky="w", pady=3)
 
         self._remember_editable(
             self.openocd_entry,
@@ -416,6 +436,7 @@ class ConfigurationPane(ttk.Frame):
             self.timeout_entry,
             self.vofa_entry,
             self.vofa_button,
+            self.vofa_scope_profile_combo,
             self.vofa_listen_entry,
             self.vofa_verify_scope_check,
             self.scope_guide_button,

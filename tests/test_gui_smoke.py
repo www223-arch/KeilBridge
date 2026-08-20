@@ -367,7 +367,8 @@ def test_one_click_vofa_uses_dedicated_rtt_channel_and_ports(tmp_path, monkeypat
     )
     gui.logs_dir_var.set(str(tmp_path / "logs"))
     gui.vofa_path_var.set(str(executable))
-    gui.vofa_listen_var.set("127.0.0.1:1347")
+    gui.vofa_scope_profile_var.set("bilbopro-imu-loop-scope-v2")
+    gui.vofa_listen_var.set("127.0.0.1:1348")
     monkeypatch.setattr(gui, "_obtain_fresh_snapshot", lambda: SimpleNamespace(facts=facts))
     monkeypatch.setattr(gui, "_build_openocd_config", lambda _snapshot: config)
     monkeypatch.setattr(app, "VofaTcpBridge", FakeBridge)
@@ -393,18 +394,25 @@ def test_one_click_vofa_uses_dedicated_rtt_channel_and_ports(tmp_path, monkeypat
         gui._start_vofa_rtt()
 
         assert len(sessions) == 1
-        assert sessions[0].request.channel == 1
-        assert sessions[0].request.port == 19022
-        assert sessions[0].request.expected_channel_name == "Scope"
+        assert sessions[0].request.channel == 2
+        assert sessions[0].request.port == 19023
+        assert sessions[0].request.expected_channel_name == "LoopScope"
         assert sessions[0].kwargs["parse_records"] is False
         assert sessions[0].request.additional_channels[0].channel == 0
         assert sessions[0].request.additional_channels[0].port == 19021
         assert sessions[0].request.additional_channels[0].parse_records is True
+        assert sessions[0].request.additional_channels[1].channel == 1
+        assert sessions[0].request.additional_channels[1].port == 19022
+        assert sessions[0].request.additional_channels[1].expected_channel_name == "Scope"
+        assert (
+            sessions[0].request.additional_channels[1].expected_down_channel_name
+            == "ScopeCmd"
+        )
         assert bridges[0].host == "127.0.0.1"
-        assert bridges[0].port == 1347
+        assert bridges[0].port == 1348
         assert bridges[0].raw_output.name == "rtt-justfloat.bin"
         assert bridges[0].reverse_output.name == "vofa-to-mcu.bin"
-        assert bridges[0].expected_float_count == 15
+        assert bridges[0].expected_float_count == 40
         reverse_payload = b"\x00\x80\xffcommand"
         assert bridges[0].reverse_sink(reverse_payload) == len(reverse_payload)
         assert sessions[0].sent == [(1, reverse_payload)]
@@ -412,12 +420,14 @@ def test_one_click_vofa_uses_dedicated_rtt_channel_and_ports(tmp_path, monkeypat
         guide = sessions[0].log_path.parent / "scope-channels.txt"
         assert guide.is_file()
         assert "I0  = acc_g.x" in guide.read_text(encoding="utf-8")
-        assert "I14 = euler_9dof_deg.yaw" in gui.output._openocd_text.get("1.0", "end")
+        assert "I39 = control.last_cmd_result_status_bitmask" in gui.output._openocd_text.get(
+            "1.0", "end"
+        )
         assert gui.vofa_verify_scope_name_var.get() is True
-        assert "Scope" in gui.controls.vofa_verify_scope_check.cget("text")
+        assert "LoopScope" in gui.controls.vofa_verify_scope_check.cget("text")
         assert launches[0][0] == [str(executable.resolve())]
-        assert configurations == [(executable.resolve(), "127.0.0.1", 1347)]
-        assert "127.0.0.1:1347" in gui.vofa_connection_hint_var.get()
+        assert configurations == [(executable.resolve(), "127.0.0.1", 1348)]
+        assert "127.0.0.1:1348" in gui.vofa_connection_hint_var.get()
         assert "JustFloat" in gui.vofa_connection_hint_var.get()
         assert "双向" in gui.vofa_connection_hint_var.get()
         assert workers[0][0] == "rtt-start-settled"

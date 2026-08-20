@@ -62,6 +62,7 @@ def build_rtt_request(
     ram_size: int | None,
     port: str | int,
     channel: str | int,
+    expected_channel_name: str | None = None,
 ) -> RttRequest:
     """Validate workbench RTT fields and return the shared RTT request."""
 
@@ -87,6 +88,7 @@ def build_rtt_request(
         scan_size=scan_size,
         port=parsed_port,
         channel=parsed_channel,
+        expected_channel_name=expected_channel_name,
     )
 
 

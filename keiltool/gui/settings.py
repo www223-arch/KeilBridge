@@ -32,6 +32,9 @@ class GuiSettings:
     device_source_mode: str = "device"
     project_firmware: str = ""
     device_firmware: str = ""
+    vofa_path: str = ""
+    vofa_listen: str = "127.0.0.1:1347"
+    vofa_verify_scope_name: bool = True
 
     def to_dict(self) -> dict[str, object]:
         return {"version": SETTINGS_VERSION, **asdict(self)}
@@ -70,6 +73,12 @@ class GuiSettings:
             device_firmware=_string(
                 data.get("device_firmware"),
                 firmware if not project else "",
+            ),
+            vofa_path=_string(data.get("vofa_path"), defaults.vofa_path),
+            vofa_listen=_string(data.get("vofa_listen"), defaults.vofa_listen),
+            vofa_verify_scope_name=_boolean(
+                data.get("vofa_verify_scope_name"),
+                defaults.vofa_verify_scope_name,
             ),
         )
 
@@ -157,6 +166,10 @@ def _integer(value: Any, default: int) -> int:
         return int(value)
     except (TypeError, ValueError):
         return default
+
+
+def _boolean(value: Any, default: bool) -> bool:
+    return value if isinstance(value, bool) else default
 
 
 def _device_source_mode(value: object, project: str) -> str:

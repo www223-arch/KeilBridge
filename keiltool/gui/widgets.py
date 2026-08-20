@@ -59,6 +59,10 @@ class WorkbenchVariables(Protocol):
     target_override_var: tk.StringVar
     rtt_port_var: tk.StringVar
     rtt_timeout_var: tk.StringVar
+    vofa_path_var: tk.StringVar
+    vofa_listen_var: tk.StringVar
+    vofa_verify_scope_name_var: tk.BooleanVar
+    vofa_connection_hint_var: tk.StringVar
 
 
 class OperationStatusPane(ttk.Frame):
@@ -303,11 +307,29 @@ class ConfigurationPane(ttk.Frame):
 
         actions = ttk.Frame(section)
         actions.grid(row=4, column=0, columnspan=3, sticky="ew", pady=(7, 0))
-        actions.columnconfigure((0, 1), weight=1)
+        actions.columnconfigure((0, 1, 2), weight=1)
         self.rtt_start_button = ttk.Button(actions, text="开始采集", style="Primary.TButton")
-        self.rtt_start_button.grid(row=0, column=0, sticky="ew", padx=(0, 4))
+        self.rtt_start_button.grid(row=0, column=0, sticky="ew", padx=(0, 3))
+        self.vofa_start_button = ttk.Button(actions, text="VOFA+ 曲线")
+        self.vofa_start_button.grid(row=0, column=1, sticky="ew", padx=3)
         self.rtt_stop_button = ttk.Button(actions, text="停止采集")
-        self.rtt_stop_button.grid(row=0, column=1, sticky="ew", padx=(4, 0))
+        self.rtt_stop_button.grid(row=0, column=2, sticky="ew", padx=(3, 0))
+
+        vofa_hint = ttk.Frame(section)
+        vofa_hint.grid(row=5, column=0, columnspan=3, sticky="ew", pady=(6, 0))
+        vofa_hint.columnconfigure(0, weight=1)
+        ttk.Label(
+            vofa_hint,
+            textvariable=variables.vofa_connection_hint_var,
+            style="Accent.TLabel",
+            wraplength=270,
+            justify="left",
+        ).grid(row=0, column=0, sticky="w")
+        self.copy_vofa_connection_button = ttk.Button(
+            vofa_hint,
+            text="复制连接参数",
+        )
+        self.copy_vofa_connection_button.grid(row=0, column=1, sticky="e", padx=(8, 0))
 
         self._remember_editable(
             self.auto_radio,
@@ -352,6 +374,36 @@ class ConfigurationPane(ttk.Frame):
         ttk.Label(self.advanced_frame, text="扫描超时(ms)").grid(row=4, column=0, sticky="w", pady=3)
         self.timeout_entry = ttk.Entry(self.advanced_frame, textvariable=variables.rtt_timeout_var, width=12)
         self.timeout_entry.grid(row=4, column=1, sticky="w", pady=3)
+        self.vofa_entry, self.vofa_button = path_row(
+            self.advanced_frame,
+            5,
+            "VOFA+",
+            variables.vofa_path_var,
+        )
+        ttk.Label(self.advanced_frame, text="VOFA 监听").grid(row=6, column=0, sticky="w", pady=3)
+        self.vofa_listen_entry = ttk.Entry(
+            self.advanced_frame,
+            textvariable=variables.vofa_listen_var,
+            width=20,
+        )
+        self.vofa_listen_entry.grid(row=6, column=1, sticky="w", pady=3)
+        self.vofa_verify_scope_check = ttk.Checkbutton(
+            self.advanced_frame,
+            text="校验 RTT channel 1 名称为 Scope",
+            variable=variables.vofa_verify_scope_name_var,
+        )
+        self.vofa_verify_scope_check.grid(
+            row=7,
+            column=1,
+            columnspan=2,
+            sticky="w",
+            pady=3,
+        )
+        self.scope_guide_button = ttk.Button(
+            self.advanced_frame,
+            text="打开 BilboPro 通道说明",
+        )
+        self.scope_guide_button.grid(row=8, column=1, sticky="w", pady=3)
 
         self._remember_editable(
             self.openocd_entry,
@@ -362,6 +414,11 @@ class ConfigurationPane(ttk.Frame):
             self.override_button,
             self.port_entry,
             self.timeout_entry,
+            self.vofa_entry,
+            self.vofa_button,
+            self.vofa_listen_entry,
+            self.vofa_verify_scope_check,
+            self.scope_guide_button,
         )
         self.editable_widgets.append((self.advanced_button, "normal"))
 

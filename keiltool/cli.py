@@ -33,6 +33,9 @@ from .core.openocd_backend import (
 )
 from .core.session_logs import create_session_logs
 from .core.rtt import RttEvent, RttRequest, RttSession
+from .core.scope_profile import BILBOPRO_IMU_SCOPE_V1, write_scope_guide
+from .core.process_launch import background_process_kwargs
+from .core.vofa_bridge import VofaTcpBridge, parse_listen_address
 from .core.scatter import generate_gnu_ld, parse_scatter_memory
 from .core.tool_finder import armclang_environment, find_arm_gcc_root, find_armclang_tools, find_cmake, find_ninja, find_openocd, find_openocd_scripts
 from .core.workspace import configure_workspace
@@ -517,7 +520,30 @@ def _persist_rtt_openocd_event(event: RttEvent, log_context) -> None:
 def cmd_rtt(args: argparse.Namespace) -> int:
     if args.output is not None and args.format != "raw":
         raise SystemExit("--output requires --format raw.")
+    if args.vofa_listen is not None and args.format != "raw":
+        raise SystemExit("--vofa-listen requires --format raw.")
+    if args.vofa_executable is not None and args.vofa_listen is None:
+        raise SystemExit("--vofa-executable requires --vofa-listen.")
+    scope_profile = BILBOPRO_IMU_SCOPE_V1 if args.vofa_listen is not None else None
+    channel = args.channel
+    if channel is None:
+        channel = scope_profile.rtt_channel if scope_profile is not None else 0
+    if scope_profile is not None and channel != scope_profile.rtt_channel:
+        raise SystemExit(
+            f"{scope_profile.title} requires RTT up-channel {scope_profile.rtt_channel}."
+        )
+    vofa_bridge: VofaTcpBridge | None = None
+    vofa_process: subprocess.Popen | None = None
+    vofa_endpoint: tuple[str, int] | None = None
+    if args.vofa_listen is not None:
+        try:
+            vofa_endpoint = parse_listen_address(args.vofa_listen)
+        except ValueError as exc:
+            raise SystemExit(str(exc)) from exc
     context = _resolve_hardware(args)
+    vofa_executable = args.vofa_executable.expanduser() if args.vofa_executable is not None else None
+    if vofa_executable is not None and not vofa_executable.is_file():
+        raise SystemExit(f"VOFA executable does not exist: {vofa_executable}")
     if args.address is None:
         if context.ram is None:
             raise SystemExit("The selected target does not provide a verified RAM range for RTT scan.")
@@ -530,7 +556,12 @@ def cmd_rtt(args: argparse.Namespace) -> int:
         scan_address=scan_address,
         scan_size=scan_size,
         port=args.port,
-        channel=args.channel,
+        channel=channel,
+        expected_channel_name=(
+            scope_profile.rtt_channel_name
+            if scope_profile is not None and not args.no_verify_channel_name
+            else None
+        ),
     )
     log_context = create_session_logs(
         context.logs_dir,
@@ -543,8 +574,18 @@ def cmd_rtt(args: argparse.Namespace) -> int:
             "channel": request.channel,
             "port": request.port,
             "format": args.format,
+            "vofa_listen": args.vofa_listen or "",
+            "scope_profile": scope_profile.profile_id if scope_profile is not None else "",
+            "expected_channel_name": request.expected_channel_name or "",
+            "scope_channels": list(scope_profile.channels) if scope_profile is not None else [],
         },
     )
+    scope_guide = None
+    if scope_profile is not None:
+        scope_guide = write_scope_guide(
+            log_context.directory / "scope-channels.txt",
+            scope_profile,
+        )
     session = RttSession(
         context.config,
         request,
@@ -559,10 +600,17 @@ def cmd_rtt(args: argparse.Namespace) -> int:
             raw_sink.open()
         except OSError as exc:
             raise SystemExit(f"Unable to open RTT raw output: {exc}") from exc
+    if vofa_endpoint is not None:
+        vofa_bridge = VofaTcpBridge(
+            *vofa_endpoint,
+            expected_float_count=scope_profile.expected_float_count if scope_profile else None,
+        )
     print(f"RTT log: {log_context.rtt_log}", file=sys.stderr, flush=True)
     print(f"Session metadata: {log_context.metadata_log}", file=sys.stderr, flush=True)
     if raw_sink is not None and raw_sink.output is not None:
         print(f"RTT raw output: {raw_sink.output.resolve()}", file=sys.stderr, flush=True)
+    if scope_guide is not None:
+        print(f"Scope channel guide: {scope_guide.resolve()}", file=sys.stderr, flush=True)
     connected = False
     failed = False
     interrupted = False
@@ -571,6 +619,17 @@ def cmd_rtt(args: argparse.Namespace) -> int:
     disconnect_message = "none"
     deadline = time.monotonic() + args.duration if args.duration is not None else None
     try:
+        if vofa_bridge is not None:
+            vofa_bridge.start()
+            host, port = vofa_bridge.listen_address
+            print(f"VOFA+ bridge: tcp://{host}:{port} (JustFloat)", file=sys.stderr, flush=True)
+        if vofa_executable is not None:
+            vofa_process = subprocess.Popen(
+                [str(vofa_executable)],
+                cwd=vofa_executable.parent,
+                **background_process_kwargs(),
+            )
+            print(f"VOFA+ launched: {vofa_executable.resolve()}", file=sys.stderr, flush=True)
         session.start()
         while True:
             if deadline is not None and time.monotonic() >= deadline:
@@ -583,8 +642,12 @@ def cmd_rtt(args: argparse.Namespace) -> int:
             except queue.Empty:
                 continue
             _persist_rtt_openocd_event(event, log_context)
+            if vofa_bridge is not None and event.kind == "raw" and event.data:
+                vofa_bridge.feed(event.data)
             _write_rtt_payload(event, args.format, raw_sink)
-            if event.kind == "connected":
+            if event.kind == "channel_verified":
+                print(event.message, file=sys.stderr, flush=True)
+            elif event.kind == "connected":
                 connected = True
                 print(event.message, file=sys.stderr, flush=True)
             elif event.kind == "error":
@@ -604,7 +667,7 @@ def cmd_rtt(args: argparse.Namespace) -> int:
         print("RTT interrupted; stopping session.", file=sys.stderr, flush=True)
     except OSError as exc:
         failed = True
-        error_message = f"raw output write failed: {exc}"
+        error_message = f"RTT/VOFA I/O failed: {exc}"
         print(f"RTT error: {error_message}", file=sys.stderr, flush=True)
     finally:
         session.stop()
@@ -616,6 +679,8 @@ def cmd_rtt(args: argparse.Namespace) -> int:
                 break
             _persist_rtt_openocd_event(event, log_context)
             try:
+                if vofa_bridge is not None and event.kind == "raw" and event.data:
+                    vofa_bridge.feed(event.data)
                 _write_rtt_payload(event, args.format, raw_sink)
             except OSError as exc:
                 failed = True
@@ -637,6 +702,21 @@ def cmd_rtt(args: argparse.Namespace) -> int:
                 failed = True
                 error_message = f"raw output close failed: {exc}"
                 print(f"RTT cleanup error: {error_message}", file=sys.stderr, flush=True)
+        if vofa_bridge is not None:
+            vofa_bridge.stop()
+            vofa_stats = vofa_bridge.stats
+            print(
+                "VOFA bridge summary: "
+                f"frames_received={vofa_stats.frames_received} "
+                f"frames_forwarded={vofa_stats.frames_forwarded} "
+                f"frames_dropped={vofa_stats.frames_dropped} "
+                f"invalid_frames={vofa_stats.invalid_frames} "
+                f"frame_size_mismatches={getattr(vofa_stats, 'frame_size_mismatches', 0)} "
+                f"clients_connected={vofa_stats.clients_connected} "
+                f"error={vofa_stats.last_error or 'none'}",
+                file=sys.stderr,
+                flush=True,
+            )
         outcome = "interrupted" if interrupted else "failed" if failed or not connected else cleanup_outcome
         log_context.finalize(outcome)
         if raw_sink is not None:
@@ -1052,8 +1132,28 @@ def build_parser() -> argparse.ArgumentParser:
         type=parse_address,
         help="Manual RTT scan size (default: 0x100 with --address)",
     )
-    rtt_cmd.add_argument("--channel", type=int, default=0, help="RTT up-channel (default: 0)")
+    rtt_cmd.add_argument(
+        "--channel",
+        type=int,
+        default=None,
+        help="RTT up-channel (default: 1 in VOFA mode, otherwise 0)",
+    )
     rtt_cmd.add_argument("--port", type=int, default=19021, help="Local RTT TCP port")
+    rtt_cmd.add_argument(
+        "--vofa-listen",
+        metavar="HOST:PORT",
+        help="Forward raw RTT JustFloat frames to a local VOFA+ TCP client",
+    )
+    rtt_cmd.add_argument(
+        "--vofa-executable",
+        type=Path,
+        help="Launch VOFA+ after the TCP bridge starts; requires --vofa-listen",
+    )
+    rtt_cmd.add_argument(
+        "--no-verify-channel-name",
+        action="store_true",
+        help="Advanced: disable the default channel name 'Scope' check in VOFA mode",
+    )
     rtt_cmd.add_argument(
         "--duration",
         type=float,

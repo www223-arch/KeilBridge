@@ -94,7 +94,7 @@ def _open_rtt_log(path: Path) -> TextIO:
 
 
 class RttSession:
-    """Own an OpenOCD RTT server and persist its live channel output."""
+    """Own a bidirectional OpenOCD RTT TCP channel and persist its output."""
 
     def __init__(
         self,
@@ -138,6 +138,7 @@ class RttSession:
         self._channel = request.channel
         self._expected_channel_name = request.expected_channel_name
         self._socket_lock = threading.Lock()
+        self._send_lock = threading.Lock()
         self._log_lock = threading.Lock()
         self._workers_lock = threading.Lock()
         self._lifecycle = threading.Condition(threading.RLock())
@@ -153,6 +154,23 @@ class RttSession:
         self._workers: list[threading.Thread] = []
         self._state = "new"
         self._cleanup_emitted = False
+
+    def send_bytes(self, data: bytes | bytearray | memoryview) -> int:
+        """Write raw host data to the selected OpenOCD RTT down-channel."""
+
+        payload = bytes(data)
+        if not payload:
+            return 0
+        with self._send_lock:
+            with self._socket_lock:
+                connection = self._socket
+            if connection is None:
+                raise RuntimeError("RTT TCP channel is not connected.")
+            try:
+                connection.sendall(payload)
+            except OSError as exc:
+                raise OSError(f"RTT TCP send failed: {exc}") from exc
+        return len(payload)
 
     def start(self) -> None:
         """Start OpenOCD and return while background workers establish RTT."""

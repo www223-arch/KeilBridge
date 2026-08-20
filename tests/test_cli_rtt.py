@@ -40,6 +40,7 @@ class FakeRttSession:
             self.events.put(event)
         self.started = False
         self.stopped = False
+        self.sent: list[bytes] = []
         self.kwargs = kwargs
         FakeRttSession.last = self
 
@@ -51,6 +52,11 @@ class FakeRttSession:
 
     def wait(self, timeout=None):
         return True
+
+    def send_bytes(self, data):
+        payload = bytes(data)
+        self.sent.append(payload)
+        return len(payload)
 
 
 def _run(tmp_path, monkeypatch, output_format: str, *extra_args: str):
@@ -339,6 +345,9 @@ def test_rtt_vofa_bridge_receives_raw_events(tmp_path, monkeypatch, capsysbinary
     assert FakeBridge.last.stopped
     assert FakeBridge.last.payloads == [payload]
     assert FakeBridge.last.kwargs["expected_float_count"] == 15
+    reverse_payload = b"\x00\x80\xffcommand"
+    assert FakeBridge.last.kwargs["reverse_sink"](reverse_payload) == len(reverse_payload)
+    assert FakeRttSession.last.sent == [reverse_payload]
     assert FakeRttSession.last.request.expected_channel_name == "Scope"
     assert FakeRttSession.last.kwargs["parse_records"] is False
     assert b"frames_forwarded=1" in capture.err

@@ -304,11 +304,22 @@ def test_one_click_vofa_uses_dedicated_rtt_channel_and_ports(tmp_path, monkeypat
     configurations = []
 
     class FakeBridge:
-        def __init__(self, host, port, *, raw_output, expected_float_count):
+        def __init__(
+            self,
+            host,
+            port,
+            *,
+            raw_output,
+            reverse_output,
+            expected_float_count,
+            reverse_sink,
+        ):
             self.host = host
             self.port = port
             self.raw_output = raw_output
+            self.reverse_output = reverse_output
             self.expected_float_count = expected_float_count
+            self.reverse_sink = reverse_sink
             self.started = False
             self.stats = SimpleNamespace(
                 frames_received=0,
@@ -334,10 +345,16 @@ def test_one_click_vofa_uses_dedicated_rtt_channel_and_ports(tmp_path, monkeypat
             self.log_path = log_path
             self.kwargs = kwargs
             self.command = ["openocd", "rtt"]
+            self.sent = []
             sessions.append(self)
 
         def start(self):
             pass
+
+        def send_bytes(self, data):
+            payload = bytes(data)
+            self.sent.append(payload)
+            return len(payload)
 
     facts = SimpleNamespace(
         device="GD32F303CC",
@@ -383,7 +400,11 @@ def test_one_click_vofa_uses_dedicated_rtt_channel_and_ports(tmp_path, monkeypat
         assert bridges[0].host == "127.0.0.1"
         assert bridges[0].port == 1347
         assert bridges[0].raw_output.name == "rtt-justfloat.bin"
+        assert bridges[0].reverse_output.name == "vofa-to-mcu.bin"
         assert bridges[0].expected_float_count == 15
+        reverse_payload = b"\x00\x80\xffcommand"
+        assert bridges[0].reverse_sink(reverse_payload) == len(reverse_payload)
+        assert sessions[0].sent == [reverse_payload]
         assert bridges[0].started
         guide = sessions[0].log_path.parent / "scope-channels.txt"
         assert guide.is_file()
@@ -395,6 +416,7 @@ def test_one_click_vofa_uses_dedicated_rtt_channel_and_ports(tmp_path, monkeypat
         assert configurations == [(executable.resolve(), "127.0.0.1", 1347)]
         assert "127.0.0.1:1347" in gui.vofa_connection_hint_var.get()
         assert "JustFloat" in gui.vofa_connection_hint_var.get()
+        assert "双向" in gui.vofa_connection_hint_var.get()
         assert workers[0][0] == "rtt-start-settled"
         assert workers[0][2] is sessions[0]
     finally:

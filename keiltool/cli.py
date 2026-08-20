@@ -577,6 +577,11 @@ def cmd_rtt(args: argparse.Namespace) -> int:
             "vofa_listen": args.vofa_listen or "",
             "scope_profile": scope_profile.profile_id if scope_profile is not None else "",
             "expected_channel_name": request.expected_channel_name or "",
+            "rtt_down_channel": scope_profile.rtt_channel if scope_profile is not None else "",
+            "rtt_down_channel_name": (
+                scope_profile.rtt_down_channel_name if scope_profile is not None else ""
+            ),
+            "vofa_reverse_capture": "vofa-to-mcu.bin" if scope_profile is not None else "",
             "scope_channels": list(scope_profile.channels) if scope_profile is not None else [],
         },
     )
@@ -604,6 +609,8 @@ def cmd_rtt(args: argparse.Namespace) -> int:
         vofa_bridge = VofaTcpBridge(
             *vofa_endpoint,
             expected_float_count=scope_profile.expected_float_count if scope_profile else None,
+            reverse_output=log_context.directory / "vofa-to-mcu.bin",
+            reverse_sink=session.send_bytes,
         )
     print(f"RTT log: {log_context.rtt_log}", file=sys.stderr, flush=True)
     print(f"Session metadata: {log_context.metadata_log}", file=sys.stderr, flush=True)
@@ -611,6 +618,11 @@ def cmd_rtt(args: argparse.Namespace) -> int:
         print(f"RTT raw output: {raw_sink.output.resolve()}", file=sys.stderr, flush=True)
     if scope_guide is not None:
         print(f"Scope channel guide: {scope_guide.resolve()}", file=sys.stderr, flush=True)
+        print(
+            f"VOFA+ reverse capture: {(log_context.directory / 'vofa-to-mcu.bin').resolve()}",
+            file=sys.stderr,
+            flush=True,
+        )
     connected = False
     failed = False
     interrupted = False
@@ -622,7 +634,11 @@ def cmd_rtt(args: argparse.Namespace) -> int:
         if vofa_bridge is not None:
             vofa_bridge.start()
             host, port = vofa_bridge.listen_address
-            print(f"VOFA+ bridge: tcp://{host}:{port} (JustFloat)", file=sys.stderr, flush=True)
+            print(
+                f"VOFA+ bridge: tcp://{host}:{port} (JustFloat up, transparent RTT down)",
+                file=sys.stderr,
+                flush=True,
+            )
         if vofa_executable is not None:
             vofa_process = subprocess.Popen(
                 [str(vofa_executable)],
@@ -712,6 +728,9 @@ def cmd_rtt(args: argparse.Namespace) -> int:
                 f"frames_dropped={vofa_stats.frames_dropped} "
                 f"invalid_frames={vofa_stats.invalid_frames} "
                 f"frame_size_mismatches={getattr(vofa_stats, 'frame_size_mismatches', 0)} "
+                f"reverse_bytes_received={getattr(vofa_stats, 'reverse_bytes_received', 0)} "
+                f"reverse_bytes_forwarded={getattr(vofa_stats, 'reverse_bytes_forwarded', 0)} "
+                f"reverse_errors={getattr(vofa_stats, 'reverse_errors', 0)} "
                 f"clients_connected={vofa_stats.clients_connected} "
                 f"error={vofa_stats.last_error or 'none'}",
                 file=sys.stderr,
@@ -1142,7 +1161,7 @@ def build_parser() -> argparse.ArgumentParser:
     rtt_cmd.add_argument(
         "--vofa-listen",
         metavar="HOST:PORT",
-        help="Forward raw RTT JustFloat frames to a local VOFA+ TCP client",
+        help="Bridge JustFloat RTT up-data and transparent RTT down-data with VOFA+",
     )
     rtt_cmd.add_argument(
         "--vofa-executable",

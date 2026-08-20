@@ -10,6 +10,7 @@ class ScopeProfile:
     title: str
     rtt_channel: int
     rtt_channel_name: str
+    rtt_down_channel_name: str
     channels: tuple[str, ...]
 
     @property
@@ -22,6 +23,7 @@ BILBOPRO_IMU_SCOPE_V1 = ScopeProfile(
     title="BilboPro IMU Scope v1",
     rtt_channel=1,
     rtt_channel_name="Scope",
+    rtt_down_channel_name="ScopeCmd",
     channels=(
         "acc_g.x",
         "acc_g.y",
@@ -50,6 +52,8 @@ def render_scope_guide(profile: ScopeProfile) -> str:
         f"{profile.title}\n"
         f"Profile ID: {profile.profile_id}\n"
         f"RTT up-channel: {profile.rtt_channel} ({profile.rtt_channel_name})\n"
+        f"RTT down-channel: {profile.rtt_channel} ({profile.rtt_down_channel_name})\n"
+        "VOFA+ -> MCU: transparent raw bytes; KeilTool adds no encoding, delimiter, or framing.\n"
         f"JustFloat: {profile.expected_float_count} x float32 little-endian + 00 00 80 7F\n"
         "\n"
         "VOFA+ channel mapping\n"
@@ -61,7 +65,8 @@ def render_scope_guide(profile: ScopeProfile) -> str:
         "1. KeilTool auto-fills TCP Client 127.0.0.1:1347 and JustFloat for VOFA+ 1.3.\n"
         "2. In the newly opened VOFA+ window, click the connection button.\n"
         "3. Add or rename curves using the I0-I14 mapping above.\n"
-        "4. Keep this profile fixed for the complete capture session.\n"
+        "4. Use the VOFA+ send area in text or HEX mode to write RTT down-channel 1.\n"
+        "5. Keep this profile fixed for the complete capture session.\n"
     )
 
 

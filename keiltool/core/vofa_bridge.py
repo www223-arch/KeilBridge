@@ -4,13 +4,15 @@ from dataclasses import dataclass, replace
 import os
 from pathlib import Path
 import queue
+import select
 import socket
 import threading
-from typing import BinaryIO, Iterable
+from typing import BinaryIO, Callable, Iterable
 
 
 JUSTFLOAT_TAIL = b"\x00\x00\x80\x7f"
 _RAW_FILE_BUFFER_SIZE = 1024 * 1024
+ReverseSink = Callable[[bytes], int | None]
 
 
 @dataclass(slots=True)
@@ -87,6 +89,9 @@ class VofaBridgeStats:
     frames_received: int = 0
     frames_forwarded: int = 0
     bytes_forwarded: int = 0
+    reverse_bytes_received: int = 0
+    reverse_bytes_forwarded: int = 0
+    reverse_errors: int = 0
     frames_dropped: int = 0
     invalid_frames: int = 0
     frame_size_mismatches: int = 0
@@ -98,7 +103,7 @@ class VofaBridgeStats:
 
 
 class VofaTcpBridge:
-    """Forward complete JustFloat frames to one non-blocking local TCP consumer."""
+    """Bridge JustFloat up-data and transparent down-data over one TCP client."""
 
     def __init__(
         self,
@@ -106,8 +111,10 @@ class VofaTcpBridge:
         port: int = 1347,
         *,
         raw_output: Path | None = None,
+        reverse_output: Path | None = None,
         queued_frames: int = 2048,
         expected_float_count: int | None = None,
+        reverse_sink: ReverseSink | None = None,
     ) -> None:
         if not 0 <= port <= 65535:
             raise ValueError("VOFA TCP port must be between 0 and 65535.")
@@ -116,13 +123,16 @@ class VofaTcpBridge:
         self._host = host
         self._port = port
         self._raw_output = Path(raw_output) if raw_output is not None else None
+        self._reverse_output = Path(reverse_output) if reverse_output is not None else None
         self._decoder = JustFloatFrameDecoder(expected_float_count=expected_float_count)
         self._expected_float_count = expected_float_count
+        self._reverse_sink = reverse_sink
         self._frames: queue.Queue[bytes] = queue.Queue(maxsize=queued_frames)
         self._stats = VofaBridgeStats()
         self._stats_lock = threading.Lock()
         self._raw_lock = threading.Lock()
         self._raw_stream: BinaryIO | None = None
+        self._reverse_stream: BinaryIO | None = None
         self._listener: socket.socket | None = None
         self._client: socket.socket | None = None
         self._thread: threading.Thread | None = None
@@ -151,13 +161,23 @@ class VofaTcpBridge:
             self._raw_output.parent.mkdir(parents=True, exist_ok=True)
             self._raw_stream = self._raw_output.open("wb", buffering=_RAW_FILE_BUFFER_SIZE)
         try:
+            if self._reverse_output is not None:
+                self._reverse_output.parent.mkdir(parents=True, exist_ok=True)
+                self._reverse_stream = self._reverse_output.open(
+                    "wb",
+                    buffering=_RAW_FILE_BUFFER_SIZE,
+                )
+        except Exception:
+            self._close_capture_streams()
+            raise
+        try:
             listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             listener.bind((self._host, self._port))
             listener.listen(1)
             listener.settimeout(0.1)
         except Exception:
-            self._close_raw_stream()
+            self._close_capture_streams()
             raise
         self._listener = listener
         address = listener.getsockname()
@@ -205,7 +225,7 @@ class VofaTcpBridge:
             thread.join(timeout=max(0.0, timeout))
         self._close_client(count_disconnect=False)
         try:
-            self._close_raw_stream()
+            self._close_capture_streams()
         except OSError as exc:
             with self._stats_lock:
                 self._stats.last_error = str(exc)
@@ -219,6 +239,16 @@ class VofaTcpBridge:
                 if written != len(data):
                     raise OSError(
                         f"Short RTT raw write: expected {len(data)} bytes, wrote {written}."
+                    )
+
+    def _write_reverse_raw(self, data: bytes) -> None:
+        with self._raw_lock:
+            if self._reverse_stream is not None:
+                written = self._reverse_stream.write(data)
+                if written != len(data):
+                    raise OSError(
+                        "Short VOFA reverse capture write: "
+                        f"expected {len(data)} bytes, wrote {written}."
                     )
 
     def _enqueue_latest(self, frame: bytes) -> None:
@@ -245,8 +275,11 @@ class VofaTcpBridge:
             if self._client is None:
                 self._accept_client()
                 continue
+            self._receive_client_data()
+            if self._client is None:
+                continue
             try:
-                frame = self._frames.get(timeout=0.1)
+                frame = self._frames.get(timeout=0.02)
             except queue.Empty:
                 continue
             try:
@@ -260,6 +293,39 @@ class VofaTcpBridge:
             with self._stats_lock:
                 self._stats.frames_forwarded += 1
                 self._stats.bytes_forwarded += len(frame)
+
+    def _receive_client_data(self) -> None:
+        client = self._client
+        sink = self._reverse_sink
+        if client is None or sink is None:
+            return
+        try:
+            readable, _writable, exceptional = select.select([client], [], [client], 0)
+            if exceptional:
+                raise OSError("VOFA TCP connection reported an exceptional state.")
+            if not readable:
+                return
+            data = client.recv(65536)
+            if not data:
+                self._close_client()
+                return
+            self._write_reverse_raw(data)
+            with self._stats_lock:
+                self._stats.reverse_bytes_received += len(data)
+            written = sink(data)
+            if written is not None and written != len(data):
+                raise OSError(
+                    "Short RTT down-channel write: "
+                    f"expected {len(data)} bytes, wrote {written}."
+                )
+        except (OSError, RuntimeError) as exc:
+            with self._stats_lock:
+                self._stats.reverse_errors += 1
+                self._stats.last_error = str(exc)
+            self._close_client()
+            return
+        with self._stats_lock:
+            self._stats.reverse_bytes_forwarded += len(data)
 
     def _accept_client(self) -> None:
         listener = self._listener
@@ -304,6 +370,27 @@ class VofaTcpBridge:
                 stream.flush()
             finally:
                 stream.close()
+
+    def _close_reverse_stream(self) -> None:
+        with self._raw_lock:
+            stream = self._reverse_stream
+            self._reverse_stream = None
+            if stream is None:
+                return
+            try:
+                stream.flush()
+            finally:
+                stream.close()
+
+    def _close_capture_streams(self) -> None:
+        errors: list[OSError] = []
+        for close_stream in (self._close_reverse_stream, self._close_raw_stream):
+            try:
+                close_stream()
+            except OSError as exc:
+                errors.append(exc)
+        if errors:
+            raise errors[0]
 
 
 def parse_listen_address(value: str) -> tuple[str, int]:

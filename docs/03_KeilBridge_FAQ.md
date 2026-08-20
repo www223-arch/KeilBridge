@@ -214,6 +214,12 @@ Windows 下由 GUI 启动的 OpenOCD 使用隐藏控制台窗口模式，因此�
 
 RTT 页的“显示等级”使用固件现有的 EasyLogger/SEGGER RTT 等级语义。默认 `VERBOSE` 显示全部；选择 `INFO` 会显示 `ASSERT`、`ERROR`、`WARN` 和 `INFO`。筛选和“清空显示”只处理最近 20,000 行 GUI 缓存，完整 UTF-8 日志仍持续记录所有等级。
 
+## 9B. VOFA+ 能通过 RTT 向 MCU 发送命令吗？
+
+可以。“VOFA+ 曲线”使用同一个全双工 TCP 连接：MCU 的 RTT up-channel 1 经过 KeilTool 转发到 VOFA+，VOFA+ 发送区的数据经过 KeilTool 原样写入 RTT down-channel 1。文本模式是否追加换行由 VOFA+ 的发送设置决定；HEX 模式发送精确字节。KeilTool 不进行 UTF-8 转换、命令拆包或自动补帧，并把下行原始字节保存到会话目录的 `vofa-to-mcu.bin`。
+
+固件必须配置 down-channel 1，约定名称为 `ScopeCmd`，并在主循环或任务中调用 `SEGGER_RTT_Read(1, ...)`。不要在高频 ISR 中阻塞等待命令。TCP 写入成功不等于命令执行成功；需要可靠控制时，固件协议应返回带相同序号的 ACK 或错误结果。
+
 ## 10. GUI 提示 target 未验证或 target override 无效怎么办？
 
 GUI 只会在 OpenOCD target cfg 已验证时启用“检查连接”“烧录并校验”和 RTT。自动解析失败时，不会猜测 target cfg。可在高级设置填写 override，但它必须是存在的 `.cfg` 文件：相对路径必须位于 OpenOCD scripts 目录内，绝对路径必须指向存在的文件。

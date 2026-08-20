@@ -293,9 +293,9 @@ Flash 读取、烧录、连接检查和 RTT 共享同一支 ST-Link，但任何�
 
 Windows GUI 启动的 OpenOCD 进程使用后台窗口模式，连接检查、Flash 读取、烧录和 RTT 期间不会额外弹出终端窗口。该策略只作用于 GUI；CLI 仍保持标准 stdout/stderr 和中断处理，便于脚本、AI 自动化调试和第三方工具集成。
 
-RTT 区域的“VOFA+ 曲线”按钮提供一键 JustFloat 桥接。它固定读取 RTT up-channel 1，通过 OpenOCD 本地端口 `19022` 接收字节，在 `127.0.0.1:1347` 建立 TCP 服务，然后启动已记忆的 VOFA+。首次使用时如果没有找到 `vofa+.exe`，工作台会要求选择一次，关闭时自动保存路径。VOFA+ 中首次建立一个 TCP 客户端连接，目标为 `127.0.0.1:1347`，协议引擎选择 JustFloat；VOFA+ 保存该工程后，后续只需点击工作台按钮。普通“开始采集”仍使用当前通道和文本日志解析，不受曲线模式影响。
+RTT 区域的“VOFA+ 曲线”按钮提供一键双向 JustFloat 桥接。它固定读取 RTT up-channel 1，通过 OpenOCD 本地端口 `19022` 接收字节，在 `127.0.0.1:1347` 建立 TCP 服务，然后启动已记忆的 VOFA+。首次使用时如果没有找到 `vofa+.exe`，工作台会要求选择一次，关闭时自动保存路径。VOFA+ 中建立一个 TCP 客户端连接，目标为 `127.0.0.1:1347`，协议引擎选择 JustFloat；该 TCP 连接同时承载 VOFA+ 发送区到 MCU 的反向数据。普通“开始采集”仍使用当前通道和文本日志解析，不受曲线模式影响。
 
-曲线模式不会 reset、halt 或 resume MCU。工作台按 JustFloat 帧尾切分完整帧，在独立线程中转发，VOFA+ 未连接或绘制变慢不会阻塞 RTT 接收。转发队列满时只丢弃用于实时显示的完整帧，并显示转发、丢弃和无效帧计数；RTT 原始字节仍优先写入本次会话的 `rtt-justfloat.bin`。停止采集会关闭 OpenOCD 和本地 TCP bridge，但不会强制关闭 VOFA+。
+曲线模式不会 reset、halt 或 resume MCU。工作台按 JustFloat 帧尾切分完整帧，在独立线程中转发，VOFA+ 未连接或绘制变慢不会阻塞 RTT 接收。转发队列满时只丢弃用于实时显示的完整帧，并显示转发、丢弃和无效帧计数；RTT 原始上行字节写入 `rtt-justfloat.bin`。VOFA+ 发送区产生的每个原始字节都会不经 UTF-8 解码、不添加换行、不做命令封包地写入同一编号的 RTT down-channel 1，并单独保存到 `vofa-to-mcu.bin`。MCU 需要把 down-channel 1 配置为 `ScopeCmd` 并调用 `SEGGER_RTT_Read(1, ...)`；主机发送成功只证明字节已交给 OpenOCD，不证明 MCU 已执行命令，可靠命令仍需由固件协议提供序号、校验和 ACK。停止采集会关闭 OpenOCD 和本地 TCP bridge，但不会强制关闭 VOFA+。
 
 默认日志目录为：
 
@@ -331,7 +331,7 @@ RTT 默认持续采集到 `Ctrl+C`、RTT EOF 或错误，也可用 `--duration <
 
 `--channel 1` 可让 FOC 二进制记录独占 RTT 上行通道 1，`--port 19022` 指定 KeilTool 连接的本地 OpenOCD RTT TCP 端口。该采集命令只执行 `rtt setup`、`rtt start` 和 `rtt server start`，目标运行期间不发送 reset、halt 或 resume。主机字节计数只能证明 KeilTool 收到和写入了多少字节，不能检测 MCU 产生记录之前或 RTT 缓冲区内发生的漏记录；扫频有效性仍应由记录内 timestamp 连续性判定。
 
-`--vofa-listen HOST:PORT` 把 raw RTT 中的完整 JustFloat 帧转发给连接到该地址的 VOFA+ TCP 客户端；必须与 `--format raw` 配合。可选的 `--vofa-executable PATH` 会在监听成功后启动 VOFA+。命令结束时 stderr 额外报告收到、转发、丢弃、无效帧和连接次数。
+`--vofa-listen HOST:PORT` 把 raw RTT 中的完整 JustFloat 帧转发给连接到该地址的 VOFA+ TCP 客户端；必须与 `--format raw` 配合。该连接是全双工的：VOFA+ 发来的原始字节会透明写入所选编号的 RTT down-channel，并保存为本次会话的 `vofa-to-mcu.bin`。可选的 `--vofa-executable PATH` 会在监听成功后启动 VOFA+。命令结束时 stderr 额外报告上行帧、下行字节、丢弃、无效帧、反向错误和连接次数。
 
 高级覆盖参数在这些命令中保持一致：`--openocd`、`--scripts`、`--target-cfg` 和 `--logs-dir`。无法验证设备内存范围或 target cfg 时命令会失败，不会猜测配置继续访问硬件。
 

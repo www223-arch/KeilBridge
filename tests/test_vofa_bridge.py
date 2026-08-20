@@ -73,6 +73,43 @@ def test_vofa_bridge_forwards_complete_frames_to_tcp_client(tmp_path):
     assert (tmp_path / "capture.bin").read_bytes() == first + second
     assert bridge.stats.frames_forwarded == 2
     assert bridge.stats.bytes_forwarded == len(first + second)
+
+
+def test_vofa_bridge_forwards_client_bytes_back_to_rtt_without_decoding(tmp_path):
+    chunks: list[bytes] = []
+
+    def reverse_sink(data: bytes) -> int:
+        chunks.append(bytes(data))
+        return len(data)
+
+    bridge = VofaTcpBridge(
+        "127.0.0.1",
+        0,
+        raw_output=tmp_path / "capture.bin",
+        reverse_output=tmp_path / "vofa-to-mcu.bin",
+        reverse_sink=reverse_sink,
+    )
+    bridge.start()
+    client = socket.create_connection(bridge.listen_address, timeout=2)
+    payload_parts = (b"\x00\x80", b"\xffcmd", b"\x00\r\n")
+
+    try:
+        for part in payload_parts:
+            client.sendall(part)
+            time.sleep(0.02)
+        deadline = time.monotonic() + 2
+        while bridge.stats.reverse_bytes_forwarded < sum(map(len, payload_parts)):
+            assert time.monotonic() < deadline
+            time.sleep(0.01)
+    finally:
+        client.close()
+        bridge.stop()
+
+    assert b"".join(chunks) == b"".join(payload_parts)
+    assert bridge.stats.reverse_bytes_received == len(b"".join(payload_parts))
+    assert bridge.stats.reverse_bytes_forwarded == len(b"".join(payload_parts))
+    assert bridge.stats.reverse_errors == 0
+    assert (tmp_path / "vofa-to-mcu.bin").read_bytes() == b"".join(payload_parts)
     assert bridge.stats.clients_connected == 1
 
 
@@ -152,3 +189,54 @@ def test_vofa_bridge_stop_records_flush_failure_without_breaking_cleanup():
 
     assert stream.closed
     assert "disk full" in bridge.stats.last_error
+
+
+def test_vofa_bridge_closes_both_capture_files_when_reverse_flush_fails():
+    class RecordingStream:
+        def __init__(self, *, fail_flush: bool = False) -> None:
+            self.fail_flush = fail_flush
+            self.closed = False
+
+        def flush(self):
+            if self.fail_flush:
+                raise OSError("reverse disk full")
+
+        def close(self):
+            self.closed = True
+
+    bridge = VofaTcpBridge()
+    upstream = RecordingStream()
+    reverse = RecordingStream(fail_flush=True)
+    bridge._raw_stream = upstream
+    bridge._reverse_stream = reverse
+
+    bridge.stop()
+
+    assert upstream.closed
+    assert reverse.closed
+    assert "reverse disk full" in bridge.stats.last_error
+
+
+def test_vofa_bridge_reports_reverse_sink_failure_and_disconnects_client():
+    def fail(_data: bytes) -> int:
+        raise OSError("RTT down-channel unavailable")
+
+    bridge = VofaTcpBridge("127.0.0.1", 0, reverse_sink=fail)
+    bridge.start()
+    client = socket.create_connection(bridge.listen_address, timeout=2)
+
+    try:
+        client.sendall(b"command")
+        deadline = time.monotonic() + 2
+        while bridge.stats.reverse_errors == 0:
+            assert time.monotonic() < deadline
+            time.sleep(0.01)
+    finally:
+        client.close()
+        bridge.stop()
+
+    assert bridge.stats.reverse_bytes_received == len(b"command")
+    assert bridge.stats.reverse_bytes_forwarded == 0
+    assert bridge.stats.reverse_errors == 1
+    assert bridge.stats.active_clients == 0
+    assert "down-channel unavailable" in bridge.stats.last_error

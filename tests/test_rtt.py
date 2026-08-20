@@ -231,6 +231,41 @@ def _drain_events(session: RttSession):
             return events
 
 
+class RecordingSendSocket:
+    def __init__(self) -> None:
+        self.sent: list[bytes] = []
+
+    def sendall(self, data: bytes) -> None:
+        self.sent.append(bytes(data))
+
+
+def test_session_sends_raw_bytes_to_openocd_rtt_socket(tmp_path):
+    connection = RecordingSendSocket()
+    session = RttSession(
+        CONFIG,
+        RttRequest(scan_address=0x20000000, scan_size=0x10000),
+        tmp_path / "rtt.log",
+    )
+    session._socket = connection
+    payload = b"\x00\x80\xffcmd\x00\r\n"
+
+    written = session.send_bytes(payload)
+
+    assert written == len(payload)
+    assert b"".join(connection.sent) == payload
+
+
+def test_session_refuses_send_before_rtt_tcp_connects(tmp_path):
+    session = RttSession(
+        CONFIG,
+        RttRequest(scan_address=0x20000000, scan_size=0x10000),
+        tmp_path / "rtt.log",
+    )
+
+    with pytest.raises(RuntimeError, match="not connected"):
+        session.send_bytes(b"command")
+
+
 def test_session_decodes_fragmented_utf8_and_writes_log(tmp_path):
     expected = "电机启动\n"
     port, server = _start_rtt_server(expected.encode("utf-8"))

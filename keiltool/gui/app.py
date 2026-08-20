@@ -155,6 +155,7 @@ class KeilToolGui:
         self._vofa_process: subprocess.Popen | None = None
         self._scope_guide_path: Path | None = None
         self._vofa_mismatch_reported = 0
+        self._vofa_reverse_errors_reported = 0
         self._last_operation_feedback_refresh = 0.0
         self._rtt_display = RttDisplayBuffer(max_records=20_000)
         self._one_shot_cleanup_log: Path | None = None
@@ -1144,6 +1145,11 @@ class KeilToolGui:
                     "vofa_listen": self.vofa_listen_var.get().strip() if vofa else "",
                     "scope_profile": BILBOPRO_IMU_SCOPE_V1.profile_id if vofa else "",
                     "expected_channel_name": request.expected_channel_name or "",
+                    "rtt_down_channel": BILBOPRO_IMU_SCOPE_V1.rtt_channel if vofa else "",
+                    "rtt_down_channel_name": (
+                        BILBOPRO_IMU_SCOPE_V1.rtt_down_channel_name if vofa else ""
+                    ),
+                    "vofa_reverse_capture": "vofa-to-mcu.bin" if vofa else "",
                     "scope_channels": list(BILBOPRO_IMU_SCOPE_V1.channels) if vofa else [],
                 },
             )
@@ -1170,7 +1176,9 @@ class KeilToolGui:
                     vofa_host,
                     vofa_port,
                     raw_output=raw_output,
+                    reverse_output=log_context.directory / "vofa-to-mcu.bin",
                     expected_float_count=BILBOPRO_IMU_SCOPE_V1.expected_float_count,
+                    reverse_sink=session.send_bytes,
                 )
                 bridge.start()
                 vofa_setup = prepare_installed_vofa_connection(
@@ -1217,6 +1225,7 @@ class KeilToolGui:
         self._rtt_lines = 0
         self._rtt_error_message = ""
         self._vofa_mismatch_reported = 0
+        self._vofa_reverse_errors_reported = 0
         self.operation_feedback.log_dir = log_context.directory
         self._set_feedback_stage("扫描 RTT 控制块", ProgressMode.INDETERMINATE)
         self.elapsed_var.set("00:00:00")
@@ -1237,6 +1246,7 @@ class KeilToolGui:
                 f"VOFA+ TCP: {self.vofa_listen_var.get().strip()} (JustFloat)\n"
                 f"VOFA+ 自动配置: {vofa_setup_status}\n"
                 f"RTT 原始数据: {log_context.directory / 'rtt-justfloat.bin'}\n"
+                f"VOFA+ 下行原始数据: {log_context.directory / 'vofa-to-mcu.bin'}\n"
                 f"通道说明: {self._scope_guide_path}\n"
                 f"{render_scope_guide(BILBOPRO_IMU_SCOPE_V1)}\n"
                 if vofa
@@ -1258,7 +1268,7 @@ class KeilToolGui:
     def _update_vofa_connection_hint(self) -> None:
         try:
             host, port = parse_listen_address(self.vofa_listen_var.get())
-            text = f"VOFA+：TCP 客户端 · {host}:{port} · JustFloat"
+            text = f"VOFA+：双向 TCP 客户端 · {host}:{port} · JustFloat"
         except ValueError:
             text = "VOFA+：连接地址无效，请在高级设置中修正"
         self.vofa_connection_hint_var.set(text)
@@ -1269,7 +1279,7 @@ class KeilToolGui:
         except ValueError as exc:
             self._fail_feedback("无法复制 VOFA+ 连接参数", str(exc))
             return
-        text = f"TCP Client | {host}:{port} | JustFloat"
+        text = f"Duplex TCP Client | {host}:{port} | JustFloat"
         self.root.clipboard_clear()
         self.root.clipboard_append(text)
         self.status_var.set(f"已复制 VOFA+ 连接参数：{text}")
@@ -1291,6 +1301,8 @@ class KeilToolGui:
             f"服务器：{host}\n"
             f"端口：{port}\n"
             "协议：JustFloat\n\n"
+            "反向发送：VOFA+ 发送区 → RTT Down Channel 1\n"
+            "KeilTool 原样透传，不自动编码、加换行或封包。\n\n"
             "请在本次新打开的 VOFA+ 窗口点击连接按钮。\n"
             "连接参数也会一直显示在 KeilTool 的 RTT 采集区域。",
             parent=self.root,
@@ -1698,7 +1710,9 @@ class KeilToolGui:
                         f"丢弃 {vofa_stats.frames_dropped:,} 帧，"
                         f"无效 {vofa_stats.invalid_frames:,} 帧，"
                         f"帧长不匹配 "
-                        f"{getattr(vofa_stats, 'frame_size_mismatches', 0):,} 帧"
+                        f"{getattr(vofa_stats, 'frame_size_mismatches', 0):,} 帧，"
+                        f"下行 {getattr(vofa_stats, 'reverse_bytes_forwarded', 0):,} 字节，"
+                        f"下行错误 {getattr(vofa_stats, 'reverse_errors', 0):,} 次"
                         if vofa_stats is not None
                         else f"RTT 已停止，共采集 {self._rtt_bytes:,} 字节 / {self._rtt_lines:,} 行"
                     )
@@ -1727,7 +1741,8 @@ class KeilToolGui:
         stats = bridge.stats
         client = "VOFA+ 已连接" if stats.active_clients else "等待 VOFA+"
         summary = (
-            f"{self._rtt_bytes:,} 字节 / {stats.frames_forwarded:,} 帧 / {client}"
+            f"上行 {self._rtt_bytes:,} 字节 / {stats.frames_forwarded:,} 帧 / "
+            f"下行 {getattr(stats, 'reverse_bytes_forwarded', 0):,} 字节 / {client}"
         )
         if stats.frames_dropped or stats.invalid_frames:
             summary += (
@@ -1745,6 +1760,15 @@ class KeilToolGui:
                 )
                 self._append_openocd(message)
                 self.status_var.set(message.strip())
+        reverse_errors = getattr(stats, "reverse_errors", 0)
+        if reverse_errors > self._vofa_reverse_errors_reported:
+            self._vofa_reverse_errors_reported = reverse_errors
+            message = (
+                "[VOFA] RTT 下行发送失败："
+                f"{stats.last_error or '未知错误'}；VOFA+ 连接已断开，请等待 RTT 就绪后重连。\n"
+            )
+            self._append_openocd(message)
+            self.status_var.set(message.strip())
         self.counts_var.set(summary)
         if (
             self.operation_feedback.task == "RTT → VOFA+"

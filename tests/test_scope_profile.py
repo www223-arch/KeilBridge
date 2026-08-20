@@ -30,6 +30,8 @@ def test_scope_guide_contains_vofa_mapping_and_first_use_steps(tmp_path):
     path = write_scope_guide(tmp_path / "scope-channels.txt", BILBOPRO_IMU_SCOPE_V1)
     text = path.read_text(encoding="utf-8")
 
+    assert "RTT text up-channel: 0" in text
+    assert "never forwarded to VOFA+" in text
     assert "RTT up-channel: 1 (Scope)" in text
     assert "RTT down-channel: 1 (ScopeCmd)" in text
     assert "transparent raw bytes" in text

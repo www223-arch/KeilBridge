@@ -51,6 +51,7 @@ def render_scope_guide(profile: ScopeProfile) -> str:
     return (
         f"{profile.title}\n"
         f"Profile ID: {profile.profile_id}\n"
+        "RTT text up-channel: 0 (KeilTool log only; never forwarded to VOFA+)\n"
         f"RTT up-channel: {profile.rtt_channel} ({profile.rtt_channel_name})\n"
         f"RTT down-channel: {profile.rtt_channel} ({profile.rtt_down_channel_name})\n"
         "VOFA+ -> MCU: transparent raw bytes; KeilTool adds no encoding, delimiter, or framing.\n"

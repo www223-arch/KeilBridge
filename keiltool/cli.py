@@ -32,7 +32,7 @@ from .core.openocd_backend import (
     run_flash_read,
 )
 from .core.session_logs import create_session_logs
-from .core.rtt import RttEvent, RttRequest, RttSession
+from .core.rtt import RttChannelConfig, RttEvent, RttRequest, RttSession
 from .core.scope_profile import BILBOPRO_IMU_SCOPE_V1, write_scope_guide
 from .core.process_launch import background_process_kwargs
 from .core.vofa_bridge import VofaTcpBridge, parse_listen_address
@@ -525,6 +525,9 @@ def cmd_rtt(args: argparse.Namespace) -> int:
     if args.vofa_executable is not None and args.vofa_listen is None:
         raise SystemExit("--vofa-executable requires --vofa-listen.")
     scope_profile = BILBOPRO_IMU_SCOPE_V1 if args.vofa_listen is not None else None
+    port = args.port
+    if port is None:
+        port = 19022 if scope_profile is not None else 19021
     channel = args.channel
     if channel is None:
         channel = scope_profile.rtt_channel if scope_profile is not None else 0
@@ -532,6 +535,8 @@ def cmd_rtt(args: argparse.Namespace) -> int:
         raise SystemExit(
             f"{scope_profile.title} requires RTT up-channel {scope_profile.rtt_channel}."
         )
+    if scope_profile is not None and args.text_port == port:
+        raise SystemExit("VOFA scope port and RTT text port must be different.")
     vofa_bridge: VofaTcpBridge | None = None
     vofa_process: subprocess.Popen | None = None
     vofa_endpoint: tuple[str, int] | None = None
@@ -555,13 +560,18 @@ def cmd_rtt(args: argparse.Namespace) -> int:
     request = RttRequest(
         scan_address=scan_address,
         scan_size=scan_size,
-        port=args.port,
+        port=port,
         channel=channel,
         expected_channel_name=(
             scope_profile.rtt_channel_name
             if scope_profile is not None and not args.no_verify_channel_name
             else None
         ),
+        additional_channels=(
+            RttChannelConfig(port=args.text_port, channel=0, parse_records=True),
+        )
+        if scope_profile is not None
+        else (),
     )
     log_context = create_session_logs(
         context.logs_dir,
@@ -582,6 +592,8 @@ def cmd_rtt(args: argparse.Namespace) -> int:
                 scope_profile.rtt_down_channel_name if scope_profile is not None else ""
             ),
             "vofa_reverse_capture": "vofa-to-mcu.bin" if scope_profile is not None else "",
+            "text_channel": 0 if scope_profile is not None else request.channel,
+            "text_port": args.text_port if scope_profile is not None else request.port,
             "scope_channels": list(scope_profile.channels) if scope_profile is not None else [],
         },
     )
@@ -610,7 +622,7 @@ def cmd_rtt(args: argparse.Namespace) -> int:
             *vofa_endpoint,
             expected_float_count=scope_profile.expected_float_count if scope_profile else None,
             reverse_output=log_context.directory / "vofa-to-mcu.bin",
-            reverse_sink=session.send_bytes,
+            reverse_sink=lambda data: session.send_bytes(data, channel=scope_profile.rtt_channel),
         )
     print(f"RTT log: {log_context.rtt_log}", file=sys.stderr, flush=True)
     print(f"Session metadata: {log_context.metadata_log}", file=sys.stderr, flush=True)
@@ -618,6 +630,11 @@ def cmd_rtt(args: argparse.Namespace) -> int:
         print(f"RTT raw output: {raw_sink.output.resolve()}", file=sys.stderr, flush=True)
     if scope_guide is not None:
         print(f"Scope channel guide: {scope_guide.resolve()}", file=sys.stderr, flush=True)
+        print(
+            f"RTT text channel: 0 on tcp://127.0.0.1:{args.text_port} -> {log_context.rtt_log}",
+            file=sys.stderr,
+            flush=True,
+        )
         print(
             f"VOFA+ reverse capture: {(log_context.directory / 'vofa-to-mcu.bin').resolve()}",
             file=sys.stderr,
@@ -658,9 +675,15 @@ def cmd_rtt(args: argparse.Namespace) -> int:
             except queue.Empty:
                 continue
             _persist_rtt_openocd_event(event, log_context)
-            if vofa_bridge is not None and event.kind == "raw" and event.data:
+            if (
+                vofa_bridge is not None
+                and event.kind == "raw"
+                and event.data
+                and event.channel == scope_profile.rtt_channel
+            ):
                 vofa_bridge.feed(event.data)
-            _write_rtt_payload(event, args.format, raw_sink)
+            if scope_profile is None or event.channel in {None, scope_profile.rtt_channel}:
+                _write_rtt_payload(event, args.format, raw_sink)
             if event.kind == "channel_verified":
                 print(event.message, file=sys.stderr, flush=True)
             elif event.kind == "connected":
@@ -695,9 +718,15 @@ def cmd_rtt(args: argparse.Namespace) -> int:
                 break
             _persist_rtt_openocd_event(event, log_context)
             try:
-                if vofa_bridge is not None and event.kind == "raw" and event.data:
+                if (
+                    vofa_bridge is not None
+                    and event.kind == "raw"
+                    and event.data
+                    and event.channel == scope_profile.rtt_channel
+                ):
                     vofa_bridge.feed(event.data)
-                _write_rtt_payload(event, args.format, raw_sink)
+                if scope_profile is None or event.channel in {None, scope_profile.rtt_channel}:
+                    _write_rtt_payload(event, args.format, raw_sink)
             except OSError as exc:
                 failed = True
                 error_message = f"raw output write failed: {exc}"
@@ -1157,7 +1186,18 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="RTT up-channel (default: 1 in VOFA mode, otherwise 0)",
     )
-    rtt_cmd.add_argument("--port", type=int, default=19021, help="Local RTT TCP port")
+    rtt_cmd.add_argument(
+        "--port",
+        type=int,
+        default=None,
+        help="Local RTT TCP port (default: 19022 in VOFA mode, otherwise 19021)",
+    )
+    rtt_cmd.add_argument(
+        "--text-port",
+        type=int,
+        default=19021,
+        help="RTT channel 0 text TCP port used alongside VOFA (default: 19021)",
+    )
     rtt_cmd.add_argument(
         "--vofa-listen",
         metavar="HOST:PORT",

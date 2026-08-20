@@ -351,9 +351,9 @@ def test_one_click_vofa_uses_dedicated_rtt_channel_and_ports(tmp_path, monkeypat
         def start(self):
             pass
 
-        def send_bytes(self, data):
+        def send_bytes(self, data, *, channel=None):
             payload = bytes(data)
-            self.sent.append(payload)
+            self.sent.append((channel, payload))
             return len(payload)
 
     facts = SimpleNamespace(
@@ -397,6 +397,9 @@ def test_one_click_vofa_uses_dedicated_rtt_channel_and_ports(tmp_path, monkeypat
         assert sessions[0].request.port == 19022
         assert sessions[0].request.expected_channel_name == "Scope"
         assert sessions[0].kwargs["parse_records"] is False
+        assert sessions[0].request.additional_channels[0].channel == 0
+        assert sessions[0].request.additional_channels[0].port == 19021
+        assert sessions[0].request.additional_channels[0].parse_records is True
         assert bridges[0].host == "127.0.0.1"
         assert bridges[0].port == 1347
         assert bridges[0].raw_output.name == "rtt-justfloat.bin"
@@ -404,7 +407,7 @@ def test_one_click_vofa_uses_dedicated_rtt_channel_and_ports(tmp_path, monkeypat
         assert bridges[0].expected_float_count == 15
         reverse_payload = b"\x00\x80\xffcommand"
         assert bridges[0].reverse_sink(reverse_payload) == len(reverse_payload)
-        assert sessions[0].sent == [reverse_payload]
+        assert sessions[0].sent == [(1, reverse_payload)]
         assert bridges[0].started
         guide = sessions[0].log_path.parent / "scope-channels.txt"
         assert guide.is_file()
@@ -633,7 +636,10 @@ def test_gui_applies_theme_and_filters_structured_rtt_records(tmp_path, monkeypa
                 last_error="",
             ),
         )
-        gui._handle_rtt_event(RttEvent("raw", data=b"\x00\x00\x80?\x00\x00\x80\x7f"))
+        gui._handle_rtt_event(RttEvent("raw", data=b"I/text only\n", channel=0))
+        gui._handle_rtt_event(
+            RttEvent("raw", data=b"\x00\x00\x80?\x00\x00\x80\x7f", channel=1)
+        )
         assert forwarded == [b"\x00\x00\x80?\x00\x00\x80\x7f"]
         assert "1 帧" in gui.counts_var.get()
         gui._vofa_bridge = None

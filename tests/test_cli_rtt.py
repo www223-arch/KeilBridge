@@ -53,9 +53,9 @@ class FakeRttSession:
     def wait(self, timeout=None):
         return True
 
-    def send_bytes(self, data):
+    def send_bytes(self, data, *, channel=None):
         payload = bytes(data)
-        self.sent.append(payload)
+        self.sent.append((channel, payload))
         return len(payload)
 
 
@@ -252,6 +252,7 @@ def test_rtt_parser_exposes_vofa_bridge_options():
     assert args.vofa_listen == "127.0.0.1:1347"
     assert args.vofa_executable == Path("D:/tools/vofa+.exe")
     assert args.no_verify_channel_name is False
+    assert args.text_port == 19021
 
 
 def test_rtt_does_not_start_vofa_bridge_before_hardware_validation(monkeypatch):
@@ -291,9 +292,12 @@ def test_rtt_does_not_start_vofa_bridge_before_hardware_validation(monkeypatch):
 def test_rtt_vofa_bridge_receives_raw_events(tmp_path, monkeypatch, capsysbinary):
     payload = b"\x00\x00\x80?\x00\x00\x80\x7f"
     FakeRttSession.event_list = (
-        RttEvent("connected", message="connected"),
-        RttEvent("raw", data=payload),
-        RttEvent("eof", message="closed"),
+        RttEvent("connected", message="text connected", channel=0),
+        RttEvent("connected", message="scope connected", channel=1),
+        RttEvent("raw", data=b"I/boot ready\n", channel=0),
+        RttEvent("data", text="I/boot ready\n", level=RttLevel.INFO, terminal=0, channel=0),
+        RttEvent("raw", data=payload, channel=1),
+        RttEvent("eof", message="closed", channel=1),
     )
 
     class FakeBridge:
@@ -347,9 +351,14 @@ def test_rtt_vofa_bridge_receives_raw_events(tmp_path, monkeypatch, capsysbinary
     assert FakeBridge.last.kwargs["expected_float_count"] == 15
     reverse_payload = b"\x00\x80\xffcommand"
     assert FakeBridge.last.kwargs["reverse_sink"](reverse_payload) == len(reverse_payload)
-    assert FakeRttSession.last.sent == [reverse_payload]
+    assert FakeRttSession.last.sent == [(1, reverse_payload)]
     assert FakeRttSession.last.request.expected_channel_name == "Scope"
     assert FakeRttSession.last.kwargs["parse_records"] is False
+    assert FakeRttSession.last.request.port == 19022
+    assert FakeRttSession.last.request.additional_channels[0].channel == 0
+    assert FakeRttSession.last.request.additional_channels[0].port == 19021
+    assert FakeRttSession.last.request.additional_channels[0].parse_records is True
+    assert output.read_bytes() == payload
     assert b"frames_forwarded=1" in capture.err
     assert FakeRttSession.last.stopped
     guides = tuple((tmp_path / "logs").glob("*/scope-channels.txt"))

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 import os
 from pathlib import Path
@@ -25,7 +25,7 @@ from keiltool.core.openocd_backend import (
     run_flash,
     run_flash_read,
 )
-from keiltool.core.rtt import RttEvent, RttSession
+from keiltool.core.rtt import RttChannelConfig, RttEvent, RttSession
 from keiltool.core.scope_profile import (
     BILBOPRO_IMU_SCOPE_V1,
     render_scope_guide,
@@ -150,6 +150,7 @@ class KeilToolGui:
         self._rtt_started_at: float | None = None
         self._rtt_bytes = 0
         self._rtt_lines = 0
+        self._vofa_rtt_bytes = 0
         self._rtt_error_message = ""
         self._vofa_bridge: VofaTcpBridge | None = None
         self._vofa_process: subprocess.Popen | None = None
@@ -1125,6 +1126,13 @@ class KeilToolGui:
                     else None
                 ),
             )
+            if vofa:
+                request = replace(
+                    request,
+                    additional_channels=(
+                        RttChannelConfig(port=19021, channel=0, parse_records=True),
+                    ),
+                )
             timeout_ms = int(self.rtt_timeout_var.get().strip())
             if timeout_ms <= 0:
                 raise ValueError("RTT 扫描超时必须大于 0。")
@@ -1150,6 +1158,8 @@ class KeilToolGui:
                         BILBOPRO_IMU_SCOPE_V1.rtt_down_channel_name if vofa else ""
                     ),
                     "vofa_reverse_capture": "vofa-to-mcu.bin" if vofa else "",
+                    "text_channel": 0 if vofa else request.channel,
+                    "text_port": 19021 if vofa else request.port,
                     "scope_channels": list(BILBOPRO_IMU_SCOPE_V1.channels) if vofa else [],
                 },
             )
@@ -1178,7 +1188,10 @@ class KeilToolGui:
                     raw_output=raw_output,
                     reverse_output=log_context.directory / "vofa-to-mcu.bin",
                     expected_float_count=BILBOPRO_IMU_SCOPE_V1.expected_float_count,
-                    reverse_sink=session.send_bytes,
+                    reverse_sink=lambda data: session.send_bytes(
+                        data,
+                        channel=BILBOPRO_IMU_SCOPE_V1.rtt_channel,
+                    ),
                 )
                 bridge.start()
                 vofa_setup = prepare_installed_vofa_connection(
@@ -1223,13 +1236,18 @@ class KeilToolGui:
         self._rtt_started_at = None
         self._rtt_bytes = 0
         self._rtt_lines = 0
+        self._vofa_rtt_bytes = 0
         self._rtt_error_message = ""
         self._vofa_mismatch_reported = 0
         self._vofa_reverse_errors_reported = 0
         self.operation_feedback.log_dir = log_context.directory
         self._set_feedback_stage("扫描 RTT 控制块", ProgressMode.INDETERMINATE)
         self.elapsed_var.set("00:00:00")
-        self.counts_var.set("0 字节 / 0 帧 / 等待 VOFA+" if vofa else "0 字节 / 0 行")
+        self.counts_var.set(
+            "文字 0 字节 / 0 行 · 曲线 0 字节 / 0 帧 · 等待 VOFA+"
+            if vofa
+            else "0 字节 / 0 行"
+        )
         vofa_setup_status = ""
         if vofa and vofa_setup is not None:
             vofa_setup_status = "成功" if vofa_setup.configured else "未完成"
@@ -1244,6 +1262,8 @@ class KeilToolGui:
             f"OpenOCD stderr: {log_paths.stderr}\n"
             + (
                 f"VOFA+ TCP: {self.vofa_listen_var.get().strip()} (JustFloat)\n"
+                "文字 RTT: Up Channel 0 · OpenOCD TCP 127.0.0.1:19021\n"
+                "曲线 RTT: Up/Down Channel 1 · OpenOCD TCP 127.0.0.1:19022\n"
                 f"VOFA+ 自动配置: {vofa_setup_status}\n"
                 f"RTT 原始数据: {log_context.directory / 'rtt-justfloat.bin'}\n"
                 f"VOFA+ 下行原始数据: {log_context.directory / 'vofa-to-mcu.bin'}\n"
@@ -1599,7 +1619,11 @@ class KeilToolGui:
         if event.kind == "openocd":
             self._append_openocd(event.text)
             self._persist_rtt_openocd_event(event)
-        elif event.kind == "raw" and self._vofa_bridge is not None:
+        elif (
+            event.kind == "raw"
+            and self._vofa_bridge is not None
+            and event.channel == BILBOPRO_IMU_SCOPE_V1.rtt_channel
+        ):
             try:
                 self._vofa_bridge.feed(event.data)
             except OSError as exc:
@@ -1611,7 +1635,7 @@ class KeilToolGui:
                 )
                 self.root.after_idle(self._stop_rtt)
                 return
-            self._rtt_bytes += len(event.data)
+            self._vofa_rtt_bytes += len(event.data)
             self._update_vofa_summary()
         elif event.kind == "data":
             level = event.level if event.level is not None else RttLevel.INFO
@@ -1628,7 +1652,10 @@ class KeilToolGui:
             self._update_rtt_visible_counts()
             self._rtt_bytes += len(event.text.encode("utf-8", errors="replace"))
             self._rtt_lines += event.text.count("\n")
-            self.counts_var.set(f"{self._rtt_bytes:,} 字节 / {self._rtt_lines:,} 行")
+            if self._vofa_bridge is not None:
+                self._update_vofa_summary()
+            else:
+                self.counts_var.set(f"{self._rtt_bytes:,} 字节 / {self._rtt_lines:,} 行")
             if (
                 self.operation_feedback.task == "RTT 日志采集"
                 and self.operation_feedback.state is OperationVisualState.RUNNING
@@ -1705,7 +1732,8 @@ class KeilToolGui:
                     self.gate.finish()
                     self.status_var.set("RTT 已停止")
                     summary = (
-                        f"RTT → VOFA+ 已停止，共接收 {self._rtt_bytes:,} 字节，"
+                        f"RTT → VOFA+ 已停止，文字 {self._rtt_bytes:,} 字节 / "
+                        f"{self._rtt_lines:,} 行，曲线 {self._vofa_rtt_bytes:,} 字节，"
                         f"转发 {vofa_stats.frames_forwarded:,} 帧，"
                         f"丢弃 {vofa_stats.frames_dropped:,} 帧，"
                         f"无效 {vofa_stats.invalid_frames:,} 帧，"
@@ -1741,7 +1769,8 @@ class KeilToolGui:
         stats = bridge.stats
         client = "VOFA+ 已连接" if stats.active_clients else "等待 VOFA+"
         summary = (
-            f"上行 {self._rtt_bytes:,} 字节 / {stats.frames_forwarded:,} 帧 / "
+            f"文字 {self._rtt_bytes:,} 字节 / {self._rtt_lines:,} 行 · "
+            f"曲线 {self._vofa_rtt_bytes:,} 字节 / {stats.frames_forwarded:,} 帧 · "
             f"下行 {getattr(stats, 'reverse_bytes_forwarded', 0):,} 字节 / {client}"
         )
         if stats.frames_dropped or stats.invalid_frames:

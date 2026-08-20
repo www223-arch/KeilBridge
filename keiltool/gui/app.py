@@ -26,8 +26,23 @@ from keiltool.core.openocd_backend import (
     run_flash_read,
 )
 from keiltool.core.rtt import RttEvent, RttSession
+from keiltool.core.scope_profile import (
+    BILBOPRO_IMU_SCOPE_V1,
+    render_scope_guide,
+    write_scope_guide,
+)
 from keiltool.core.rtt_log import RttLevel, RttLogRecord
+from keiltool.core.process_launch import background_process_kwargs
 from keiltool.core.session_logs import SessionLogContext, create_session_logs
+from keiltool.core.vofa_bridge import (
+    VofaTcpBridge,
+    discover_vofa_executable,
+    parse_listen_address,
+)
+from keiltool.core.vofa_config import (
+    VofaConnectionConfigResult,
+    prepare_installed_vofa_connection,
+)
 from keiltool.gui.project_config import (
     ProjectTargetFacts,
     clear_project_device_catalog_cache,
@@ -136,6 +151,10 @@ class KeilToolGui:
         self._rtt_bytes = 0
         self._rtt_lines = 0
         self._rtt_error_message = ""
+        self._vofa_bridge: VofaTcpBridge | None = None
+        self._vofa_process: subprocess.Popen | None = None
+        self._scope_guide_path: Path | None = None
+        self._vofa_mismatch_reported = 0
         self._last_operation_feedback_refresh = 0.0
         self._rtt_display = RttDisplayBuffer(max_records=20_000)
         self._one_shot_cleanup_log: Path | None = None
@@ -243,6 +262,13 @@ class KeilToolGui:
         self.target_override_var = tk.StringVar(value=settings.target_override)
         self.rtt_port_var = tk.StringVar(value=str(settings.rtt_port))
         self.rtt_timeout_var = tk.StringVar(value=str(settings.rtt_timeout_ms))
+        self.vofa_path_var = tk.StringVar(value=settings.vofa_path)
+        self.vofa_listen_var = tk.StringVar(value=settings.vofa_listen)
+        self.vofa_verify_scope_name_var = tk.BooleanVar(
+            value=settings.vofa_verify_scope_name
+        )
+        self.vofa_connection_hint_var = tk.StringVar()
+        self._update_vofa_connection_hint()
         self.status_var = tk.StringVar(value=_STATE_TEXT[SessionState.IDLE])
         self.elapsed_var = tk.StringVar(value="00:00:00")
         self.counts_var = tk.StringVar(value="0 字节 / 0 行")
@@ -316,7 +342,11 @@ class KeilToolGui:
         controls.flash_read_button.configure(command=self._read_flash)
         controls.flash_button.configure(command=self._flash)
         controls.rtt_start_button.configure(command=self._start_rtt)
+        controls.vofa_start_button.configure(command=self._start_vofa_rtt)
         controls.rtt_stop_button.configure(command=self._stop_rtt)
+        controls.vofa_button.configure(command=self._choose_vofa)
+        controls.scope_guide_button.configure(command=self._open_scope_guide)
+        controls.copy_vofa_connection_button.configure(command=self._copy_vofa_connection)
         controls.auto_radio.configure(command=self._refresh_controls)
         controls.manual_radio.configure(command=self._refresh_controls)
         controls.project_source_radio.configure(command=self._change_device_source)
@@ -326,6 +356,7 @@ class KeilToolGui:
         controls.device_combo.bind("<KeyRelease>", self._filter_device_choices)
         controls.device_combo.bind("<Return>", lambda _event: self._select_catalog_device())
         self.firmware_var.trace_add("write", lambda *_args: self._refresh_controls())
+        self.vofa_listen_var.trace_add("write", lambda *_args: self._update_vofa_connection_hint())
         controls.firmware_entry.bind("<FocusOut>", self._accept_typed_firmware)
         controls.firmware_entry.bind("<Return>", self._accept_typed_firmware)
         for variable in (
@@ -672,6 +703,29 @@ class KeilToolGui:
         if path:
             self.openocd_var.set(path)
             self._resolve_selected_target()
+
+    def _choose_vofa(self) -> Path | None:
+        path = filedialog.askopenfilename(
+            parent=self.root,
+            title="选择 VOFA+ 可执行文件",
+            filetypes=[("VOFA+", "vofa+.exe"), ("可执行文件", "*.exe"), ("所有文件", "*.*")],
+        )
+        if not path:
+            return None
+        executable = Path(path)
+        self.vofa_path_var.set(str(executable))
+        return executable
+
+    def _obtain_vofa_executable(self) -> Path:
+        executable = discover_vofa_executable(self.vofa_path_var.get().strip())
+        if executable is None:
+            executable = self._choose_vofa()
+        if executable is None:
+            raise ValueError(
+                "未找到可用的 VOFA+。当前桌面快捷方式已经失效，请安装 VOFA+ 后选择 vofa+.exe。"
+            )
+        self.vofa_path_var.set(str(executable))
+        return executable
 
     def _choose_scripts_dir(self) -> None:
         path = filedialog.askdirectory(parent=self.root, title="选择 OpenOCD scripts 目录")
@@ -1034,22 +1088,41 @@ class KeilToolGui:
             owner=operation,
         )
 
-    def _start_rtt(self) -> None:
+    def _start_vofa_rtt(self) -> None:
+        self._start_rtt(vofa=True)
+
+    def _start_rtt(self, *, vofa: bool = False) -> None:
         if self._hardware_busy():
             self._show_busy()
             return
-        self._begin_feedback("RTT 日志采集", "准备 RTT 配置")
+        task_name = "RTT → VOFA+" if vofa else "RTT 日志采集"
+        self._begin_feedback(task_name, "准备 RTT 配置")
+        bridge: VofaTcpBridge | None = None
+        vofa_process: subprocess.Popen | None = None
+        vofa_setup: VofaConnectionConfigResult | None = None
+        log_context: SessionLogContext | None = None
         try:
             snapshot = self._obtain_fresh_snapshot()
             config = self._build_openocd_config(snapshot)
             facts = cast(ProjectTargetFacts, snapshot.facts)
+            vofa_executable: Path | None = None
+            vofa_host = ""
+            vofa_port = 0
+            if vofa:
+                vofa_executable = self._obtain_vofa_executable()
+                vofa_host, vofa_port = parse_listen_address(self.vofa_listen_var.get())
             request = build_rtt_request(
                 manual=self.rtt_manual_var.get(),
                 address=self.rtt_address_var.get().strip(),
                 ram_origin=facts.ram_origin,
                 ram_size=facts.ram_size,
-                port=self.rtt_port_var.get().strip(),
-                channel=self.rtt_channel_var.get().strip(),
+                port="19022" if vofa else self.rtt_port_var.get().strip(),
+                channel="1" if vofa else self.rtt_channel_var.get().strip(),
+                expected_channel_name=(
+                    BILBOPRO_IMU_SCOPE_V1.rtt_channel_name
+                    if vofa and self.vofa_verify_scope_name_var.get()
+                    else None
+                ),
             )
             timeout_ms = int(self.rtt_timeout_var.get().strip())
             if timeout_ms <= 0:
@@ -1058,7 +1131,7 @@ class KeilToolGui:
             log_context = create_session_logs(
                 log_dir,
                 device=facts.device,
-                task="RTT",
+                task="RTT_VOFA" if vofa else "RTT",
                 metadata={
                     "probe": "ST-Link",
                     "target_cfg": config.target_cfg,
@@ -1067,6 +1140,11 @@ class KeilToolGui:
                     "scan_size": request.scan_size,
                     "channel": request.channel,
                     "port": request.port,
+                    "mode": "vofa_justfloat" if vofa else "text",
+                    "vofa_listen": self.vofa_listen_var.get().strip() if vofa else "",
+                    "scope_profile": BILBOPRO_IMU_SCOPE_V1.profile_id if vofa else "",
+                    "expected_channel_name": request.expected_channel_name or "",
+                    "scope_channels": list(BILBOPRO_IMU_SCOPE_V1.channels) if vofa else [],
                 },
             )
             log_paths = RttLogPaths(
@@ -1080,42 +1158,143 @@ class KeilToolGui:
                 log_paths.channel,
                 connect_timeout=timeout_ms / 1000.0,
                 background=True,
+                parse_records=not vofa,
             )
+            if vofa:
+                self._scope_guide_path = write_scope_guide(
+                    log_context.directory / "scope-channels.txt",
+                    BILBOPRO_IMU_SCOPE_V1,
+                )
+                raw_output = log_context.directory / "rtt-justfloat.bin"
+                bridge = VofaTcpBridge(
+                    vofa_host,
+                    vofa_port,
+                    raw_output=raw_output,
+                    expected_float_count=BILBOPRO_IMU_SCOPE_V1.expected_float_count,
+                )
+                bridge.start()
+                vofa_setup = prepare_installed_vofa_connection(
+                    vofa_executable,
+                    vofa_host,
+                    vofa_port,
+                )
+                vofa_process = subprocess.Popen(
+                    [str(vofa_executable)],
+                    cwd=vofa_executable.parent,
+                    **background_process_kwargs(),
+                )
             self.gate.begin(SessionState.RTT_SCAN)
             try:
                 self._rtt_lifecycle.begin_start(session)
             except Exception:
                 self.gate.finish()
-                log_context.finalize("not_started")
                 raise
         except BusySessionError:
+            if bridge is not None:
+                bridge.stop()
+            if log_context is not None:
+                log_context.finalize("not_started")
             self._show_busy()
             return
         except Exception as exc:
-            self._fail_feedback("无法启动 RTT", str(exc))
+            if bridge is not None:
+                bridge.stop()
+            if log_context is not None:
+                try:
+                    log_context.finalize("not_started")
+                except OSError:
+                    pass
+            self._fail_feedback(f"无法启动 {task_name}", str(exc))
             return
 
         self._rtt_session = session
         self._rtt_log_paths = log_paths
         self._rtt_log_context = log_context
+        self._vofa_bridge = bridge
+        self._vofa_process = vofa_process
         self._rtt_started_at = None
         self._rtt_bytes = 0
         self._rtt_lines = 0
         self._rtt_error_message = ""
+        self._vofa_mismatch_reported = 0
         self.operation_feedback.log_dir = log_context.directory
         self._set_feedback_stage("扫描 RTT 控制块", ProgressMode.INDETERMINATE)
         self.elapsed_var.set("00:00:00")
-        self.counts_var.set("0 字节 / 0 行")
+        self.counts_var.set("0 字节 / 0 帧 / 等待 VOFA+" if vofa else "0 字节 / 0 行")
+        vofa_setup_status = ""
+        if vofa and vofa_setup is not None:
+            vofa_setup_status = "成功" if vofa_setup.configured else "未完成"
+            detail = getattr(vofa_setup, "message", "")
+            if detail:
+                vofa_setup_status += f" · {detail}"
         self._append_openocd(
             "[RTT]\n"
             f"命令: {subprocess.list2cmdline(session.command)}\n"
             f"RTT 日志: {log_paths.channel}\n"
             f"OpenOCD stdout: {log_paths.stdout}\n"
             f"OpenOCD stderr: {log_paths.stderr}\n"
+            + (
+                f"VOFA+ TCP: {self.vofa_listen_var.get().strip()} (JustFloat)\n"
+                f"VOFA+ 自动配置: {vofa_setup_status}\n"
+                f"RTT 原始数据: {log_context.directory / 'rtt-justfloat.bin'}\n"
+                f"通道说明: {self._scope_guide_path}\n"
+                f"{render_scope_guide(BILBOPRO_IMU_SCOPE_V1)}\n"
+                if vofa
+                else ""
+            )
         )
         self._set_status()
         self._refresh_controls()
         self._start_worker("rtt-start-settled", session.start, owner=session)
+        if vofa and vofa_setup is not None:
+            self.root.after_idle(
+                lambda setup=vofa_setup, host=vofa_host, port=vofa_port: self._show_vofa_connection_help(
+                    setup,
+                    host,
+                    port,
+                )
+            )
+
+    def _update_vofa_connection_hint(self) -> None:
+        try:
+            host, port = parse_listen_address(self.vofa_listen_var.get())
+            text = f"VOFA+：TCP 客户端 · {host}:{port} · JustFloat"
+        except ValueError:
+            text = "VOFA+：连接地址无效，请在高级设置中修正"
+        self.vofa_connection_hint_var.set(text)
+
+    def _copy_vofa_connection(self) -> None:
+        try:
+            host, port = parse_listen_address(self.vofa_listen_var.get())
+        except ValueError as exc:
+            self._fail_feedback("无法复制 VOFA+ 连接参数", str(exc))
+            return
+        text = f"TCP Client | {host}:{port} | JustFloat"
+        self.root.clipboard_clear()
+        self.root.clipboard_append(text)
+        self.status_var.set(f"已复制 VOFA+ 连接参数：{text}")
+
+    def _show_vofa_connection_help(
+        self,
+        setup: VofaConnectionConfigResult,
+        host: str,
+        port: int,
+    ) -> None:
+        if setup.configured:
+            config_status = "已自动填入 VOFA+" if setup.changed else "VOFA+ 已是正确配置"
+        else:
+            config_status = f"未能自动填写：{setup.message}"
+        messagebox.showinfo(
+            "VOFA+ 连接参数",
+            f"{config_status}\n\n"
+            "连接方式：TCP 客户端\n"
+            f"服务器：{host}\n"
+            f"端口：{port}\n"
+            "协议：JustFloat\n\n"
+            "请在本次新打开的 VOFA+ 窗口点击连接按钮。\n"
+            "连接参数也会一直显示在 KeilTool 的 RTT 采集区域。",
+            parent=self.root,
+        )
 
     def _stop_rtt(self) -> None:
         session = self._rtt_session
@@ -1408,6 +1587,20 @@ class KeilToolGui:
         if event.kind == "openocd":
             self._append_openocd(event.text)
             self._persist_rtt_openocd_event(event)
+        elif event.kind == "raw" and self._vofa_bridge is not None:
+            try:
+                self._vofa_bridge.feed(event.data)
+            except OSError as exc:
+                self._rtt_error_message = f"RTT 原始数据写入失败: {exc}"
+                self._fail_feedback(
+                    "VOFA+ 数据保存失败",
+                    self._rtt_error_message,
+                    log_dir=self.operation_feedback.log_dir,
+                )
+                self.root.after_idle(self._stop_rtt)
+                return
+            self._rtt_bytes += len(event.data)
+            self._update_vofa_summary()
         elif event.kind == "data":
             level = event.level if event.level is not None else RttLevel.INFO
             terminal = event.terminal if event.terminal is not None else 0
@@ -1429,13 +1622,22 @@ class KeilToolGui:
                 and self.operation_feedback.state is OperationVisualState.RUNNING
             ):
                 self.operation_feedback.summary = self.counts_var.get()
+        elif event.kind == "channel_verified":
+            self._append_openocd(f"[RTT] {event.message}\n")
+            self.status_var.set(event.message)
+            self._set_feedback_stage("Scope 通道已确认，正在连接数据流", ProgressMode.INDETERMINATE)
         elif event.kind == "connected":
             if self.gate.state is SessionState.RTT_SCAN:
                 self.gate.finish()
                 self.gate.begin(SessionState.RTT)
             self._rtt_started_at = time.monotonic()
-            self.status_var.set("RTT 采集中")
-            self._set_feedback_stage("正在采集 RTT 日志", ProgressMode.INDETERMINATE)
+            if self._vofa_bridge is not None:
+                self.status_var.set("RTT → VOFA+ 运行中")
+                self._set_feedback_stage("正在转发 JustFloat 曲线", ProgressMode.INDETERMINATE)
+                self._update_vofa_summary()
+            else:
+                self.status_var.set("RTT 采集中")
+                self._set_feedback_stage("正在采集 RTT 日志", ProgressMode.INDETERMINATE)
             self._append_openocd(f"{event.message}\n")
             self._refresh_controls()
         elif event.kind in {"error", "eof"}:
@@ -1464,6 +1666,13 @@ class KeilToolGui:
                 )
                 self._refresh_operation_feedback()
             elif action is LifecycleAction.RELEASE_SESSION:
+                vofa_stats = None
+                if self._vofa_bridge is not None:
+                    bridge = self._vofa_bridge
+                    bridge.stop()
+                    vofa_stats = bridge.stats
+                    self._vofa_bridge = None
+                    self._vofa_process = None
                 if event.outcome == "startup_failed":
                     self.gate.fail()
                     self.status_var.set("RTT 启动失败")
@@ -1483,8 +1692,18 @@ class KeilToolGui:
                 else:
                     self.gate.finish()
                     self.status_var.set("RTT 已停止")
+                    summary = (
+                        f"RTT → VOFA+ 已停止，共接收 {self._rtt_bytes:,} 字节，"
+                        f"转发 {vofa_stats.frames_forwarded:,} 帧，"
+                        f"丢弃 {vofa_stats.frames_dropped:,} 帧，"
+                        f"无效 {vofa_stats.invalid_frames:,} 帧，"
+                        f"帧长不匹配 "
+                        f"{getattr(vofa_stats, 'frame_size_mismatches', 0):,} 帧"
+                        if vofa_stats is not None
+                        else f"RTT 已停止，共采集 {self._rtt_bytes:,} 字节 / {self._rtt_lines:,} 行"
+                    )
                     self._complete_feedback(
-                        f"RTT 已停止，共采集 {self._rtt_bytes:,} 字节 / {self._rtt_lines:,} 行",
+                        summary,
                         log_dir=self.operation_feedback.log_dir,
                     )
                 if self._rtt_log_context is not None:
@@ -1500,6 +1719,38 @@ class KeilToolGui:
             self._rtt_started_at = None
             self._refresh_controls()
             self._finish_close_if_ready()
+
+    def _update_vofa_summary(self) -> None:
+        bridge = self._vofa_bridge
+        if bridge is None:
+            return
+        stats = bridge.stats
+        client = "VOFA+ 已连接" if stats.active_clients else "等待 VOFA+"
+        summary = (
+            f"{self._rtt_bytes:,} 字节 / {stats.frames_forwarded:,} 帧 / {client}"
+        )
+        if stats.frames_dropped or stats.invalid_frames:
+            summary += (
+                f" / 丢弃 {stats.frames_dropped:,} / 无效 {stats.invalid_frames:,}"
+            )
+        mismatches = getattr(stats, "frame_size_mismatches", 0)
+        if mismatches:
+            actual = getattr(stats, "last_frame_float_count", None)
+            summary += f" / 帧长不匹配 {mismatches:,} (收到 N={actual}，要求 N=15)"
+            if mismatches > self._vofa_mismatch_reported:
+                self._vofa_mismatch_reported = mismatches
+                message = (
+                    "[VOFA] BilboPro IMU Scope v1 帧长不匹配："
+                    f"收到 N={actual}，要求 N=15；该帧未转发。\n"
+                )
+                self._append_openocd(message)
+                self.status_var.set(message.strip())
+        self.counts_var.set(summary)
+        if (
+            self.operation_feedback.task == "RTT → VOFA+"
+            and self.operation_feedback.state is OperationVisualState.RUNNING
+        ):
+            self.operation_feedback.summary = summary
 
     def _on_rtt_level_changed(self) -> None:
         view = build_rtt_view(self._rtt_display, self.rtt_display_level_var.get())
@@ -1640,6 +1891,9 @@ class KeilToolGui:
         controls.rtt_start_button.configure(
             state="normal" if idle and ready and rtt_fields_ready else "disabled"
         )
+        controls.vofa_start_button.configure(
+            state="normal" if idle and ready and rtt_fields_ready else "disabled"
+        )
         controls.rtt_stop_button.configure(
             state=(
                 "normal"
@@ -1668,6 +1922,7 @@ class KeilToolGui:
         hours, remainder = divmod(elapsed, 3600)
         minutes, seconds = divmod(remainder, 60)
         self.elapsed_var.set(f"{hours:02d}:{minutes:02d}:{seconds:02d}")
+        self._update_vofa_summary()
 
     def _append_openocd(self, text: str) -> None:
         self.output.append_openocd(text)
@@ -1753,6 +2008,21 @@ class KeilToolGui:
             os.startfile(path)  # type: ignore[attr-defined]
         except OSError as exc:
             self._fail_feedback("无法打开日志目录", str(exc))
+
+    def _open_scope_guide(self) -> None:
+        try:
+            path = self._scope_guide_path
+            if path is None or not path.is_file():
+                path = write_scope_guide(
+                    self.settings_store.path.parent / "bilbopro-imu-scope-v1.txt",
+                    BILBOPRO_IMU_SCOPE_V1,
+                )
+                self._scope_guide_path = path
+            if os.name != "nt" or not hasattr(os, "startfile"):
+                raise OSError("当前平台不支持打开通道说明。")
+            os.startfile(path)  # type: ignore[attr-defined]
+        except OSError as exc:
+            self._fail_feedback("无法打开通道说明", str(exc))
 
     def _on_close(self) -> None:
         if self._closing:
@@ -1860,6 +2130,9 @@ class KeilToolGui:
             device_source_mode=mode,
             project_firmware=self._project_firmware,
             device_firmware=self._device_firmware,
+            vofa_path=self.vofa_path_var.get().strip(),
+            vofa_listen=self.vofa_listen_var.get().strip() or "127.0.0.1:1347",
+            vofa_verify_scope_name=self.vofa_verify_scope_name_var.get(),
         )
 
 

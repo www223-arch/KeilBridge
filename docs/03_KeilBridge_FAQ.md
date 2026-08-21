@@ -220,6 +220,17 @@ RTT 页的“显示等级”使用固件现有的 EasyLogger/SEGGER RTT 等级�
 
 固件必须配置与工作台一致的 down-channel，并在主循环或任务中调用对应的 `SEGGER_RTT_Read(channel, ...)`。不要在高频 ISR 中阻塞等待命令。KeilTool 不规定名称和业务协议；TCP 写入成功不等于命令执行成功，需要可靠控制时由固件协议自行提供序号、校验和 ACK。
 
+最短操作步骤：
+
+1. 在 KeilTool 高级设置中填写曲线 Up、反向 Down 及各自 OpenOCD 端口；名称校验可留空。点击“VOFA+ 曲线”，等待界面显示 RTT 与 VOFA 已连接。
+2. 在 VOFA+ 中使用 KeilTool 显示的 TCP Client 地址连接，协议引擎选择 `JustFloat`。
+3. 发送二进制协议时，在底部发送区启用 `HEX`/十六进制发送，以空格分隔输入完整字节，例如 `B1 50 ... CRC_LO CRC_HI`。
+4. 将发送区的“自动追加”设为“不追加/无”，不要追加 `\n`、`\r` 或 `\r\n`；同时关闭循环发送，除非协议明确需要周期命令。
+
+文本发送模式会按 VOFA+ 当前编码（通常为 UTF-8）把字符转换成字节，并可能受“自动追加”设置影响，因此不适合发送含 `0x00` 或任意二进制值的控制帧。HEX 模式下输入的每个字节会原样进入 KeilTool，KeilTool不会添加换行、编码或帧头。VOFA+ 官方文档也区分字符串发送与十六进制字节发送；其发送区支持自动追加 `\n`、`\r`、`\r\n`、`\n\r`，二进制协议应选择不追加。
+
+TCP 与 RTT 都是字节流：KeilTool 保证字节内容、顺序和方向不变，但一次 VOFA“发送”可能被拆成多次 RTT 读取，也可能与下一次发送合并。MCU 必须使用流式解析器按帧头、长度和校验重新组帧，不能把一次 `SEGGER_RTT_Read` 当作一帧。曲线 Up 数据只发送到 VOFA 的接收方向，VOFA 下行字节只进入所选 RTT Down，两者不会相互拼接。
+
 ## 9C. 打开 VOFA+ 曲线后，文字 RTT 还能同时接收吗？
 
 可以。默认配置下，KeilTool 在同一个 OpenOCD 进程中同时启动 `channel 0 / 127.0.0.1:19021` 和 `channel 1 / 127.0.0.1:19022` 两个 RTT server。这里的 TCP 只是在电脑本机连接 OpenOCD 与 KeilTool，不是 MCU 网络通信。Channel 0 解析、显示、按等级过滤并保存文字日志；Channel 1 进入 JustFloat 和 VOFA+。两者的通道与端口都可配置，但文字 Up 和曲线 Up 必须不同，保证物理隔离。

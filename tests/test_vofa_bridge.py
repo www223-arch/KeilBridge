@@ -40,7 +40,7 @@ def test_justfloat_decoder_rejects_non_float_aligned_frame_and_resynchronizes():
     assert decoder.stats.frames == 1
 
 
-def test_bilbopro_decoder_rejects_frames_that_are_not_15_floats():
+def test_decoder_rejects_frames_that_do_not_match_user_selected_float_count():
     wrong = _frame(*(b"\x00\x00\x00\x00" for _ in range(14)))
     valid = _frame(*(b"\x00\x00\x00\x00" for _ in range(15)))
     decoder = JustFloatFrameDecoder(expected_float_count=15)
@@ -91,7 +91,11 @@ def test_vofa_bridge_forwards_client_bytes_back_to_rtt_without_decoding(tmp_path
     )
     bridge.start()
     client = socket.create_connection(bridge.listen_address, timeout=2)
-    payload_parts = (b"\x00\x80", b"\xffcmd", b"\x00\r\n")
+    payload_parts = (
+        b"\xb1\x50\x01\x02",
+        b"\x07\x03\x00\x80\xff",
+        b"\x34\x12",
+    )
 
     try:
         for part in payload_parts:
@@ -113,7 +117,49 @@ def test_vofa_bridge_forwards_client_bytes_back_to_rtt_without_decoding(tmp_path
     assert bridge.stats.clients_connected == 1
 
 
-def test_bilbopro_bridge_does_not_forward_wrong_float_count(tmp_path):
+def test_vofa_bridge_keeps_simultaneous_curve_up_and_command_down_bytes_isolated(tmp_path):
+    reverse_chunks: list[bytes] = []
+
+    def reverse_sink(data: bytes) -> int:
+        reverse_chunks.append(bytes(data))
+        return len(data)
+
+    bridge = VofaTcpBridge(
+        "127.0.0.1",
+        0,
+        raw_output=tmp_path / "curve-up.bin",
+        reverse_output=tmp_path / "command-down.bin",
+        reverse_sink=reverse_sink,
+    )
+    bridge.start()
+    client = socket.create_connection(bridge.listen_address, timeout=2)
+    client.settimeout(2)
+    curve_frame = _frame(b"\x00\x00\x80?", b"\x00\x00\x00@")
+    command = b"\xb1\x50\x01\x09\x2a\x00\x7d\x91"
+
+    try:
+        bridge.feed(curve_frame[:5])
+        client.sendall(command[:3])
+        bridge.feed(curve_frame[5:])
+        client.sendall(command[3:])
+        received_curve = b""
+        deadline = time.monotonic() + 2
+        while len(received_curve) < len(curve_frame) and time.monotonic() < deadline:
+            received_curve += client.recv(4096)
+        while bridge.stats.reverse_bytes_forwarded < len(command):
+            assert time.monotonic() < deadline
+            time.sleep(0.01)
+    finally:
+        client.close()
+        bridge.stop()
+
+    assert received_curve == curve_frame
+    assert b"".join(reverse_chunks) == command
+    assert (tmp_path / "curve-up.bin").read_bytes() == curve_frame
+    assert (tmp_path / "command-down.bin").read_bytes() == command
+
+
+def test_bridge_does_not_forward_frames_with_the_wrong_user_selected_float_count(tmp_path):
     bridge = VofaTcpBridge(
         "127.0.0.1",
         0,

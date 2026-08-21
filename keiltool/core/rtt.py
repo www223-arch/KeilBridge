@@ -249,12 +249,6 @@ class RttSession:
                 raise OSError(f"RTT TCP send failed: {exc}") from exc
         return len(payload)
 
-    def is_channel_connected(self, channel: int) -> bool:
-        """Return whether the selected RTT TCP channel currently has a socket."""
-
-        with self._socket_lock:
-            return channel in self._sockets
-
     def start(self) -> None:
         """Start OpenOCD and return while background workers establish RTT."""
 
@@ -366,14 +360,18 @@ class RttSession:
             if self._channel_validation_failed.is_set():
                 return
             if self._process_exited():
-                if control_block_ready and self._expected_channel_names:
+                if control_block_ready and (
+                    self._expected_channel_names or self._expected_down_channel_names
+                ):
                     message = "OpenOCD exited before the RTT channel name was verified."
                 else:
                     message = "OpenOCD exited before the RTT control block was found."
                 self._emit("error", message=message)
                 return
             if self._monotonic() >= deadline:
-                if control_block_ready and self._expected_channel_names:
+                if control_block_ready and (
+                    self._expected_channel_names or self._expected_down_channel_names
+                ):
                     message = "Timed out waiting for the OpenOCD RTT channel list."
                 else:
                     message = "Timed out waiting for the OpenOCD RTT control block."

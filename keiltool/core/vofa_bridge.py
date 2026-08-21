@@ -212,36 +212,6 @@ class VofaTcpBridge:
                 self._stats.frames_received += 1
             self._enqueue_latest(frame)
 
-    def send_reverse(self, data: bytes | bytearray | memoryview) -> int:
-        """Send operator/VOFA bytes through the configured RTT down-channel sink."""
-
-        payload = bytes(data)
-        if not payload:
-            return 0
-        if self._thread is None:
-            raise RuntimeError("VOFA bridge is not running.")
-        sink = self._reverse_sink
-        if sink is None:
-            raise RuntimeError("VOFA reverse sink is not configured.")
-        try:
-            self._write_reverse_raw(payload)
-            with self._stats_lock:
-                self._stats.reverse_bytes_received += len(payload)
-            written = sink(payload)
-            if written is not None and written != len(payload):
-                raise OSError(
-                    "Short RTT down-channel write: "
-                    f"expected {len(payload)} bytes, wrote {written}."
-                )
-        except (OSError, RuntimeError) as exc:
-            with self._stats_lock:
-                self._stats.reverse_errors += 1
-                self._stats.last_error = str(exc)
-            raise
-        with self._stats_lock:
-            self._stats.reverse_bytes_forwarded += len(payload)
-        return len(payload)
-
     def stop(self, timeout: float = 2.0) -> None:
         thread = self._thread
         self._stop_requested.set()
@@ -326,7 +296,8 @@ class VofaTcpBridge:
 
     def _receive_client_data(self) -> None:
         client = self._client
-        if client is None or self._reverse_sink is None:
+        sink = self._reverse_sink
+        if client is None or sink is None:
             return
         try:
             readable, _writable, exceptional = select.select([client], [], [client], 0)
@@ -338,10 +309,23 @@ class VofaTcpBridge:
             if not data:
                 self._close_client()
                 return
-            self.send_reverse(data)
+            self._write_reverse_raw(data)
+            with self._stats_lock:
+                self._stats.reverse_bytes_received += len(data)
+            written = sink(data)
+            if written is not None and written != len(data):
+                raise OSError(
+                    "Short RTT down-channel write: "
+                    f"expected {len(data)} bytes, wrote {written}."
+                )
         except (OSError, RuntimeError) as exc:
+            with self._stats_lock:
+                self._stats.reverse_errors += 1
+                self._stats.last_error = str(exc)
             self._close_client()
             return
+        with self._stats_lock:
+            self._stats.reverse_bytes_forwarded += len(data)
 
     def _accept_client(self) -> None:
         listener = self._listener

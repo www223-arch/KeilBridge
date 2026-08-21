@@ -34,8 +34,13 @@ class GuiSettings:
     device_firmware: str = ""
     vofa_path: str = ""
     vofa_listen: str = "127.0.0.1:1347"
-    vofa_scope_profile: str = "bilbopro-imu-scope-v1"
-    vofa_verify_scope_name: bool = True
+    vofa_up_channel: int = 1
+    vofa_up_port: int = 19022
+    vofa_up_name: str = ""
+    vofa_down_channel: int = 1
+    vofa_down_port: int = 19022
+    vofa_down_name: str = ""
+    vofa_expected_float_count: int = 0
 
     def to_dict(self) -> dict[str, object]:
         return {"version": SETTINGS_VERSION, **asdict(self)}
@@ -77,13 +82,23 @@ class GuiSettings:
             ),
             vofa_path=_string(data.get("vofa_path"), defaults.vofa_path),
             vofa_listen=_string(data.get("vofa_listen"), defaults.vofa_listen),
-            vofa_scope_profile=_string(
-                data.get("vofa_scope_profile"),
-                defaults.vofa_scope_profile,
+            vofa_up_channel=_integer(
+                data.get("vofa_up_channel"), defaults.vofa_up_channel
             ),
-            vofa_verify_scope_name=_boolean(
-                data.get("vofa_verify_scope_name"),
-                defaults.vofa_verify_scope_name,
+            vofa_up_port=_integer(data.get("vofa_up_port"), defaults.vofa_up_port),
+            vofa_up_name=_string(data.get("vofa_up_name"), defaults.vofa_up_name),
+            vofa_down_channel=_integer(
+                data.get("vofa_down_channel"), defaults.vofa_down_channel
+            ),
+            vofa_down_port=_integer(
+                data.get("vofa_down_port"), defaults.vofa_down_port
+            ),
+            vofa_down_name=_string(
+                data.get("vofa_down_name"), defaults.vofa_down_name
+            ),
+            vofa_expected_float_count=_integer(
+                data.get("vofa_expected_float_count"),
+                defaults.vofa_expected_float_count,
             ),
         )
 

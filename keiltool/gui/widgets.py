@@ -61,8 +61,13 @@ class WorkbenchVariables(Protocol):
     rtt_timeout_var: tk.StringVar
     vofa_path_var: tk.StringVar
     vofa_listen_var: tk.StringVar
-    vofa_scope_profile_var: tk.StringVar
-    vofa_verify_scope_name_var: tk.BooleanVar
+    vofa_up_channel_var: tk.StringVar
+    vofa_up_port_var: tk.StringVar
+    vofa_up_name_var: tk.StringVar
+    vofa_down_channel_var: tk.StringVar
+    vofa_down_port_var: tk.StringVar
+    vofa_down_name_var: tk.StringVar
+    vofa_expected_float_count_var: tk.StringVar
     vofa_connection_hint_var: tk.StringVar
 
 
@@ -289,7 +294,7 @@ class ConfigurationPane(ttk.Frame):
         self.rtt_address_entry = ttk.Entry(section, textvariable=variables.rtt_address_var)
         self.rtt_address_entry.grid(row=1, column=1, columnspan=2, sticky="ew", pady=3)
 
-        ttk.Label(section, text="通道").grid(row=2, column=0, sticky="w", pady=3)
+        ttk.Label(section, text="文字 Up 通道").grid(row=2, column=0, sticky="w", pady=3)
         self.channel_spin = ttk.Spinbox(
             section,
             from_=0,
@@ -315,14 +320,6 @@ class ConfigurationPane(ttk.Frame):
         self.vofa_start_button.grid(row=0, column=1, sticky="ew", padx=3)
         self.rtt_stop_button = ttk.Button(actions, text="停止采集")
         self.rtt_stop_button.grid(row=0, column=2, sticky="ew", padx=(3, 0))
-        self.scope_command_button = ttk.Button(actions, text="控制命令")
-        self.scope_command_button.grid(
-            row=1,
-            column=0,
-            columnspan=3,
-            sticky="ew",
-            pady=(6, 0),
-        )
 
         vofa_hint = ttk.Frame(section)
         vofa_hint.grid(row=5, column=0, columnspan=3, sticky="ew", pady=(6, 0))
@@ -377,7 +374,9 @@ class ConfigurationPane(ttk.Frame):
             "target override",
             variables.target_override_var,
         )
-        ttk.Label(self.advanced_frame, text="RTT 端口").grid(row=3, column=0, sticky="w", pady=3)
+        ttk.Label(self.advanced_frame, text="文字 RTT 端口").grid(
+            row=3, column=0, sticky="w", pady=3
+        )
         self.port_entry = ttk.Entry(self.advanced_frame, textvariable=variables.rtt_port_var, width=12)
         self.port_entry.grid(row=3, column=1, sticky="w", pady=3)
         ttk.Label(self.advanced_frame, text="扫描超时(ms)").grid(row=4, column=0, sticky="w", pady=3)
@@ -389,49 +388,62 @@ class ConfigurationPane(ttk.Frame):
             "VOFA+",
             variables.vofa_path_var,
         )
-        ttk.Label(self.advanced_frame, text="曲线配置").grid(
-            row=6,
-            column=0,
-            sticky="w",
-            pady=3,
-        )
-        self.vofa_scope_profile_combo = ttk.Combobox(
-            self.advanced_frame,
-            textvariable=variables.vofa_scope_profile_var,
-            state="readonly",
-            width=32,
-        )
-        self.vofa_scope_profile_combo.grid(
-            row=6,
-            column=1,
-            columnspan=2,
-            sticky="ew",
-            pady=3,
-        )
-        ttk.Label(self.advanced_frame, text="VOFA 监听").grid(row=7, column=0, sticky="w", pady=3)
+        ttk.Label(self.advanced_frame, text="VOFA 监听").grid(row=6, column=0, sticky="w", pady=3)
         self.vofa_listen_entry = ttk.Entry(
             self.advanced_frame,
             textvariable=variables.vofa_listen_var,
             width=20,
         )
-        self.vofa_listen_entry.grid(row=7, column=1, sticky="w", pady=3)
-        self.vofa_verify_scope_check = ttk.Checkbutton(
+        self.vofa_listen_entry.grid(row=6, column=1, sticky="w", pady=3)
+        self.vofa_up_channel_entry, self.vofa_up_port_entry = self._channel_port_row(
             self.advanced_frame,
-            text="校验 RTT channel 1 名称为 Scope",
-            variable=variables.vofa_verify_scope_name_var,
+            7,
+            "曲线 Up / 端口",
+            variables.vofa_up_channel_var,
+            variables.vofa_up_port_var,
         )
-        self.vofa_verify_scope_check.grid(
-            row=8,
-            column=1,
-            columnspan=2,
-            sticky="w",
-            pady=3,
+        ttk.Label(self.advanced_frame, text="曲线 Up 名称").grid(
+            row=8, column=0, sticky="w", pady=3
         )
-        self.scope_guide_button = ttk.Button(
+        self.vofa_up_name_entry = ttk.Entry(
             self.advanced_frame,
-            text="打开 BilboPro 通道说明",
+            textvariable=variables.vofa_up_name_var,
+            width=20,
         )
-        self.scope_guide_button.grid(row=9, column=1, sticky="w", pady=3)
+        self.vofa_up_name_entry.grid(row=8, column=1, sticky="w", pady=3)
+        self.vofa_down_channel_entry, self.vofa_down_port_entry = self._channel_port_row(
+            self.advanced_frame,
+            9,
+            "反向 Down / 端口",
+            variables.vofa_down_channel_var,
+            variables.vofa_down_port_var,
+        )
+        ttk.Label(self.advanced_frame, text="反向 Down 名称").grid(
+            row=10, column=0, sticky="w", pady=3
+        )
+        self.vofa_down_name_entry = ttk.Entry(
+            self.advanced_frame,
+            textvariable=variables.vofa_down_name_var,
+            width=20,
+        )
+        self.vofa_down_name_entry.grid(row=10, column=1, sticky="w", pady=3)
+        ttk.Label(self.advanced_frame, text="固定浮点数 N").grid(
+            row=11, column=0, sticky="w", pady=3
+        )
+        self.vofa_expected_float_count_entry = ttk.Entry(
+            self.advanced_frame,
+            textvariable=variables.vofa_expected_float_count_var,
+            width=12,
+        )
+        self.vofa_expected_float_count_entry.grid(row=11, column=1, sticky="w", pady=3)
+        ttk.Label(self.advanced_frame, text="0 = 不校验", style="Muted.TLabel").grid(
+            row=11, column=2, sticky="w", pady=3
+        )
+        self.vofa_guide_button = ttk.Button(
+            self.advanced_frame,
+            text="打开 RTT/VOFA 会话说明",
+        )
+        self.vofa_guide_button.grid(row=12, column=1, sticky="w", pady=3)
 
         self._remember_editable(
             self.openocd_entry,
@@ -444,12 +456,34 @@ class ConfigurationPane(ttk.Frame):
             self.timeout_entry,
             self.vofa_entry,
             self.vofa_button,
-            self.vofa_scope_profile_combo,
             self.vofa_listen_entry,
-            self.vofa_verify_scope_check,
-            self.scope_guide_button,
+            self.vofa_up_channel_entry,
+            self.vofa_up_port_entry,
+            self.vofa_up_name_entry,
+            self.vofa_down_channel_entry,
+            self.vofa_down_port_entry,
+            self.vofa_down_name_entry,
+            self.vofa_expected_float_count_entry,
+            self.vofa_guide_button,
         )
         self.editable_widgets.append((self.advanced_button, "normal"))
+
+    @staticmethod
+    def _channel_port_row(
+        parent: ttk.Frame,
+        row: int,
+        label: str,
+        channel_var: tk.StringVar,
+        port_var: tk.StringVar,
+    ) -> tuple[ttk.Entry, ttk.Entry]:
+        ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w", pady=3)
+        values = ttk.Frame(parent)
+        values.grid(row=row, column=1, columnspan=2, sticky="w", pady=3)
+        channel = ttk.Entry(values, textvariable=channel_var, width=6)
+        channel.grid(row=0, column=0, sticky="w")
+        port = ttk.Entry(values, textvariable=port_var, width=10)
+        port.grid(row=0, column=1, sticky="w", padx=(8, 0))
+        return channel, port
 
     def _remember_editable(self, *widgets: tk.Widget) -> None:
         self.editable_widgets.extend((widget, "normal") for widget in widgets)

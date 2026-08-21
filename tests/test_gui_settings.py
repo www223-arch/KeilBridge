@@ -27,8 +27,13 @@ def test_settings_round_trip(tmp_path):
         device_firmware="D:/fw/device.bin",
         vofa_path="D:/tools/VOFA+/vofa+.exe",
         vofa_listen="127.0.0.1:1347",
-        vofa_scope_profile="bilbopro-imu-loop-scope-v2",
-        vofa_verify_scope_name=False,
+        vofa_up_channel=3,
+        vofa_up_port=19101,
+        vofa_up_name="Plot",
+        vofa_down_channel=4,
+        vofa_down_port=19102,
+        vofa_down_name="Commands",
+        vofa_expected_float_count=6,
     )
 
     store.save(settings)

@@ -41,22 +41,6 @@ def test_manual_address_uses_0x100_search_window():
     assert "rtt setup 0x20006CAC 0x100" in " ".join(build_rtt_command(CONFIG, request))
 
 
-def test_session_reports_selected_rtt_channel_connection_state(tmp_path):
-    request = RttRequest(
-        scan_address=0x20000000,
-        scan_size=0x10000,
-        port=19023,
-        channel=2,
-        additional_channels=(RttChannelConfig(port=19022, channel=1),),
-    )
-    session = RttSession(CONFIG, request, tmp_path / "rtt.log")
-
-    assert session.is_channel_connected(1) is False
-    with session._socket_lock:
-        session._sockets[1] = object()
-    assert session.is_channel_connected(1) is True
-
-
 def test_expected_channel_name_lists_channels_before_starting_server():
     request = RttRequest(
         scan_address=0x20000000,
@@ -163,54 +147,6 @@ def test_session_refuses_channel_name_mismatch_before_tcp_connect(tmp_path):
     assert "TextLog" in event.message
 
 
-def test_session_refuses_down_channel_name_mismatch_before_tcp_connect(tmp_path):
-    process = FakeProcess(
-        stdout_lines=(
-            "Info : rtt: Control block found at 0x20008fc0\n",
-            "Channels: up=3, down=2\n",
-            "Up-channels:\n",
-            "0: Terminal 1024 0\n",
-            "1: Scope 2048 0\n",
-            "2: LoopScope 4096 0\n",
-            "Down-channels:\n",
-            "0: Terminal 16 0\n",
-            "1: WrongCmd 256 0\n",
-        )
-    )
-    connect_calls = []
-    session = RttSession(
-        CONFIG,
-        RttRequest(
-            scan_address=0x20000000,
-            scan_size=0x10000,
-            port=19023,
-            channel=2,
-            expected_channel_name="LoopScope",
-            additional_channels=(
-                RttChannelConfig(
-                    port=19022,
-                    channel=1,
-                    expected_channel_name="Scope",
-                    expected_down_channel_name="ScopeCmd",
-                ),
-            ),
-        ),
-        tmp_path / "rtt.log",
-        popen_factory=lambda *args, **kwargs: process,
-        socket_factory=lambda *args, **kwargs: connect_calls.append(args),
-        connect_timeout=0.5,
-    )
-
-    session.start()
-    event = _next_event(session, "error")
-    session.stop()
-
-    assert connect_calls == []
-    assert "down-channel 1" in event.message
-    assert "ScopeCmd" in event.message
-    assert "WrongCmd" in event.message
-
-
 def test_session_validates_scope_channel_before_tcp_connect(tmp_path):
     payload = b"scope-data"
     port, server = _start_rtt_server(payload)
@@ -253,6 +189,48 @@ def test_session_validates_scope_channel_before_tcp_connect(tmp_path):
 
     assert verified.message == "RTT up-channel 1 verified as 'Scope'."
     assert b"".join(chunks) == payload
+
+
+def test_session_validates_user_selected_up_and_down_names_before_tcp_connect(tmp_path):
+    payload = b"scope-data"
+    port, server = _start_rtt_server(payload)
+    process = FakeProcess(
+        stdout_lines=(
+            "Info : rtt: Control block found at 0x20008fc0\n",
+            "Channels: up=2, down=2\n",
+            "Up-channels:\n",
+            "0: Terminal 1024 0\n",
+            "1: Plot 2048 0\n",
+            "Down-channels:\n",
+            "0: Terminal 16 0\n",
+            "1: Commands 256 0\n",
+        )
+    )
+    session = RttSession(
+        CONFIG,
+        RttRequest(
+            scan_address=0x20000000,
+            scan_size=0x10000,
+            port=port,
+            channel=1,
+            expected_channel_name="Plot",
+            expected_down_channel_name="Commands",
+        ),
+        tmp_path / "rtt.log",
+        popen_factory=lambda *args, **kwargs: process,
+        connect_timeout=0.5,
+        parse_records=False,
+    )
+
+    session.start()
+    verified = [_next_event(session, "channel_verified") for _ in range(2)]
+    server.join(timeout=1)
+    session.stop()
+
+    assert {event.message for event in verified} == {
+        "RTT up-channel 1 verified as 'Plot'.",
+        "RTT down-channel 1 verified as 'Commands'.",
+    }
 
 
 def test_session_receives_text_and_scope_on_independent_tcp_channels(tmp_path):

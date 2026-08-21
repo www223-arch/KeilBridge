@@ -113,33 +113,6 @@ def test_vofa_bridge_forwards_client_bytes_back_to_rtt_without_decoding(tmp_path
     assert bridge.stats.clients_connected == 1
 
 
-def test_vofa_bridge_operator_send_uses_same_reverse_sink_and_capture(tmp_path):
-    chunks: list[bytes] = []
-
-    def reverse_sink(data: bytes) -> int:
-        chunks.append(bytes(data))
-        return len(data)
-
-    bridge = VofaTcpBridge(
-        "127.0.0.1",
-        0,
-        reverse_output=tmp_path / "vofa-to-mcu.bin",
-        reverse_sink=reverse_sink,
-    )
-    bridge.start()
-    frame = bytes.fromhex("B1 50 01 09 2A 00 00 00")
-
-    try:
-        assert bridge.send_reverse(frame) == len(frame)
-    finally:
-        bridge.stop()
-
-    assert chunks == [frame]
-    assert (tmp_path / "vofa-to-mcu.bin").read_bytes() == frame
-    assert bridge.stats.reverse_bytes_received == len(frame)
-    assert bridge.stats.reverse_bytes_forwarded == len(frame)
-
-
 def test_bilbopro_bridge_does_not_forward_wrong_float_count(tmp_path):
     bridge = VofaTcpBridge(
         "127.0.0.1",

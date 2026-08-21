@@ -216,17 +216,15 @@ RTT 页的“显示等级”使用固件现有的 EasyLogger/SEGGER RTT 等级�
 
 ## 9B. VOFA+ 能通过 RTT 向 MCU 发送命令吗？
 
-可以。“VOFA+ 曲线”使用同一个全双工 TCP 连接：MCU 的 RTT up-channel 1 经过 KeilTool 转发到 VOFA+，VOFA+ 发送区的数据经过 KeilTool 原样写入 RTT down-channel 1。文本模式是否追加换行由 VOFA+ 的发送设置决定；HEX 模式发送精确字节。KeilTool 不进行 UTF-8 转换、命令拆包或自动补帧，并把下行原始字节保存到会话目录的 `vofa-to-mcu.bin`。
+可以。“VOFA+ 曲线”使用同一个全双工 TCP 连接：MCU 的用户所选 RTT curve up-channel 经过 KeilTool 转发到 VOFA+，VOFA+ 发送区的数据经过 KeilTool 原样写入用户所选 RTT down-channel。文本模式是否追加换行由 VOFA+ 的发送设置决定；HEX 模式发送精确字节。KeilTool 不进行 UTF-8 转换、命令拆包或自动补帧，并把下行原始字节保存到会话目录的 `vofa-to-mcu.bin`。
 
-固件必须配置 down-channel 1，约定名称为 `ScopeCmd`，并在主循环或任务中调用 `SEGGER_RTT_Read(1, ...)`。不要在高频 ISR 中阻塞等待命令。TCP 写入成功不等于命令执行成功；需要可靠控制时，固件协议应返回带相同序号的 ACK 或错误结果。
-
-BilboPro LoopScope v2 还提供 GUI“控制命令”面板，不需要在 VOFA+ 中手工计算 CRC。面板支持九类 ScopeCmd 命令、最终 HEX 预览和可选自动 KEEPALIVE。发送后必须等待 I38 等于本帧 seq，再读取 I39：`0` 为成功，非零为拒绝/错误状态；I38 未匹配时不能判定 MCU 已执行。
+固件必须配置与工作台一致的 down-channel，并在主循环或任务中调用对应的 `SEGGER_RTT_Read(channel, ...)`。不要在高频 ISR 中阻塞等待命令。KeilTool 不规定名称和业务协议；TCP 写入成功不等于命令执行成功，需要可靠控制时由固件协议自行提供序号、校验和 ACK。
 
 ## 9C. 打开 VOFA+ 曲线后，文字 RTT 还能同时接收吗？
 
-可以。KeilTool 在同一个 OpenOCD 进程中同时启动 `channel 0 / 127.0.0.1:19021` 和 `channel 1 / 127.0.0.1:19022` 两个 RTT server。这里的 TCP 只是在电脑本机连接 OpenOCD 与 KeilTool，不是 MCU 网络通信。Channel 0 继续解析、显示、按等级过滤并保存文字日志；Channel 1 才会进入 JustFloat 和 VOFA+。二者依靠 RTT channel 物理隔离，不使用不可靠的内容猜测或文字过滤。
+可以。默认配置下，KeilTool 在同一个 OpenOCD 进程中同时启动 `channel 0 / 127.0.0.1:19021` 和 `channel 1 / 127.0.0.1:19022` 两个 RTT server。这里的 TCP 只是在电脑本机连接 OpenOCD 与 KeilTool，不是 MCU 网络通信。Channel 0 解析、显示、按等级过滤并保存文字日志；Channel 1 进入 JustFloat 和 VOFA+。两者的通道与端口都可配置，但文字 Up 和曲线 Up 必须不同，保证物理隔离。
 
-固件必须遵守通道约定：文字只写 up-channel 0，曲线只写名为 `Scope` 的 up-channel 1。如果把文字写进 channel 1，KeilTool 会报告 JustFloat 无效帧或帧长不匹配，而不会尝试把它自动过滤掉。
+固件必须遵守本次会话中选择的通道：文字只写文字 Up，曲线只写曲线 Up。通道名称校验是可选的，未填写名称时 KeilTool 不作假设。如果把文字写进曲线通道，KeilTool 会报告 JustFloat 无效帧，而不会尝试根据内容自动过滤。
 
 ## 10. GUI 提示 target 未验证或 target override 无效怎么办？
 

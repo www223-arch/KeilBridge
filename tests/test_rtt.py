@@ -10,7 +10,7 @@ import time
 import pytest
 
 from keiltool.core.openocd_backend import OpenOcdConfig
-from keiltool.core.rtt import RttRequest, RttSession, build_rtt_command
+from keiltool.core.rtt import RttChannelConfig, RttRequest, RttSession, build_rtt_command
 from keiltool.core.rtt_log import RttLevel
 
 
@@ -41,6 +41,22 @@ def test_manual_address_uses_0x100_search_window():
     assert "rtt setup 0x20006CAC 0x100" in " ".join(build_rtt_command(CONFIG, request))
 
 
+def test_session_reports_selected_rtt_channel_connection_state(tmp_path):
+    request = RttRequest(
+        scan_address=0x20000000,
+        scan_size=0x10000,
+        port=19023,
+        channel=2,
+        additional_channels=(RttChannelConfig(port=19022, channel=1),),
+    )
+    session = RttSession(CONFIG, request, tmp_path / "rtt.log")
+
+    assert session.is_channel_connected(1) is False
+    with session._socket_lock:
+        session._sockets[1] = object()
+    assert session.is_channel_connected(1) is True
+
+
 def test_expected_channel_name_lists_channels_before_starting_server():
     request = RttRequest(
         scan_address=0x20000000,
@@ -53,6 +69,26 @@ def test_expected_channel_name_lists_channels_before_starting_server():
     command = build_rtt_command(CONFIG, request)
 
     assert command.index("rtt channels") < command.index("rtt server start 19022 1")
+
+
+def test_command_starts_text_and_scope_servers_in_one_openocd_process():
+    request = RttRequest(
+        scan_address=0x20000000,
+        scan_size=0x10000,
+        port=19022,
+        channel=1,
+        expected_channel_name="Scope",
+        additional_channels=(
+            RttChannelConfig(port=19021, channel=0, parse_records=True),
+        ),
+    )
+
+    command = build_rtt_command(CONFIG, request)
+
+    assert command.count("init") == 1
+    assert command.count("rtt start") == 1
+    assert "rtt server start 19021 0" in command
+    assert "rtt server start 19022 1" in command
 
 
 class FakeProcess:
@@ -127,6 +163,54 @@ def test_session_refuses_channel_name_mismatch_before_tcp_connect(tmp_path):
     assert "TextLog" in event.message
 
 
+def test_session_refuses_down_channel_name_mismatch_before_tcp_connect(tmp_path):
+    process = FakeProcess(
+        stdout_lines=(
+            "Info : rtt: Control block found at 0x20008fc0\n",
+            "Channels: up=3, down=2\n",
+            "Up-channels:\n",
+            "0: Terminal 1024 0\n",
+            "1: Scope 2048 0\n",
+            "2: LoopScope 4096 0\n",
+            "Down-channels:\n",
+            "0: Terminal 16 0\n",
+            "1: WrongCmd 256 0\n",
+        )
+    )
+    connect_calls = []
+    session = RttSession(
+        CONFIG,
+        RttRequest(
+            scan_address=0x20000000,
+            scan_size=0x10000,
+            port=19023,
+            channel=2,
+            expected_channel_name="LoopScope",
+            additional_channels=(
+                RttChannelConfig(
+                    port=19022,
+                    channel=1,
+                    expected_channel_name="Scope",
+                    expected_down_channel_name="ScopeCmd",
+                ),
+            ),
+        ),
+        tmp_path / "rtt.log",
+        popen_factory=lambda *args, **kwargs: process,
+        socket_factory=lambda *args, **kwargs: connect_calls.append(args),
+        connect_timeout=0.5,
+    )
+
+    session.start()
+    event = _next_event(session, "error")
+    session.stop()
+
+    assert connect_calls == []
+    assert "down-channel 1" in event.message
+    assert "ScopeCmd" in event.message
+    assert "WrongCmd" in event.message
+
+
 def test_session_validates_scope_channel_before_tcp_connect(tmp_path):
     payload = b"scope-data"
     port, server = _start_rtt_server(payload)
@@ -169,6 +253,63 @@ def test_session_validates_scope_channel_before_tcp_connect(tmp_path):
 
     assert verified.message == "RTT up-channel 1 verified as 'Scope'."
     assert b"".join(chunks) == payload
+
+
+def test_session_receives_text_and_scope_on_independent_tcp_channels(tmp_path):
+    text_payload = b"I/boot ready\n"
+    scope_payload = b"\x00\x00\x80?\x00\x00\x80\x7f"
+    text_port, text_server = _start_rtt_server(text_payload)
+    scope_port, scope_server = _start_rtt_server(scope_payload)
+    process = FakeProcess(
+        stdout_lines=(
+            "Info : rtt: Control block found at 0x20008fc0\n",
+            "Channels: up=2, down=2\n",
+            "Up-channels:\n",
+            "0: Terminal 1024 0\n",
+            "1: Scope 2048 0\n",
+            "Down-channels:\n",
+        )
+    )
+    log_path = tmp_path / "rtt-text.log"
+    session = RttSession(
+        CONFIG,
+        RttRequest(
+            scan_address=0x20000000,
+            scan_size=0x10000,
+            port=scope_port,
+            channel=1,
+            expected_channel_name="Scope",
+            additional_channels=(
+                RttChannelConfig(port=text_port, channel=0, parse_records=True),
+            ),
+        ),
+        log_path,
+        popen_factory=lambda *args, **kwargs: process,
+        connect_timeout=0.5,
+        parse_records=False,
+    )
+
+    session.start()
+    events = []
+    deadline = time.monotonic() + 2
+    while sum(event.kind == "eof" for event in events) < 2:
+        assert time.monotonic() < deadline
+        events.append(session.events.get(timeout=0.1))
+    text_server.join(timeout=1)
+    scope_server.join(timeout=1)
+    session.stop()
+
+    assert b"".join(
+        event.data for event in events if event.kind == "raw" and event.channel == 0
+    ) == text_payload
+    assert b"".join(
+        event.data for event in events if event.kind == "raw" and event.channel == 1
+    ) == scope_payload
+    assert "".join(
+        event.text for event in events if event.kind == "data" and event.channel == 0
+    ) == text_payload.decode("ascii")
+    assert not [event for event in events if event.kind == "data" and event.channel == 1]
+    assert log_path.read_text(encoding="utf-8") == text_payload.decode("ascii")
 
 
 def _start_rtt_server(payload: bytes) -> tuple[int, threading.Thread]:
@@ -229,6 +370,65 @@ def _drain_events(session: RttSession):
             events.append(session.events.get_nowait())
         except queue.Empty:
             return events
+
+
+class RecordingSendSocket:
+    def __init__(self) -> None:
+        self.sent: list[bytes] = []
+
+    def sendall(self, data: bytes) -> None:
+        self.sent.append(bytes(data))
+
+
+def test_session_sends_raw_bytes_to_openocd_rtt_socket(tmp_path):
+    connection = RecordingSendSocket()
+    session = RttSession(
+        CONFIG,
+        RttRequest(scan_address=0x20000000, scan_size=0x10000),
+        tmp_path / "rtt.log",
+    )
+    session._socket = connection
+    payload = b"\x00\x80\xffcmd\x00\r\n"
+
+    written = session.send_bytes(payload)
+
+    assert written == len(payload)
+    assert b"".join(connection.sent) == payload
+
+
+def test_session_sends_to_explicit_rtt_down_channel(tmp_path):
+    text_connection = RecordingSendSocket()
+    scope_connection = RecordingSendSocket()
+    session = RttSession(
+        CONFIG,
+        RttRequest(
+            scan_address=0x20000000,
+            scan_size=0x10000,
+            port=19022,
+            channel=1,
+            additional_channels=(RttChannelConfig(port=19021, channel=0),),
+        ),
+        tmp_path / "rtt.log",
+    )
+    session._sockets = {0: text_connection, 1: scope_connection}
+    payload = b"\x00\x80\xffscope-command"
+
+    written = session.send_bytes(payload, channel=1)
+
+    assert written == len(payload)
+    assert text_connection.sent == []
+    assert b"".join(scope_connection.sent) == payload
+
+
+def test_session_refuses_send_before_rtt_tcp_connects(tmp_path):
+    session = RttSession(
+        CONFIG,
+        RttRequest(scan_address=0x20000000, scan_size=0x10000),
+        tmp_path / "rtt.log",
+    )
+
+    with pytest.raises(RuntimeError, match="not connected"):
+        session.send_bytes(b"command")
 
 
 def test_session_decodes_fragmented_utf8_and_writes_log(tmp_path):

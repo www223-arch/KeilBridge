@@ -304,11 +304,22 @@ def test_one_click_vofa_uses_dedicated_rtt_channel_and_ports(tmp_path, monkeypat
     configurations = []
 
     class FakeBridge:
-        def __init__(self, host, port, *, raw_output, expected_float_count):
+        def __init__(
+            self,
+            host,
+            port,
+            *,
+            raw_output,
+            reverse_output,
+            expected_float_count,
+            reverse_sink,
+        ):
             self.host = host
             self.port = port
             self.raw_output = raw_output
+            self.reverse_output = reverse_output
             self.expected_float_count = expected_float_count
+            self.reverse_sink = reverse_sink
             self.started = False
             self.stats = SimpleNamespace(
                 frames_received=0,
@@ -334,10 +345,16 @@ def test_one_click_vofa_uses_dedicated_rtt_channel_and_ports(tmp_path, monkeypat
             self.log_path = log_path
             self.kwargs = kwargs
             self.command = ["openocd", "rtt"]
+            self.sent = []
             sessions.append(self)
 
         def start(self):
             pass
+
+        def send_bytes(self, data, *, channel=None):
+            payload = bytes(data)
+            self.sent.append((channel, payload))
+            return len(payload)
 
     facts = SimpleNamespace(
         device="GD32F303CC",
@@ -350,7 +367,8 @@ def test_one_click_vofa_uses_dedicated_rtt_channel_and_ports(tmp_path, monkeypat
     )
     gui.logs_dir_var.set(str(tmp_path / "logs"))
     gui.vofa_path_var.set(str(executable))
-    gui.vofa_listen_var.set("127.0.0.1:1347")
+    gui.vofa_scope_profile_var.set("bilbopro-imu-loop-scope-v2")
+    gui.vofa_listen_var.set("127.0.0.1:1348")
     monkeypatch.setattr(gui, "_obtain_fresh_snapshot", lambda: SimpleNamespace(facts=facts))
     monkeypatch.setattr(gui, "_build_openocd_config", lambda _snapshot: config)
     monkeypatch.setattr(app, "VofaTcpBridge", FakeBridge)
@@ -376,31 +394,101 @@ def test_one_click_vofa_uses_dedicated_rtt_channel_and_ports(tmp_path, monkeypat
         gui._start_vofa_rtt()
 
         assert len(sessions) == 1
-        assert sessions[0].request.channel == 1
-        assert sessions[0].request.port == 19022
-        assert sessions[0].request.expected_channel_name == "Scope"
+        assert sessions[0].request.channel == 2
+        assert sessions[0].request.port == 19023
+        assert sessions[0].request.expected_channel_name == "LoopScope"
         assert sessions[0].kwargs["parse_records"] is False
+        assert sessions[0].request.additional_channels[0].channel == 0
+        assert sessions[0].request.additional_channels[0].port == 19021
+        assert sessions[0].request.additional_channels[0].parse_records is True
+        assert sessions[0].request.additional_channels[1].channel == 1
+        assert sessions[0].request.additional_channels[1].port == 19022
+        assert sessions[0].request.additional_channels[1].expected_channel_name == "Scope"
+        assert (
+            sessions[0].request.additional_channels[1].expected_down_channel_name
+            == "ScopeCmd"
+        )
         assert bridges[0].host == "127.0.0.1"
-        assert bridges[0].port == 1347
+        assert bridges[0].port == 1348
         assert bridges[0].raw_output.name == "rtt-justfloat.bin"
-        assert bridges[0].expected_float_count == 15
+        assert bridges[0].reverse_output.name == "vofa-to-mcu.bin"
+        assert bridges[0].expected_float_count == 40
+        reverse_payload = b"\x00\x80\xffcommand"
+        assert bridges[0].reverse_sink(reverse_payload) == len(reverse_payload)
+        assert sessions[0].sent == [(1, reverse_payload)]
         assert bridges[0].started
         guide = sessions[0].log_path.parent / "scope-channels.txt"
         assert guide.is_file()
         assert "I0  = acc_g.x" in guide.read_text(encoding="utf-8")
-        assert "I14 = euler_9dof_deg.yaw" in gui.output._openocd_text.get("1.0", "end")
+        assert "I39 = control.last_cmd_result_status_bitmask" in gui.output._openocd_text.get(
+            "1.0", "end"
+        )
         assert gui.vofa_verify_scope_name_var.get() is True
-        assert "Scope" in gui.controls.vofa_verify_scope_check.cget("text")
+        assert "LoopScope" in gui.controls.vofa_verify_scope_check.cget("text")
         assert launches[0][0] == [str(executable.resolve())]
-        assert configurations == [(executable.resolve(), "127.0.0.1", 1347)]
-        assert "127.0.0.1:1347" in gui.vofa_connection_hint_var.get()
+        assert configurations == [(executable.resolve(), "127.0.0.1", 1348)]
+        assert "127.0.0.1:1348" in gui.vofa_connection_hint_var.get()
         assert "JustFloat" in gui.vofa_connection_hint_var.get()
+        assert "双向" in gui.vofa_connection_hint_var.get()
         assert workers[0][0] == "rtt-start-settled"
         assert workers[0][2] is sessions[0]
     finally:
         if gui._vofa_bridge is not None:
             gui._vofa_bridge.stop()
         root.destroy()
+
+
+def test_scope_command_button_sends_frame_through_active_vofa_bridge(tmp_path):
+    import tkinter as tk
+
+    from keiltool.core.scope_command import ScopeCommandType, build_scope_command
+    from keiltool.core.scope_profile import BILBOPRO_IMU_LOOP_SCOPE_V2
+    from keiltool.gui.app import KeilToolGui
+    from keiltool.gui.settings import SettingsStore
+
+    class FakeBridge:
+        def __init__(self):
+            self.sent: list[bytes] = []
+            self.stats = SimpleNamespace(
+                frames_forwarded=0,
+                frames_dropped=0,
+                invalid_frames=0,
+                active_clients=0,
+                reverse_bytes_forwarded=0,
+                reverse_errors=0,
+            )
+
+        def send_reverse(self, data):
+            self.sent.append(bytes(data))
+            return len(data)
+
+    root = tk.Tk()
+    root.withdraw()
+    gui = KeilToolGui(root, settings_store=SettingsStore(tmp_path / "settings.json"))
+    bridge = FakeBridge()
+    gui._vofa_bridge = bridge
+    gui._vofa_scope_profile = BILBOPRO_IMU_LOOP_SCOPE_V2
+    class FakeSession:
+        def is_channel_connected(self, channel):
+            return channel == 1
+
+    session = FakeSession()
+    gui._rtt_session = session
+    gui._rtt_lifecycle.begin_start(session)
+    gui._rtt_lifecycle.start_settled(session)
+    frame = build_scope_command(ScopeCommandType.GET_STATE, seq=9)
+
+    try:
+        assert gui.controls.scope_command_button.cget("command")
+        gui._send_scope_command_frame(frame, "GET_STATE seq=9")
+
+        assert bridge.sent == [frame]
+        assert "GET_STATE seq=9" in gui.output._openocd_text.get("1.0", "end")
+        assert frame.hex(" ").upper() in gui.output._openocd_text.get("1.0", "end")
+    finally:
+        root.destroy()
+
+
 
 
 def test_gui_applies_theme_and_filters_structured_rtt_records(tmp_path, monkeypatch):
@@ -611,7 +699,10 @@ def test_gui_applies_theme_and_filters_structured_rtt_records(tmp_path, monkeypa
                 last_error="",
             ),
         )
-        gui._handle_rtt_event(RttEvent("raw", data=b"\x00\x00\x80?\x00\x00\x80\x7f"))
+        gui._handle_rtt_event(RttEvent("raw", data=b"I/text only\n", channel=0))
+        gui._handle_rtt_event(
+            RttEvent("raw", data=b"\x00\x00\x80?\x00\x00\x80\x7f", channel=1)
+        )
         assert forwarded == [b"\x00\x00\x80?\x00\x00\x80\x7f"]
         assert "1 帧" in gui.counts_var.get()
         gui._vofa_bridge = None

@@ -293,9 +293,9 @@ Flash 读取、烧录、连接检查和 RTT 共享同一支 ST-Link，但任何�
 
 Windows GUI 启动的 OpenOCD 进程使用后台窗口模式，连接检查、Flash 读取、烧录和 RTT 期间不会额外弹出终端窗口。该策略只作用于 GUI；CLI 仍保持标准 stdout/stderr 和中断处理，便于脚本、AI 自动化调试和第三方工具集成。
 
-RTT 区域的“VOFA+ 曲线”按钮提供一键 JustFloat 桥接。它固定读取 RTT up-channel 1，通过 OpenOCD 本地端口 `19022` 接收字节，在 `127.0.0.1:1347` 建立 TCP 服务，然后启动已记忆的 VOFA+。首次使用时如果没有找到 `vofa+.exe`，工作台会要求选择一次，关闭时自动保存路径。VOFA+ 中首次建立一个 TCP 客户端连接，目标为 `127.0.0.1:1347`，协议引擎选择 JustFloat；VOFA+ 保存该工程后，后续只需点击工作台按钮。普通“开始采集”仍使用当前通道和文本日志解析，不受曲线模式影响。
+RTT 区域的“VOFA+ 曲线”按钮提供一键双向 JustFloat 桥接。一个 OpenOCD 进程会同时开放两个仅限本机的 RTT TCP server：up-channel 0 使用 `127.0.0.1:19021`，继续由 KeilTool 解析文字等级、显示并保存日志；up-channel 1 使用 `127.0.0.1:19022`，只把原始 JustFloat 数据交给 VOFA bridge。bridge 在 `127.0.0.1:1347` 等待 VOFA+ TCP 客户端，并启动已记忆的 VOFA+。首次使用时如果没有找到 `vofa+.exe`，工作台会要求选择一次，关闭时自动保存路径。该 VOFA TCP 连接同时承载发送区到 MCU RTT down-channel 1 的反向数据。
 
-曲线模式不会 reset、halt 或 resume MCU。工作台按 JustFloat 帧尾切分完整帧，在独立线程中转发，VOFA+ 未连接或绘制变慢不会阻塞 RTT 接收。转发队列满时只丢弃用于实时显示的完整帧，并显示转发、丢弃和无效帧计数；RTT 原始字节仍优先写入本次会话的 `rtt-justfloat.bin`。停止采集会关闭 OpenOCD 和本地 TCP bridge，但不会强制关闭 VOFA+。
+曲线模式不会 reset、halt 或 resume MCU。通道隔离是严格的：只有 channel 0 进入文字解析和等级过滤，只有 channel 1 原始字节进入 JustFloat 解码与 VOFA；工具不会从混合内容中猜测文字和曲线。工作台按 JustFloat 帧尾切分完整帧，在独立线程中转发，VOFA+ 未连接或绘制变慢不会阻塞 RTT 接收。转发队列满时只丢弃用于实时显示的完整帧，并显示文字、曲线、下行、丢弃和无效帧计数；文字日志写入本次会话的 RTT 日志，曲线上行原始字节写入 `rtt-justfloat.bin`。VOFA+ 发送区产生的每个原始字节都会不经 UTF-8 解码、不添加换行、不做命令封包地写入 RTT down-channel 1，并单独保存到 `vofa-to-mcu.bin`。MCU 需要把 down-channel 1 配置为 `ScopeCmd` 并调用 `SEGGER_RTT_Read(1, ...)`；主机发送成功只证明字节已交给 OpenOCD，不证明 MCU 已执行命令，可靠命令仍需由固件协议提供序号、校验和 ACK。停止采集会关闭 OpenOCD 和本地 TCP bridge，但不会强制关闭 VOFA+。
 
 默认日志目录为：
 
@@ -331,7 +331,22 @@ RTT 默认持续采集到 `Ctrl+C`、RTT EOF 或错误，也可用 `--duration <
 
 `--channel 1` 可让 FOC 二进制记录独占 RTT 上行通道 1，`--port 19022` 指定 KeilTool 连接的本地 OpenOCD RTT TCP 端口。该采集命令只执行 `rtt setup`、`rtt start` 和 `rtt server start`，目标运行期间不发送 reset、halt 或 resume。主机字节计数只能证明 KeilTool 收到和写入了多少字节，不能检测 MCU 产生记录之前或 RTT 缓冲区内发生的漏记录；扫频有效性仍应由记录内 timestamp 连续性判定。
 
-`--vofa-listen HOST:PORT` 把 raw RTT 中的完整 JustFloat 帧转发给连接到该地址的 VOFA+ TCP 客户端；必须与 `--format raw` 配合。可选的 `--vofa-executable PATH` 会在监听成功后启动 VOFA+。命令结束时 stderr 额外报告收到、转发、丢弃、无效帧和连接次数。
+`--vofa-listen HOST:PORT` 把所选 Scope profile 上行通道中的完整 JustFloat 帧转发给连接到该地址的 VOFA+ TCP 客户端；必须与 `--format raw` 配合。VOFA 模式默认使用 profile 对应的 OpenOCD 端口，同时使用 `--text-port 19021` 连接 channel 0；channel 0 文字继续写入本次会话的 RTT 日志，但不会混入 raw stdout、`--output` 文件或 VOFA。该连接是全双工的：VOFA+ 发来的原始字节会透明写入 profile 约定的 RTT down-channel，并保存为本次会话的 `vofa-to-mcu.bin`。可选的 `--vofa-executable PATH` 会在监听成功后启动 VOFA+。命令结束时 stderr 额外报告上行帧、下行字节、丢弃、无效帧、反向错误和连接次数。
+
+BilboPro 保留两个互不覆盖的 Scope profile：
+
+- `bilbopro-imu-scope-v1`：默认 profile，Up1=`Scope`，15 路、200 Hz，OpenOCD `19022`，VOFA `1347`。
+- `bilbopro-imu-loop-scope-v2`：闭环调试 profile，Up2=`LoopScope`，40 路、100 Hz，OpenOCD `19023`，VOFA `1348`；同时连接 Channel 1/`19022`，严格验证 Up1=`Scope`、Down1=`ScopeCmd` 并承载控制命令。
+
+启动 LoopScope v2：
+
+```powershell
+k2c rtt --device <MCU型号> --format raw --scope-profile bilbopro-imu-loop-scope-v2 --vofa-listen 127.0.0.1:1348 --output loop-scope-v2.bin
+```
+
+GUI 高级设置中的“曲线配置”可在 v1/v2 之间切换并记忆选择；使用内置端口时，切换 profile 会同步切换 `1347/1348`。每次会话目录中的 `scope-channels.txt` 记录所选 profile 的完整字段映射和 `ScopeCmd` 控制帧合同。完整固定合同见 `docs/04_BilboPro_RTT_Scope协议.md`。
+
+使用 v2 时，待 `LoopScope/ScopeCmd` 通道验证并连接后，RTT 区域会启用“控制命令”。该窗口按表单生成完整 ScopeCmd v1 帧，显示 profile、连接状态、seq、最终 HEX 和 I38/I39 ACK 提示。SET_SPEED 允许 `-6.5..+6.5 deg/s` 正反向目标；姿态 max_rate 为 `(0,6.5] deg/s`。START 始终需要显式确认。自动 KEEPALIVE 默认关闭，启用后显示续租倒计时，并在 RTT 断开、会话停止或窗口关闭时停止发送。所有下行帧仍写入本次会话的 `vofa-to-mcu.bin`。
 
 高级覆盖参数在这些命令中保持一致：`--openocd`、`--scripts`、`--target-cfg` 和 `--logs-dir`。无法验证设备内存范围或 target cfg 时命令会失败，不会猜测配置继续访问硬件。
 

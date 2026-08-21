@@ -28,6 +28,7 @@ from keiltool.core.openocd_backend import (
 from keiltool.core.rtt import RttChannelConfig, RttEvent, RttSession
 from keiltool.core.scope_profile import (
     BILBOPRO_IMU_SCOPE_V1,
+    BILBOPRO_IMU_LOOP_SCOPE_V2,
     SCOPE_PROFILES,
     ScopeProfile,
     get_scope_profile,
@@ -64,6 +65,7 @@ from keiltool.gui.settings import (
     SettingsStore,
     default_devices_path,
 )
+from keiltool.gui.scope_command_dialog import ScopeCommandDialog
 from keiltool.gui.state import BusySessionError, SessionState, TaskGate
 from keiltool.gui.theme import configure_theme
 from keiltool.gui.widgets import ConfigurationPane, OperationStatusPane, OutputNotebook
@@ -161,6 +163,7 @@ class KeilToolGui:
         self._scope_guide_path: Path | None = None
         self._vofa_mismatch_reported = 0
         self._vofa_reverse_errors_reported = 0
+        self._scope_command_seq = 0
         self._last_operation_feedback_refresh = 0.0
         self._rtt_display = RttDisplayBuffer(max_records=20_000)
         self._one_shot_cleanup_log: Path | None = None
@@ -350,6 +353,7 @@ class KeilToolGui:
         controls.flash_button.configure(command=self._flash)
         controls.rtt_start_button.configure(command=self._start_rtt)
         controls.vofa_start_button.configure(command=self._start_vofa_rtt)
+        controls.scope_command_button.configure(command=self._open_scope_command_dialog)
         controls.rtt_stop_button.configure(command=self._stop_rtt)
         controls.vofa_button.configure(command=self._choose_vofa)
         controls.vofa_scope_profile_combo.configure(
@@ -1399,6 +1403,69 @@ class KeilToolGui:
             parent=self.root,
         )
 
+    def _open_scope_command_dialog(self) -> None:
+        if (
+            self._vofa_bridge is None
+            or self._vofa_scope_profile is None
+            or self._vofa_scope_profile.profile_id != BILBOPRO_IMU_LOOP_SCOPE_V2.profile_id
+            or not self._scope_command_connected()
+        ):
+            messagebox.showinfo(
+                "控制命令不可用",
+                "请先选择 bilbopro-imu-loop-scope-v2，并启动 VOFA+ 曲线会话。",
+                parent=self.root,
+            )
+            return
+        profile = self._vofa_scope_profile
+        ScopeCommandDialog(
+            self.root,
+            on_send=self._send_scope_command_frame,
+            is_connected=self._scope_command_connected,
+            profile_text=(
+                f"{profile.title} · Up{profile.rtt_channel} {profile.rtt_channel_name} / "
+                f"Down{profile.rtt_down_channel} {profile.rtt_down_channel_name}"
+            ),
+            connection_text=(
+                f"RTT 已连接 · Down{profile.rtt_down_channel} OpenOCD TCP "
+                f"127.0.0.1:{profile.rtt_down_port}"
+            ),
+            initial_seq=self._scope_command_seq,
+        )
+
+    def _scope_command_connected(self) -> bool:
+        session = self._rtt_session
+        profile = self._vofa_scope_profile
+        return bool(
+            session is not None
+            and profile is not None
+            and profile.profile_id == BILBOPRO_IMU_LOOP_SCOPE_V2.profile_id
+            and self._rtt_lifecycle.phase is RttPhase.RUNNING
+            and session.is_channel_connected(profile.rtt_down_channel)
+        )
+
+    def _send_scope_command_frame(self, frame: bytes, description: str) -> None:
+        bridge = self._vofa_bridge
+        profile = self._vofa_scope_profile
+        if (
+            bridge is None
+            or profile is None
+            or profile.profile_id != BILBOPRO_IMU_LOOP_SCOPE_V2.profile_id
+            or not self._scope_command_connected()
+        ):
+            raise RuntimeError("BilboPro LoopScope v2 RTT 会话尚未就绪。")
+        written = bridge.send_reverse(frame)
+        if written != len(frame):
+            raise OSError(f"RTT Down1 短写：要求 {len(frame)} 字节，实际 {written} 字节。")
+        self._scope_command_seq = (frame[4] + 1) & 0xFF
+        frame_hex = frame.hex(" ").upper()
+        self._append_openocd(
+            f"[ScopeCmd] 已交给 RTT Down1：{description} · {written} 字节\n"
+            f"[ScopeCmd] HEX: {frame_hex}\n"
+            "[ScopeCmd] 请通过 LoopScope I38/I39 确认 MCU ACK/状态。\n"
+        )
+        self.status_var.set(f"控制命令已发送：{description}；等待 I38/I39 ACK")
+        self._update_vofa_summary()
+
     def _stop_rtt(self) -> None:
         session = self._rtt_session
         if session is None:
@@ -2025,6 +2092,10 @@ class KeilToolGui:
                 if self._rtt_lifecycle.phase in {RttPhase.STARTING, RttPhase.RUNNING, RttPhase.INCOMPLETE}
                 else "disabled"
             )
+        )
+        scope_command_ready = self._vofa_bridge is not None and self._scope_command_connected()
+        controls.scope_command_button.configure(
+            state="normal" if scope_command_ready else "disabled"
         )
 
     def _hardware_busy(self) -> bool:

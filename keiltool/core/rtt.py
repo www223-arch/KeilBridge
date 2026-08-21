@@ -249,6 +249,12 @@ class RttSession:
                 raise OSError(f"RTT TCP send failed: {exc}") from exc
         return len(payload)
 
+    def is_channel_connected(self, channel: int) -> bool:
+        """Return whether the selected RTT TCP channel currently has a socket."""
+
+        with self._socket_lock:
+            return channel in self._sockets
+
     def start(self) -> None:
         """Start OpenOCD and return while background workers establish RTT."""
 

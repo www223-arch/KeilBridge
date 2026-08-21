@@ -53,10 +53,10 @@ CRC 覆盖从 SOF `B1 50` 到 payload 末字节。
 | type | 命令 | payload |
 | ---: | --- | --- |
 | 01 | SET_MODE | axis:u8, mode:u8 |
-| 02 | SET_SPEED | axis:u8, target_dps:f32LE |
+| 02 | SET_SPEED | axis:u8, target_dps:f32LE，`[-6.5,+6.5] deg/s` |
 | 03 | SET_PID | axis:u8, kp/ki/kd/output_limit_dps:f32LE |
 | 04 | SET_ATTITUDE_QUAT | w/x/y/z:f32LE |
-| 05 | SET_ATTITUDE_GAIN | kp/kd/max_rate_dps:f32LE |
+| 05 | SET_ATTITUDE_GAIN | kp/kd/max_rate_dps:f32LE，`max_rate_dps` 为 `(0,6.5]` |
 | 06 | START | axis_mask:u8, ttl_ms:u16LE |
 | 07 | KEEPALIVE | ttl_ms:u16LE |
 | 08 | STOP | axis_mask:u8 |
@@ -65,3 +65,11 @@ CRC 覆盖从 SOF `B1 50` 到 payload 末字节。
 `axis=1` 表示 yaw/rotate，`axis=2` 表示 pitch。`mode=0/1/2` 分别表示 open-speed、closed-speed、quaternion-attitude。
 
 START 必须显式发送，TTL 最大 30000 ms。KEEPALIVE 缺失或 TTL 到期时 MCU 必须立即停止相应运动。ACK 不得混入 Up1；v2 使用 I38 回显 seq，I39 返回结果和状态。
+
+## 5. KeilTool 控制面板
+
+GUI 高级设置选择 `bilbopro-imu-loop-scope-v2`，点击“VOFA+ 曲线”，待 Up2=`LoopScope`、Down1=`ScopeCmd` 均连接后，RTT 区域的“控制命令”按钮才会启用。面板显示当前 profile、Down1 连接状态、seq、参数表单以及含 CRC 的最终 HEX；支持 SET_MODE、SET_SPEED、SET_PID、SET_ATTITUDE_QUAT、SET_ATTITUDE_GAIN、START、KEEPALIVE、STOP、GET_STATE。
+
+START 发送前必须再次确认。可选自动 KEEPALIVE 默认关闭，启用后立即发送一次，并按 TTL 的一半周期续租；界面显示下一次续租倒计时。RTT Down1 断开、会话停止或关闭命令窗口后，自动续租立即停止发送。
+
+每次发送后以 LoopScope v2 的 I38/I39 判读 ACK：I38 必须等于该帧 seq，才表示 MCU 已处理到这条命令；I39=`0` 表示该 seq 成功，非零表示参数、CRC、状态或安全拒绝。I38 尚未更新时只能说明主机已把完整帧写入 RTT Down1，不能声称 MCU 已执行。

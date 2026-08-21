@@ -438,6 +438,59 @@ def test_one_click_vofa_uses_dedicated_rtt_channel_and_ports(tmp_path, monkeypat
         root.destroy()
 
 
+def test_scope_command_button_sends_frame_through_active_vofa_bridge(tmp_path):
+    import tkinter as tk
+
+    from keiltool.core.scope_command import ScopeCommandType, build_scope_command
+    from keiltool.core.scope_profile import BILBOPRO_IMU_LOOP_SCOPE_V2
+    from keiltool.gui.app import KeilToolGui
+    from keiltool.gui.settings import SettingsStore
+
+    class FakeBridge:
+        def __init__(self):
+            self.sent: list[bytes] = []
+            self.stats = SimpleNamespace(
+                frames_forwarded=0,
+                frames_dropped=0,
+                invalid_frames=0,
+                active_clients=0,
+                reverse_bytes_forwarded=0,
+                reverse_errors=0,
+            )
+
+        def send_reverse(self, data):
+            self.sent.append(bytes(data))
+            return len(data)
+
+    root = tk.Tk()
+    root.withdraw()
+    gui = KeilToolGui(root, settings_store=SettingsStore(tmp_path / "settings.json"))
+    bridge = FakeBridge()
+    gui._vofa_bridge = bridge
+    gui._vofa_scope_profile = BILBOPRO_IMU_LOOP_SCOPE_V2
+    class FakeSession:
+        def is_channel_connected(self, channel):
+            return channel == 1
+
+    session = FakeSession()
+    gui._rtt_session = session
+    gui._rtt_lifecycle.begin_start(session)
+    gui._rtt_lifecycle.start_settled(session)
+    frame = build_scope_command(ScopeCommandType.GET_STATE, seq=9)
+
+    try:
+        assert gui.controls.scope_command_button.cget("command")
+        gui._send_scope_command_frame(frame, "GET_STATE seq=9")
+
+        assert bridge.sent == [frame]
+        assert "GET_STATE seq=9" in gui.output._openocd_text.get("1.0", "end")
+        assert frame.hex(" ").upper() in gui.output._openocd_text.get("1.0", "end")
+    finally:
+        root.destroy()
+
+
+
+
 def test_gui_applies_theme_and_filters_structured_rtt_records(tmp_path, monkeypatch):
     import tkinter as tk
 

@@ -346,6 +346,8 @@ k2c rtt --device <MCU型号> --format raw --scope-profile bilbopro-imu-loop-scop
 
 GUI 高级设置中的“曲线配置”可在 v1/v2 之间切换并记忆选择；使用内置端口时，切换 profile 会同步切换 `1347/1348`。每次会话目录中的 `scope-channels.txt` 记录所选 profile 的完整字段映射和 `ScopeCmd` 控制帧合同。完整固定合同见 `docs/04_BilboPro_RTT_Scope协议.md`。
 
+使用 v2 时，待 `LoopScope/ScopeCmd` 通道验证并连接后，RTT 区域会启用“控制命令”。该窗口按表单生成完整 ScopeCmd v1 帧，显示 profile、连接状态、seq、最终 HEX 和 I38/I39 ACK 提示。SET_SPEED 允许 `-6.5..+6.5 deg/s` 正反向目标；姿态 max_rate 为 `(0,6.5] deg/s`。START 始终需要显式确认。自动 KEEPALIVE 默认关闭，启用后显示续租倒计时，并在 RTT 断开、会话停止或窗口关闭时停止发送。所有下行帧仍写入本次会话的 `vofa-to-mcu.bin`。
+
 高级覆盖参数在这些命令中保持一致：`--openocd`、`--scripts`、`--target-cfg` 和 `--logs-dir`。无法验证设备内存范围或 target cfg 时命令会失败，不会猜测配置继续访问硬件。
 
 ## 5. VS Code 使用方式

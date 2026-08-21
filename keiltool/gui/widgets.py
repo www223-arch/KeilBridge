@@ -315,6 +315,14 @@ class ConfigurationPane(ttk.Frame):
         self.vofa_start_button.grid(row=0, column=1, sticky="ew", padx=3)
         self.rtt_stop_button = ttk.Button(actions, text="停止采集")
         self.rtt_stop_button.grid(row=0, column=2, sticky="ew", padx=(3, 0))
+        self.scope_command_button = ttk.Button(actions, text="控制命令")
+        self.scope_command_button.grid(
+            row=1,
+            column=0,
+            columnspan=3,
+            sticky="ew",
+            pady=(6, 0),
+        )
 
         vofa_hint = ttk.Frame(section)
         vofa_hint.grid(row=5, column=0, columnspan=3, sticky="ew", pady=(6, 0))

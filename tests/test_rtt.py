@@ -41,6 +41,22 @@ def test_manual_address_uses_0x100_search_window():
     assert "rtt setup 0x20006CAC 0x100" in " ".join(build_rtt_command(CONFIG, request))
 
 
+def test_session_reports_selected_rtt_channel_connection_state(tmp_path):
+    request = RttRequest(
+        scan_address=0x20000000,
+        scan_size=0x10000,
+        port=19023,
+        channel=2,
+        additional_channels=(RttChannelConfig(port=19022, channel=1),),
+    )
+    session = RttSession(CONFIG, request, tmp_path / "rtt.log")
+
+    assert session.is_channel_connected(1) is False
+    with session._socket_lock:
+        session._sockets[1] = object()
+    assert session.is_channel_connected(1) is True
+
+
 def test_expected_channel_name_lists_channels_before_starting_server():
     request = RttRequest(
         scan_address=0x20000000,

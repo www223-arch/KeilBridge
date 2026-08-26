@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 import json
 import os
 from pathlib import Path
@@ -55,7 +55,7 @@ class GuiSettings:
         project = _string(data.get("project"), defaults.project)
         firmware = _string(data.get("firmware"), defaults.firmware)
         source_mode = _device_source_mode(data.get("device_source_mode"), project)
-        return cls(
+        settings = cls(
             project=project,
             target=_string(data.get("target"), defaults.target),
             firmware=firmware,
@@ -101,6 +101,18 @@ class GuiSettings:
                 defaults.vofa_expected_float_count,
             ),
         )
+        if not _has_valid_vofa_rtt_topology(settings):
+            return replace(
+                settings,
+                rtt_channel=defaults.rtt_channel,
+                rtt_port=defaults.rtt_port,
+                vofa_up_channel=defaults.vofa_up_channel,
+                vofa_up_port=defaults.vofa_up_port,
+                vofa_down_channel=defaults.vofa_down_channel,
+                vofa_down_port=defaults.vofa_down_port,
+                vofa_expected_float_count=defaults.vofa_expected_float_count,
+            )
+        return settings
 
 
 @dataclass(frozen=True, slots=True)
@@ -202,3 +214,24 @@ def _rtt_level(value: object) -> str:
     if isinstance(value, str) and value in {level.name for level in RttLevel}:
         return value
     return RttLevel.VERBOSE.name
+
+
+def _has_valid_vofa_rtt_topology(settings: GuiSettings) -> bool:
+    """Reject only impossible RTT channel-to-TCP-port mappings from old GUI state."""
+    entries = (
+        (settings.rtt_channel, settings.rtt_port),
+        (settings.vofa_up_channel, settings.vofa_up_port),
+        (settings.vofa_down_channel, settings.vofa_down_port),
+    )
+    channel_ports: dict[int, int] = {}
+    port_channels: dict[int, int] = {}
+    for channel, port in entries:
+        if not 0 <= channel <= 255 or not 1 <= port <= 65535:
+            return False
+        existing_port = channel_ports.setdefault(channel, port)
+        if existing_port != port:
+            return False
+        existing_channel = port_channels.setdefault(port, channel)
+        if existing_channel != channel:
+            return False
+    return settings.rtt_channel != settings.vofa_up_channel

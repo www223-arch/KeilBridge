@@ -84,6 +84,28 @@ def test_settings_from_dict_uses_defaults_for_invalid_values():
     assert settings == GuiSettings(rtt_timeout_ms=9)
 
 
+def test_settings_from_dict_repairs_an_invalid_vofa_rtt_port_topology():
+    settings = GuiSettings.from_dict(
+        {
+            "version": 1,
+            "project": "D:/fw/bilbopro.uvprojx",
+            "rtt_channel": 0,
+            "rtt_port": 19022,
+            "vofa_up_channel": 1,
+            "vofa_up_port": 19022,
+            "vofa_down_channel": 1,
+            "vofa_down_port": 19023,
+            "vofa_expected_float_count": 20,
+        }
+    )
+
+    assert settings.project == "D:/fw/bilbopro.uvprojx"
+    assert (settings.rtt_channel, settings.rtt_port) == (0, 19021)
+    assert (settings.vofa_up_channel, settings.vofa_up_port) == (1, 19022)
+    assert (settings.vofa_down_channel, settings.vofa_down_port) == (1, 19022)
+    assert settings.vofa_expected_float_count == 0
+
+
 def test_settings_accepts_known_rtt_display_level_and_rejects_unknown_value():
     assert GuiSettings().rtt_display_level == "VERBOSE"
     assert GuiSettings.from_dict({"rtt_display_level": "INFO"}).rtt_display_level == "INFO"

@@ -166,14 +166,221 @@ def _format_elapsed(seconds: float) -> str:
     return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
 
 
+class AdvancedSettingsDialog(tk.Toplevel):
+    """Scrollable RTT/OpenOCD settings kept outside the fixed-height main pane."""
+
+    def __init__(self, parent: tk.Misc, variables: WorkbenchVariables) -> None:
+        super().__init__(parent)
+        self.withdraw()
+        self.title("RTT 高级设置")
+        self.transient(parent.winfo_toplevel())
+        self.protocol("WM_DELETE_WINDOW", self.close)
+        self.bind("<Escape>", lambda _event: self.close())
+        self.bind("<MouseWheel>", self._on_mousewheel)
+        self.minsize(540, 400)
+        self.columnconfigure(0, weight=1)
+        self.rowconfigure(0, weight=1)
+
+        viewport = ttk.Frame(self)
+        viewport.grid(row=0, column=0, sticky="nsew")
+        viewport.columnconfigure(0, weight=1)
+        viewport.rowconfigure(0, weight=1)
+        self.canvas = tk.Canvas(viewport, highlightthickness=0, borderwidth=0)
+        self.canvas.grid(row=0, column=0, sticky="nsew")
+        self.scrollbar = ttk.Scrollbar(
+            viewport,
+            orient="vertical",
+            command=self.canvas.yview,
+        )
+        self.scrollbar.grid(row=0, column=1, sticky="ns")
+        self.canvas.configure(yscrollcommand=self.scrollbar.set)
+
+        self.content = ttk.Frame(self.canvas, padding=14)
+        self.content.columnconfigure(1, weight=1)
+        self._content_window = self.canvas.create_window(
+            (0, 0),
+            window=self.content,
+            anchor="nw",
+        )
+        self.content.bind("<Configure>", self._sync_scroll_region)
+        self.canvas.bind("<Configure>", self._sync_content_width)
+        self._build_fields(variables)
+
+        footer = ttk.Frame(self)
+        footer.grid(row=1, column=0, sticky="ew", padx=12, pady=(8, 12))
+        footer.columnconfigure(0, weight=1)
+        ttk.Button(footer, text="关闭", command=self.close).grid(row=0, column=1)
+
+    def _build_fields(self, variables: WorkbenchVariables) -> None:
+        self.openocd_entry, self.openocd_button = path_row(
+            self.content,
+            0,
+            "OpenOCD",
+            variables.openocd_var,
+        )
+        self.scripts_entry, self.scripts_button = path_row(
+            self.content,
+            1,
+            "scripts",
+            variables.scripts_var,
+        )
+        self.override_entry, self.override_button = path_row(
+            self.content,
+            2,
+            "target override",
+            variables.target_override_var,
+        )
+        ttk.Label(self.content, text="文字 RTT 端口").grid(
+            row=3, column=0, sticky="w", pady=3
+        )
+        self.port_entry = ttk.Entry(
+            self.content,
+            textvariable=variables.rtt_port_var,
+            width=12,
+        )
+        self.port_entry.grid(row=3, column=1, sticky="w", pady=3)
+        ttk.Label(self.content, text="扫描超时(ms)").grid(
+            row=4, column=0, sticky="w", pady=3
+        )
+        self.timeout_entry = ttk.Entry(
+            self.content,
+            textvariable=variables.rtt_timeout_var,
+            width=12,
+        )
+        self.timeout_entry.grid(row=4, column=1, sticky="w", pady=3)
+        self.vofa_entry, self.vofa_button = path_row(
+            self.content,
+            5,
+            "VOFA+",
+            variables.vofa_path_var,
+        )
+        ttk.Label(self.content, text="VOFA 监听").grid(
+            row=6, column=0, sticky="w", pady=3
+        )
+        self.vofa_listen_entry = ttk.Entry(
+            self.content,
+            textvariable=variables.vofa_listen_var,
+            width=20,
+        )
+        self.vofa_listen_entry.grid(row=6, column=1, sticky="w", pady=3)
+        self.vofa_up_channel_entry, self.vofa_up_port_entry = _channel_port_row(
+            self.content,
+            7,
+            "曲线 Up / 端口",
+            variables.vofa_up_channel_var,
+            variables.vofa_up_port_var,
+        )
+        ttk.Label(self.content, text="曲线 Up 名称").grid(
+            row=8, column=0, sticky="w", pady=3
+        )
+        self.vofa_up_name_entry = ttk.Entry(
+            self.content,
+            textvariable=variables.vofa_up_name_var,
+            width=20,
+        )
+        self.vofa_up_name_entry.grid(row=8, column=1, sticky="w", pady=3)
+        self.vofa_down_channel_entry, self.vofa_down_port_entry = _channel_port_row(
+            self.content,
+            9,
+            "反向 Down / 端口",
+            variables.vofa_down_channel_var,
+            variables.vofa_down_port_var,
+        )
+        ttk.Label(self.content, text="反向 Down 名称").grid(
+            row=10, column=0, sticky="w", pady=3
+        )
+        self.vofa_down_name_entry = ttk.Entry(
+            self.content,
+            textvariable=variables.vofa_down_name_var,
+            width=20,
+        )
+        self.vofa_down_name_entry.grid(row=10, column=1, sticky="w", pady=3)
+        ttk.Label(self.content, text="固定浮点数 N").grid(
+            row=11, column=0, sticky="w", pady=3
+        )
+        self.vofa_expected_float_count_entry = ttk.Entry(
+            self.content,
+            textvariable=variables.vofa_expected_float_count_var,
+            width=12,
+        )
+        self.vofa_expected_float_count_entry.grid(row=11, column=1, sticky="w", pady=3)
+        ttk.Label(self.content, text="0 = 不校验", style="Muted.TLabel").grid(
+            row=11, column=2, sticky="w", pady=3
+        )
+        self.vofa_guide_button = ttk.Button(
+            self.content,
+            text="打开 RTT/VOFA 会话说明",
+        )
+        self.vofa_guide_button.grid(row=12, column=1, sticky="w", pady=3)
+
+    def open(self) -> None:
+        screen_height = max(480, self.winfo_screenheight())
+        height = min(720, screen_height - 120)
+        width = min(680, max(540, self.winfo_screenwidth() - 120))
+        owner = self.master.winfo_toplevel()
+        owner.update_idletasks()
+        x = max(0, owner.winfo_rootx() + (owner.winfo_width() - width) // 2)
+        y = max(0, owner.winfo_rooty() + (owner.winfo_height() - height) // 2)
+        self.geometry(f"{width}x{height}+{x}+{y}")
+        self.deiconify()
+        self.lift()
+        self.update_idletasks()
+        self.canvas.yview_moveto(0.0)
+        self.port_entry.focus_set()
+
+    def close(self) -> None:
+        self.withdraw()
+
+    def ensure_visible(self, widget: tk.Widget) -> None:
+        self.update_idletasks()
+        region = self.canvas.bbox("all")
+        if region is None or region[3] <= region[1]:
+            return
+        top = widget.winfo_rooty() - self.content.winfo_rooty()
+        bottom = top + widget.winfo_height()
+        visible_top = self.canvas.canvasy(0)
+        visible_height = self.canvas.winfo_height()
+        total_height = region[3] - region[1]
+        if top < visible_top:
+            self.canvas.yview_moveto(max(0.0, top / total_height))
+        elif bottom > visible_top + visible_height:
+            offset = max(0, bottom - visible_height)
+            self.canvas.yview_moveto(min(1.0, offset / total_height))
+
+    def _sync_scroll_region(self, _event: tk.Event | None = None) -> None:
+        self.canvas.configure(scrollregion=self.canvas.bbox("all"))
+
+    def _sync_content_width(self, event: tk.Event) -> None:
+        self.canvas.itemconfigure(self._content_window, width=event.width)
+
+    def _on_mousewheel(self, event: tk.Event) -> str:
+        self.canvas.yview_scroll(-1 if event.delta > 0 else 1, "units")
+        return "break"
+
+
+def _channel_port_row(
+    parent: ttk.Frame,
+    row: int,
+    label: str,
+    channel_var: tk.StringVar,
+    port_var: tk.StringVar,
+) -> tuple[ttk.Entry, ttk.Entry]:
+    ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w", pady=3)
+    values = ttk.Frame(parent)
+    values.grid(row=row, column=1, columnspan=2, sticky="w", pady=3)
+    channel = ttk.Entry(values, textvariable=channel_var, width=6)
+    channel.grid(row=0, column=0, sticky="w")
+    port = ttk.Entry(values, textvariable=port_var, width=10)
+    port.grid(row=0, column=1, sticky="w", padx=(8, 0))
+    return channel, port
+
+
 class ConfigurationPane(ttk.Frame):
     """Stable left-side project, flash, RTT, and advanced controls."""
 
     def __init__(self, parent: ttk.Frame, variables: WorkbenchVariables) -> None:
         super().__init__(parent)
-        self._advanced_visible = False
         self.columnconfigure(0, weight=1)
-        self.rowconfigure(3, weight=1)
         self.editable_widgets: list[tuple[tk.Widget, str]] = []
         self._build_project_section(variables)
         self._build_rtt_section(variables)
@@ -349,101 +556,33 @@ class ConfigurationPane(ttk.Frame):
     def _build_advanced_section(self, variables: WorkbenchVariables) -> None:
         self.advanced_button = ttk.Button(
             self,
-            text="▶ 高级设置",
-            command=self._toggle_advanced,
+            text="高级设置...",
         )
         self.advanced_button.grid(row=2, column=0, sticky="ew", pady=(4, 0))
-
-        self.advanced_frame = ttk.Frame(self, padding=(8, 5, 8, 0))
-        self.advanced_frame.columnconfigure(1, weight=1)
-        self.openocd_entry, self.openocd_button = path_row(
-            self.advanced_frame,
-            0,
-            "OpenOCD",
-            variables.openocd_var,
-        )
-        self.scripts_entry, self.scripts_button = path_row(
-            self.advanced_frame,
-            1,
-            "scripts",
-            variables.scripts_var,
-        )
-        self.override_entry, self.override_button = path_row(
-            self.advanced_frame,
-            2,
-            "target override",
-            variables.target_override_var,
-        )
-        ttk.Label(self.advanced_frame, text="文字 RTT 端口").grid(
-            row=3, column=0, sticky="w", pady=3
-        )
-        self.port_entry = ttk.Entry(self.advanced_frame, textvariable=variables.rtt_port_var, width=12)
-        self.port_entry.grid(row=3, column=1, sticky="w", pady=3)
-        ttk.Label(self.advanced_frame, text="扫描超时(ms)").grid(row=4, column=0, sticky="w", pady=3)
-        self.timeout_entry = ttk.Entry(self.advanced_frame, textvariable=variables.rtt_timeout_var, width=12)
-        self.timeout_entry.grid(row=4, column=1, sticky="w", pady=3)
-        self.vofa_entry, self.vofa_button = path_row(
-            self.advanced_frame,
-            5,
-            "VOFA+",
-            variables.vofa_path_var,
-        )
-        ttk.Label(self.advanced_frame, text="VOFA 监听").grid(row=6, column=0, sticky="w", pady=3)
-        self.vofa_listen_entry = ttk.Entry(
-            self.advanced_frame,
-            textvariable=variables.vofa_listen_var,
-            width=20,
-        )
-        self.vofa_listen_entry.grid(row=6, column=1, sticky="w", pady=3)
-        self.vofa_up_channel_entry, self.vofa_up_port_entry = self._channel_port_row(
-            self.advanced_frame,
-            7,
-            "曲线 Up / 端口",
-            variables.vofa_up_channel_var,
-            variables.vofa_up_port_var,
-        )
-        ttk.Label(self.advanced_frame, text="曲线 Up 名称").grid(
-            row=8, column=0, sticky="w", pady=3
-        )
-        self.vofa_up_name_entry = ttk.Entry(
-            self.advanced_frame,
-            textvariable=variables.vofa_up_name_var,
-            width=20,
-        )
-        self.vofa_up_name_entry.grid(row=8, column=1, sticky="w", pady=3)
-        self.vofa_down_channel_entry, self.vofa_down_port_entry = self._channel_port_row(
-            self.advanced_frame,
-            9,
-            "反向 Down / 端口",
-            variables.vofa_down_channel_var,
-            variables.vofa_down_port_var,
-        )
-        ttk.Label(self.advanced_frame, text="反向 Down 名称").grid(
-            row=10, column=0, sticky="w", pady=3
-        )
-        self.vofa_down_name_entry = ttk.Entry(
-            self.advanced_frame,
-            textvariable=variables.vofa_down_name_var,
-            width=20,
-        )
-        self.vofa_down_name_entry.grid(row=10, column=1, sticky="w", pady=3)
-        ttk.Label(self.advanced_frame, text="固定浮点数 N").grid(
-            row=11, column=0, sticky="w", pady=3
-        )
-        self.vofa_expected_float_count_entry = ttk.Entry(
-            self.advanced_frame,
-            textvariable=variables.vofa_expected_float_count_var,
-            width=12,
-        )
-        self.vofa_expected_float_count_entry.grid(row=11, column=1, sticky="w", pady=3)
-        ttk.Label(self.advanced_frame, text="0 = 不校验", style="Muted.TLabel").grid(
-            row=11, column=2, sticky="w", pady=3
-        )
-        self.vofa_guide_button = ttk.Button(
-            self.advanced_frame,
-            text="打开 RTT/VOFA 会话说明",
-        )
-        self.vofa_guide_button.grid(row=12, column=1, sticky="w", pady=3)
+        self.advanced_dialog = AdvancedSettingsDialog(self, variables)
+        self.advanced_button.configure(command=self.advanced_dialog.open)
+        for name in (
+            "openocd_entry",
+            "openocd_button",
+            "scripts_entry",
+            "scripts_button",
+            "override_entry",
+            "override_button",
+            "port_entry",
+            "timeout_entry",
+            "vofa_entry",
+            "vofa_button",
+            "vofa_listen_entry",
+            "vofa_up_channel_entry",
+            "vofa_up_port_entry",
+            "vofa_up_name_entry",
+            "vofa_down_channel_entry",
+            "vofa_down_port_entry",
+            "vofa_down_name_entry",
+            "vofa_expected_float_count_entry",
+            "vofa_guide_button",
+        ):
+            setattr(self, name, getattr(self.advanced_dialog, name))
 
         self._remember_editable(
             self.openocd_entry,
@@ -468,34 +607,8 @@ class ConfigurationPane(ttk.Frame):
         )
         self.editable_widgets.append((self.advanced_button, "normal"))
 
-    @staticmethod
-    def _channel_port_row(
-        parent: ttk.Frame,
-        row: int,
-        label: str,
-        channel_var: tk.StringVar,
-        port_var: tk.StringVar,
-    ) -> tuple[ttk.Entry, ttk.Entry]:
-        ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w", pady=3)
-        values = ttk.Frame(parent)
-        values.grid(row=row, column=1, columnspan=2, sticky="w", pady=3)
-        channel = ttk.Entry(values, textvariable=channel_var, width=6)
-        channel.grid(row=0, column=0, sticky="w")
-        port = ttk.Entry(values, textvariable=port_var, width=10)
-        port.grid(row=0, column=1, sticky="w", padx=(8, 0))
-        return channel, port
-
     def _remember_editable(self, *widgets: tk.Widget) -> None:
         self.editable_widgets.extend((widget, "normal") for widget in widgets)
-
-    def _toggle_advanced(self) -> None:
-        self._advanced_visible = not self._advanced_visible
-        if self._advanced_visible:
-            self.advanced_frame.grid(row=3, column=0, sticky="ew")
-            self.advanced_button.configure(text="▼ 高级设置")
-        else:
-            self.advanced_frame.grid_remove()
-            self.advanced_button.configure(text="▶ 高级设置")
 
 
 class OutputNotebook(ttk.Frame):

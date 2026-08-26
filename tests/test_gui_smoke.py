@@ -490,6 +490,60 @@ def test_vofa_preflight_failure_is_visible_and_persisted(tmp_path, monkeypatch):
         root.destroy()
 
 
+def test_rtt_advanced_settings_use_reopenable_scrollable_dialog(tmp_path):
+    import tkinter as tk
+
+    from keiltool.gui.app import KeilToolGui
+    from keiltool.gui.settings import SettingsStore
+
+    root = tk.Tk()
+    root.geometry("900x700")
+    gui = KeilToolGui(root, settings_store=SettingsStore(tmp_path / "settings.json"))
+    controls = gui.controls
+    dialog = controls.advanced_dialog
+    required_fields = (
+        controls.port_entry,
+        controls.vofa_entry,
+        controls.vofa_listen_entry,
+        controls.vofa_up_channel_entry,
+        controls.vofa_up_port_entry,
+        controls.vofa_up_name_entry,
+        controls.vofa_down_channel_entry,
+        controls.vofa_down_port_entry,
+        controls.vofa_down_name_entry,
+        controls.vofa_expected_float_count_entry,
+    )
+
+    try:
+        assert dialog.state() == "withdrawn"
+        assert dialog.canvas.cget("yscrollcommand")
+        assert dialog.scrollbar.cget("command")
+        assert all(field.winfo_toplevel() is dialog for field in required_fields)
+
+        controls.advanced_button.invoke()
+        root.update()
+        assert dialog.state() == "normal"
+        assert dialog.winfo_height() <= 900
+
+        gui.vofa_up_name_var.set("LoopScope")
+        for field in required_fields:
+            dialog.ensure_visible(field)
+            root.update()
+            field_top = field.winfo_rooty() - dialog.canvas.winfo_rooty()
+            field_bottom = field_top + field.winfo_height()
+            assert field_top >= 0
+            assert field_bottom <= dialog.canvas.winfo_height()
+
+        dialog.close()
+        assert dialog.state() == "withdrawn"
+        controls.advanced_button.invoke()
+        root.update()
+        assert dialog.state() == "normal"
+        assert gui.vofa_up_name_var.get() == "LoopScope"
+    finally:
+        root.destroy()
+
+
 def test_gui_applies_theme_and_filters_structured_rtt_records(tmp_path, monkeypatch):
     import tkinter as tk
 

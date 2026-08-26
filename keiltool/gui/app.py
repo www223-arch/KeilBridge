@@ -8,6 +8,7 @@ import queue
 import subprocess
 import threading
 import time
+import traceback
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 from typing import Callable, cast
@@ -1116,17 +1117,24 @@ class KeilToolGui:
         vofa_process: subprocess.Popen | None = None
         vofa_setup: VofaConnectionConfigResult | None = None
         log_context: SessionLogContext | None = None
+        facts: ProjectTargetFacts | None = None
+        preflight_stage = "刷新目标信息"
         try:
             snapshot = self._obtain_fresh_snapshot()
+            preflight_stage = "生成 OpenOCD 配置"
             config = self._build_openocd_config(snapshot)
             facts = cast(ProjectTargetFacts, snapshot.facts)
             vofa_executable: Path | None = None
             vofa_host = ""
             vofa_port = 0
             if vofa:
+                preflight_stage = "查找 VOFA+ 可执行文件"
                 vofa_executable = self._obtain_vofa_executable()
+                preflight_stage = "解析 VOFA+ 监听地址"
                 vofa_host, vofa_port = parse_listen_address(self.vofa_listen_var.get())
+                preflight_stage = "解析 VOFA+ RTT 通道配置"
                 vofa_config = self._build_vofa_rtt_config()
+            preflight_stage = "生成 RTT 请求"
             request = build_rtt_request(
                 manual=self.rtt_manual_var.get(),
                 address=self.rtt_address_var.get().strip(),
@@ -1145,6 +1153,7 @@ class KeilToolGui:
                 expected_channel_name=vofa_config.curve_up_name if vofa else None,
             )
             if vofa:
+                preflight_stage = "生成多通道 RTT 请求"
                 primary, additional_channels = vofa_config.channel_configs()
                 request = replace(
                     request,
@@ -1154,9 +1163,11 @@ class KeilToolGui:
                     expected_down_channel_name=primary.expected_down_channel_name,
                     additional_channels=additional_channels,
                 )
+            preflight_stage = "校验 RTT 超时"
             timeout_ms = int(self.rtt_timeout_var.get().strip())
             if timeout_ms <= 0:
                 raise ValueError("RTT 扫描超时必须大于 0。")
+            preflight_stage = "创建 RTT 会话日志"
             log_dir = self._log_dir()
             log_context = create_session_logs(
                 log_dir,
@@ -1183,6 +1194,7 @@ class KeilToolGui:
                     ),
                 },
             )
+            preflight_stage = "创建 RTT 会话"
             log_paths = RttLogPaths(
                 channel=log_context.primary_log,
                 stdout=log_context.stdout_log,
@@ -1197,6 +1209,7 @@ class KeilToolGui:
                 parse_records=not vofa,
             )
             if vofa:
+                preflight_stage = "创建 VOFA+ 会话说明"
                 self._vofa_guide_path = write_vofa_session_guide(
                     log_context.directory / "rtt-vofa-session.txt",
                     vofa_config,
@@ -1214,17 +1227,21 @@ class KeilToolGui:
                         channel=vofa_config.down_channel,
                     ),
                 )
+                preflight_stage = "启动 VOFA+ TCP 桥"
                 bridge.start()
+                preflight_stage = "配置 VOFA+ TCP 连接"
                 vofa_setup = prepare_installed_vofa_connection(
                     vofa_executable,
                     vofa_host,
                     vofa_port,
                 )
+                preflight_stage = "启动 VOFA+"
                 vofa_process = subprocess.Popen(
                     [str(vofa_executable)],
                     cwd=vofa_executable.parent,
                     **background_process_kwargs(),
                 )
+            preflight_stage = "登记 RTT 会话"
             self.gate.begin(SessionState.RTT_SCAN)
             try:
                 self._rtt_lifecycle.begin_start(session)
@@ -1241,12 +1258,31 @@ class KeilToolGui:
         except Exception as exc:
             if bridge is not None:
                 bridge.stop()
-            if log_context is not None:
-                try:
-                    log_context.finalize("not_started")
-                except OSError:
-                    pass
-            self._fail_feedback(f"无法启动 {task_name}", str(exc))
+            diagnostic_dir, diagnostic_path, log_error = self._record_rtt_start_failure(
+                task_name=task_name,
+                stage=preflight_stage,
+                exc=exc,
+                traceback_text=traceback.format_exc(),
+                facts=facts,
+                vofa=vofa,
+                log_context=log_context,
+            )
+            exception_text = f"{type(exc).__name__}: {exc}"
+            diagnostic_text = str(diagnostic_path) if diagnostic_path is not None else "未能写入"
+            output = (
+                f"[RTT 预检失败] {task_name}\n"
+                f"阶段: {preflight_stage}\n"
+                f"异常: {exception_text}\n"
+                f"诊断日志: {diagnostic_text}\n"
+            )
+            if log_error:
+                output += f"诊断日志写入异常: {log_error}\n"
+            self._append_openocd(output + "\n")
+            self._fail_feedback(
+                f"无法启动 {task_name}",
+                f"阶段: {preflight_stage}\n{exception_text}\n诊断日志: {diagnostic_text}",
+                log_dir=diagnostic_dir,
+            )
             return
 
         self._rtt_session = session
@@ -1310,6 +1346,80 @@ class KeilToolGui:
                     port,
                 )
             )
+
+    def _record_rtt_start_failure(
+        self,
+        *,
+        task_name: str,
+        stage: str,
+        exc: Exception,
+        traceback_text: str,
+        facts: ProjectTargetFacts | None,
+        vofa: bool,
+        log_context: SessionLogContext | None,
+    ) -> tuple[Path | None, Path | None, str]:
+        exception_text = f"{type(exc).__name__}: {exc}"
+        diagnostic = (
+            "KeilTool RTT startup failure\n"
+            "----------------------------\n"
+            f"task: {task_name}\n"
+            f"stage: {stage}\n"
+            f"exception: {exception_text}\n"
+            f"project: {self.project_var.get().strip()}\n"
+            f"target: {self.target_var.get().strip()}\n"
+            f"device: {(facts.device if facts is not None else self.device_var.get().strip()) or 'unknown'}\n"
+            f"openocd: {self.openocd_var.get().strip()}\n"
+            f"scripts: {self.scripts_var.get().strip()}\n"
+            f"rtt_address: {self.rtt_address_var.get().strip() or 'auto'}\n"
+            f"text_up: channel={self.rtt_channel_var.get().strip()}, port={self.rtt_port_var.get().strip()}\n"
+            f"vofa_listen: {self.vofa_listen_var.get().strip() if vofa else 'disabled'}\n"
+            f"curve_up: channel={self.vofa_up_channel_var.get().strip()}, port={self.vofa_up_port_var.get().strip()}, name={self.vofa_up_name_var.get().strip() or '(unchecked)'}\n"
+            f"down: channel={self.vofa_down_channel_var.get().strip()}, port={self.vofa_down_port_var.get().strip()}, name={self.vofa_down_name_var.get().strip() or '(unchecked)'}\n"
+            f"expected_float_count: {self.vofa_expected_float_count_var.get().strip()}\n"
+            "\nTraceback:\n"
+            f"{traceback_text}"
+        )
+        context = log_context
+        log_errors: list[str] = []
+        if context is None:
+            roots: list[Path] = []
+            try:
+                roots.append(self._log_dir())
+            except Exception as root_exc:
+                log_errors.append(f"configured log directory: {root_exc}")
+            fallback = self.settings_store.path.parent / "logs"
+            if fallback not in roots:
+                roots.append(fallback)
+            device = (
+                facts.device if facts is not None else self.device_var.get().strip()
+            ) or "unknown"
+            for root in roots:
+                try:
+                    context = create_session_logs(
+                        root,
+                        device=device,
+                        task="RTT_VOFA_FAILED" if vofa else "RTT_FAILED",
+                        metadata={
+                            "outcome": "preflight_failed",
+                            "failure_stage": stage,
+                            "exception_type": type(exc).__name__,
+                            "exception_message": str(exc),
+                        },
+                    )
+                    break
+                except Exception as log_exc:
+                    log_errors.append(f"{root}: {log_exc}")
+        if context is None:
+            return None, None, "; ".join(log_errors)
+
+        diagnostic_path = context.directory / "preflight-error.log"
+        try:
+            diagnostic_path.write_text(diagnostic, encoding="utf-8", newline="\n")
+            context.finalize("preflight_failed")
+        except Exception as log_exc:
+            log_errors.append(f"{diagnostic_path}: {log_exc}")
+            return context.directory, None, "; ".join(log_errors)
+        return context.directory, diagnostic_path, "; ".join(log_errors)
 
     def _build_vofa_rtt_config(self) -> VofaRttConfig:
         try:

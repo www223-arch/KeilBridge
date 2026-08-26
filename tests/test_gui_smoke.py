@@ -439,6 +439,57 @@ def test_one_click_vofa_uses_dedicated_rtt_channel_and_ports(tmp_path, monkeypat
         root.destroy()
 
 
+def test_vofa_preflight_failure_is_visible_and_persisted(tmp_path, monkeypatch):
+    import tkinter as tk
+
+    from keiltool.gui.app import KeilToolGui
+    from keiltool.gui.settings import SettingsStore
+
+    executable = tmp_path / "vofa+.exe"
+    executable.write_bytes(b"MZ")
+    root = tk.Tk()
+    root.withdraw()
+    gui = KeilToolGui(root, settings_store=SettingsStore(tmp_path / "settings.json"))
+    facts = SimpleNamespace(
+        device="GD32F303VE",
+        ram_origin=0x20000000,
+        ram_size=0x10000,
+    )
+    config = SimpleNamespace(
+        target_cfg="target/stm32f3x.cfg",
+        interface_cfg="interface/stlink.cfg",
+    )
+    gui.logs_dir_var.set(str(tmp_path / "logs"))
+    gui.vofa_path_var.set(str(executable))
+    gui.rtt_channel_var.set("0")
+    gui.rtt_port_var.set("19022")
+    gui.vofa_up_channel_var.set("1")
+    gui.vofa_up_port_var.set("19022")
+    gui.vofa_down_channel_var.set("1")
+    gui.vofa_down_port_var.set("19022")
+    monkeypatch.setattr(gui, "_obtain_fresh_snapshot", lambda: SimpleNamespace(facts=facts))
+    monkeypatch.setattr(gui, "_build_openocd_config", lambda _snapshot: config)
+
+    try:
+        gui._start_vofa_rtt()
+
+        output = gui.output._openocd_text.get("1.0", "end")
+        assert "[RTT 预检失败] RTT → VOFA+" in output
+        assert "阶段: 解析 VOFA+ RTT 通道配置" in output
+        assert "ValueError: Different RTT channels must use different OpenOCD TCP ports." in output
+        assert "诊断日志:" in output
+        assert gui.operation_feedback.log_dir is not None
+        diagnostic = gui.operation_feedback.log_dir / "preflight-error.log"
+        assert diagnostic.is_file()
+        diagnostic_text = diagnostic.read_text(encoding="utf-8")
+        assert "stage: 解析 VOFA+ RTT 通道配置" in diagnostic_text
+        assert "text_up: channel=0, port=19022" in diagnostic_text
+        assert "curve_up: channel=1, port=19022" in diagnostic_text
+        assert "Different RTT channels must use different OpenOCD TCP ports." in diagnostic_text
+    finally:
+        root.destroy()
+
+
 def test_gui_applies_theme_and_filters_structured_rtt_records(tmp_path, monkeypatch):
     import tkinter as tk
 

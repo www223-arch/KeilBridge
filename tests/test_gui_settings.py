@@ -11,6 +11,7 @@ def test_settings_round_trip(tmp_path):
         target="Release",
         firmware="D:/fw/motor.bin",
         bin_address="0x08004000",
+        flash_read_format="hex",
         openocd_path="D:/tools/openocd.exe",
         scripts_dir="D:/tools/scripts",
         target_override="target/custom.cfg",
@@ -82,6 +83,12 @@ def test_settings_from_dict_uses_defaults_for_invalid_values():
     )
 
     assert settings == GuiSettings(rtt_timeout_ms=9)
+
+
+def test_settings_accepts_bin_hex_flash_read_format_and_repairs_unknown_value():
+    assert GuiSettings.from_dict({"flash_read_format": "hex"}).flash_read_format == "hex"
+    assert GuiSettings.from_dict({"flash_read_format": "bin"}).flash_read_format == "bin"
+    assert GuiSettings.from_dict({"flash_read_format": "elf"}).flash_read_format == "bin"
 
 
 def test_settings_from_dict_repairs_an_invalid_vofa_rtt_port_topology():

@@ -92,7 +92,7 @@ def test_flash_read_cli_reads_exact_context_range_and_reports_artifact(
     tmp_path, monkeypatch, capsys
 ):
     context = _context(tmp_path)
-    output = tmp_path / "flash.bin"
+    output = tmp_path / "flash.hex"
     captured = {}
     monkeypatch.setattr(cli, "resolve_hardware_context", lambda _selection: context)
 
@@ -136,6 +136,7 @@ def test_flash_read_cli_reads_exact_context_range_and_reports_artifact(
     assert captured["request"].address == 0x08000000
     assert captured["request"].size == 0x40000
     assert payload["artifact"]["path"] == str(output.resolve())
+    assert payload["artifact"]["format"] == "hex"
     assert payload["artifact"]["sha256"] == "abc123"
     assert payload["artifact"]["size"] == 0x40000
 

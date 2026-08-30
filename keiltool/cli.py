@@ -409,11 +409,13 @@ def cmd_flash_read(args: argparse.Namespace) -> int:
         ),
         metadata={
             "output": str(request.output.expanduser().resolve()),
+            "format": request.output.suffix.lower().lstrip("."),
             "address": f"0x{request.address:08X}",
             "size": request.size,
         },
         artifact=lambda result: {
             "path": str(result.output),
+            "format": result.output.suffix.lower().lstrip("."),
             "address": f"0x{result.address:08X}",
             "requested_size": result.requested_size,
             "size": result.actual_size,
@@ -1163,7 +1165,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Read the complete verified primary Flash range without resetting",
     )
     _add_hardware_arguments(flash_read_cmd)
-    flash_read_cmd.add_argument("--output", required=True, type=Path, help="Output .bin image")
+    flash_read_cmd.add_argument(
+        "--output",
+        required=True,
+        type=Path,
+        help="Output .bin or Intel HEX .hex image (format inferred from extension)",
+    )
     flash_read_cmd.set_defaults(func=cmd_flash_read)
 
     flash_cmd = subparsers.add_parser("flash", help="Program the generated ELF or an existing HEX/BIN file with OpenOCD")

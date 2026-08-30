@@ -18,6 +18,7 @@ class GuiSettings:
     target: str = ""
     firmware: str = ""
     bin_address: str = "0x08000000"
+    flash_read_format: str = "bin"
     openocd_path: str = ""
     scripts_dir: str = ""
     target_override: str = ""
@@ -60,6 +61,7 @@ class GuiSettings:
             target=_string(data.get("target"), defaults.target),
             firmware=firmware,
             bin_address=_string(data.get("bin_address"), defaults.bin_address),
+            flash_read_format=_flash_read_format(data.get("flash_read_format")),
             openocd_path=_string(data.get("openocd_path"), defaults.openocd_path),
             scripts_dir=_string(data.get("scripts_dir"), defaults.scripts_dir),
             target_override=_string(data.get("target_override"), defaults.target_override),
@@ -214,6 +216,10 @@ def _rtt_level(value: object) -> str:
     if isinstance(value, str) and value in {level.name for level in RttLevel}:
         return value
     return RttLevel.VERBOSE.name
+
+
+def _flash_read_format(value: object) -> str:
+    return str(value).lower() if isinstance(value, str) and value.lower() in {"bin", "hex"} else "bin"
 
 
 def _has_valid_vofa_rtt_topology(settings: GuiSettings) -> bool:

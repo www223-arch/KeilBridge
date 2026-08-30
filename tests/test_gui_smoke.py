@@ -874,9 +874,12 @@ def test_gui_applies_theme_and_filters_structured_rtt_records(tmp_path, monkeypa
         monkeypatch.setattr(gui, "_obtain_fresh_snapshot", lambda: read_snapshot)
         monkeypatch.setattr(gui, "_build_openocd_config", lambda _snapshot: read_config)
         monkeypatch.setattr(gui, "_log_dir", lambda: tmp_path)
+        save_dialog_calls = []
+        gui.flash_read_format_var.set("hex")
+        read_output = read_output.with_suffix(".hex")
         monkeypatch.setattr(
             "keiltool.gui.app.filedialog.asksaveasfilename",
-            lambda **_kwargs: str(read_output),
+            lambda **kwargs: save_dialog_calls.append(kwargs) or str(read_output),
         )
         monkeypatch.setattr(
             gui,
@@ -898,6 +901,10 @@ def test_gui_applies_theme_and_filters_structured_rtt_records(tmp_path, monkeypa
         assert gui.operation_feedback.state.value == "running"
         assert gui.operation_feedback.stage == "OpenOCD 执行中"
         assert gui.operation_feedback.log_dir is not None
+        assert save_dialog_calls[0]["defaultextension"] == ".hex"
+        assert save_dialog_calls[0]["initialfile"].endswith(".hex")
+        assert ("HEX 镜像", "*.hex") in save_dialog_calls[0]["filetypes"]
+        assert ("BIN 镜像", "*.bin") in save_dialog_calls[0]["filetypes"]
 
         error_dialogs.clear()
         monkeypatch.setattr(

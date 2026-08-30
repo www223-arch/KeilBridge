@@ -186,7 +186,10 @@ GUI 使用独立的“读取完整 Flash”按钮；CLI 可使用：
 
 ```powershell
 k2c flash-read --device GD32F303CC --output board-flash.bin --output-format json
+k2c flash-read --device GD32F303CC --output board-flash.hex --output-format json
 ```
+
+GUI 可在“Flash 读取格式”中选择 BIN 或 HEX，CLI 根据输出扩展名判断格式。BIN 是连续原始字节；HEX 是带绝对地址和校验和的 Intel HEX。两种格式读取范围相同，结果中的大小和 SHA-256 均以原始 Flash 字节为准。
 
 它读取设备目录或 Keil Target 中已验证的主用户 Flash 起始地址和完整容量，不包含 option bytes、OTP 或系统 ROM。为获得一致镜像，工具会记录当前状态并在必要时暂停内核，结束后仅恢复原本正在运行的目标，不执行复位。结果必须满足精确字节数，并报告 SHA-256；失败时可能保留部分文件作为证据，不应把部分文件当作完整备份。
 

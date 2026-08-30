@@ -121,6 +121,58 @@ def test_run_flash_read_requires_exact_size_and_reports_sha256(tmp_path):
     assert result.output == output
 
 
+def test_run_flash_read_converts_verified_raw_bytes_to_intel_hex(tmp_path):
+    output = tmp_path / "full.hex"
+    payload = bytes(range(32))
+
+    def runner(command, **kwargs):
+        match = re.search(r"dump_image (\S+) 0x0800FFF0 0x20", command[-1])
+        assert match is not None
+        raw_output = Path(match.group(1))
+        raw_output.parent.mkdir(parents=True, exist_ok=True)
+        raw_output.write_bytes(payload)
+        return FakeCompletedProcess(0, "dumped 32 bytes\n", "")
+
+    result = run_flash_read(
+        CONFIG,
+        FlashReadRequest(output=output, address=0x0800FFF0, size=len(payload)),
+        tmp_path / "logs",
+        runner=runner,
+    )
+
+    records = output.read_text(encoding="ascii").splitlines()
+    assert result.success is True
+    assert result.actual_size == len(payload)
+    assert result.sha256 == __import__("hashlib").sha256(payload).hexdigest()
+    assert records[0] == ":020000040800F2"
+    assert ":020000040801F1" in records
+    assert records[-1] == ":00000001FF"
+    assert all(sum(bytes.fromhex(record[1:])) & 0xFF == 0 for record in records)
+    upper = 0
+    reconstructed: dict[int, int] = {}
+    for record in records:
+        decoded = bytes.fromhex(record[1:])
+        count = decoded[0]
+        address = int.from_bytes(decoded[1:3], "big")
+        record_type = decoded[3]
+        data = decoded[4 : 4 + count]
+        if record_type == 0x04:
+            upper = int.from_bytes(data, "big") << 16
+        elif record_type == 0x00:
+            reconstructed.update(
+                (upper + address + offset, value) for offset, value in enumerate(data)
+            )
+    assert bytes(reconstructed[0x0800FFF0 + offset] for offset in range(32)) == payload
+    assert not (tmp_path / "logs" / "flash-read.raw.bin").exists()
+    assert "flash-read.raw.bin" in " ".join(result.command)
+    assert str(output.resolve()).replace("\\", "/") not in " ".join(result.command)
+
+
+def test_flash_read_request_rejects_output_other_than_bin_or_hex(tmp_path):
+    with pytest.raises(ValueError, match=r"\.bin or \.hex"):
+        FlashReadRequest(output=tmp_path / "flash.txt", address=0x08000000, size=16)
+
+
 def test_run_flash_read_rejects_partial_output_but_keeps_evidence(tmp_path):
     output = tmp_path / "partial.bin"
 

@@ -281,7 +281,7 @@ CMSIS-Pack 本身不提供 OpenOCD target cfg。KeilBridge 只为已明确维护
 - “烧录并校验”要求 OpenOCD 同时给出程序写入和校验成功证据；成功日志通常包含 `Programming Finished` 与 `Verified OK`。
 - 已选择的固件被外部编译器更新后，窗口回到前台时会显示旧/新文件大小、修改时间和 SHA-256，并询问是否 reload。选择“否”会把固件标记为过期并禁用烧录；重新选择文件或接受后才恢复。点击烧录时还会再校验一次，防止检查后文件再次变化。
 
-“检查连接”“读取完整 Flash”和“烧录并校验”是独立动作。“检查连接”不下载固件。“读取完整 Flash”读取已验证的主用户 Flash，不读取 option bytes、OTP 或系统 ROM；为保证镜像一致，它会记录目标运行状态，必要时暂停内核，读取后仅在目标原本运行时恢复运行，且不复位。“烧录并校验”会改写 Flash，且完成后会按 OpenOCD 烧录命令复位目标。
+“检查连接”“读取完整 Flash”和“烧录并校验”是独立动作。“检查连接”不下载固件。“读取完整 Flash”读取已验证的主用户 Flash，不读取 option bytes、OTP 或系统 ROM；可选择保存为连续原始字节的 BIN，或带绝对地址和记录校验和的 Intel HEX。为保证镜像一致，它会记录目标运行状态，必要时暂停内核，读取后仅在目标原本运行时恢复运行，且不复位。HEX 在完整 BIN 读取和大小校验成功后转换，SHA-256 始终按原始 Flash 字节计算。“烧录并校验”会改写 Flash，且完成后会按 OpenOCD 烧录命令复位目标。
 
 RTT 也是独立动作。点击“开始 RTT”后，工作台在 Keil Target 或所选目录芯片的可写 RAM 范围中寻找 `SEGGER RTT` 控制块并附着到 RTT TCP 通道；该流程不包含 reset、halt 或 resume，因此不会为了采集 RTT 主动改变 MCU 运行状态。自动扫描使用已验证的 RAM 范围；选择手动地址时只搜索该地址起始的 `0x100` 字节窗口。
 
@@ -322,13 +322,14 @@ k2c connect --project "C:\Path\App.uvprojx" --target Debug --output-format json
 k2c connect --device GD32F303CC --vendor GigaDevice --output-format json
 k2c flash --device GD32F303CC --firmware "C:\Path\app.hex" --output-format json
 k2c flash-read --device GD32F303CC --output "C:\Logs\GD32F303CC_flash.bin" --output-format json
+k2c flash-read --device GD32F303CC --output "C:\Logs\GD32F303CC_flash.hex" --output-format json
 k2c rtt --device GD32F303CC --format jsonl
 k2c rtt --device STM32G431CBUx --vendor Keil --channel 1 --port 19022 --format raw --output "C:\Logs\foc_sweep.bin" --duration 8
 k2c rtt --device GD32F303CC --format raw --output "C:\Logs\scope.bin" --vofa-listen 127.0.0.1:1347 --vofa-executable "C:\Tools\VOFA+\vofa+.exe"
 k2c rtt --device GD32F303CC --format raw --vofa-listen 127.0.0.1:1347 --text-channel 0 --text-port 19021 --channel 2 --port 19023 --up-name Plot --down-channel 3 --down-port 19024 --down-name Commands --expected-floats 8
 ```
 
-`connect`、`flash` 和 `flash-read` 的 JSON schema 为 `keiltool.hardware.v1`，包含成功状态、设备、来源、target cfg、OpenOCD 返回码、证据日志和产物信息。`flash-read` 只有在输出文件字节数与主 Flash 容量完全一致时才成功，并返回 SHA-256；失败时保留已有的部分文件作为诊断证据。
+`connect`、`flash` 和 `flash-read` 的 JSON schema 为 `keiltool.hardware.v1`，包含成功状态、设备、来源、target cfg、OpenOCD 返回码、证据日志和产物信息。`flash-read` 根据 `--output` 的 `.bin` / `.hex` 扩展名选择格式；只有原始读取字节数与主 Flash 容量完全一致，且所选格式生成成功时才返回成功和原始字节 SHA-256。失败时保留已有的原始部分文件作为诊断证据。
 
 RTT 默认持续采集到 `Ctrl+C`、RTT EOF 或错误，也可用 `--duration <秒>` 限时。`--format text` 输出解析后的日志，`jsonl` 输出 schema 为 `keiltool.rtt.v1` 的逐条记录；`raw` 不做 UTF-8 解码、换行或终端帧处理，原样处理 RTT TCP 字节。raw 未指定 `--output` 时仍写 stdout；指定 `--output PATH` 时使用至少 1 MiB 的主机文件缓冲直接写入该二进制文件，并抑制 raw stdout。输出文件在每次启动时截断，退出时 flush/close。OpenOCD 状态、累计接收字节数、最终文件字节数、异常和断连信息写 stderr。`Ctrl+C` 会清理 RTT/OpenOCD 后返回退出码 `130`。
 

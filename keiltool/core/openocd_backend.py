@@ -74,6 +74,8 @@ class FlashReadRequest:
         parse_address(self.address)
         if self.size <= 0 or self.address + self.size > 0x1_0000_0000:
             raise ValueError("Flash read size must define a positive 32-bit range.")
+        if self.output.suffix.lower() not in {".bin", ".hex"}:
+            raise ValueError("Flash read output must be a .bin or .hex file.")
 
 
 @dataclass(frozen=True, slots=True)
@@ -381,6 +383,8 @@ def build_flash_command(config: OpenOcdConfig, request: FlashRequest) -> list[st
 
 
 def build_flash_read_command(config: OpenOcdConfig, request: FlashReadRequest) -> list[str]:
+    if request.output.suffix.lower() != ".bin":
+        raise ValueError("OpenOCD dump_image output must use a temporary .bin file.")
     output = quote_tcl_word(request.output.resolve().as_posix())
     script = (
         "set _kt_target [target current]; "
@@ -540,12 +544,20 @@ def run_flash_read(
 ) -> FlashReadResult:
     output = request.output.expanduser().resolve()
     output.parent.mkdir(parents=True, exist_ok=True)
-    try:
-        output.unlink(missing_ok=True)
-    except OSError as exc:
-        raise ValueError(f"Unable to replace Flash read output: {output}: {exc}") from exc
+    output_format = output.suffix.lower()
+    raw_output = (
+        output
+        if output_format == ".bin"
+        else Path(log_dir).expanduser().resolve() / "flash-read.raw.bin"
+    )
+    raw_output.parent.mkdir(parents=True, exist_ok=True)
+    for candidate in dict.fromkeys((output, raw_output)):
+        try:
+            candidate.unlink(missing_ok=True)
+        except OSError as exc:
+            raise ValueError(f"Unable to replace Flash read output: {candidate}: {exc}") from exc
 
-    normalized_request = FlashReadRequest(output, request.address, request.size)
+    normalized_request = FlashReadRequest(raw_output, request.address, request.size)
     command = build_flash_read_command(config, normalized_request)
     completed, stdout_log, stderr_log = _run_with_logs(
         command,
@@ -559,13 +571,21 @@ def run_flash_read(
         stderr_log_path,
     )
     findings = _classify(completed.stdout, completed.stderr, config.executable, target)
-    actual_size = output.stat().st_size if output.is_file() else 0
-    digest = _sha256_file(output) if output.is_file() else ""
-    success = (
+    actual_size = raw_output.stat().st_size if raw_output.is_file() else 0
+    digest = _sha256_file(raw_output) if raw_output.is_file() else ""
+    read_succeeded = (
         completed.outcome == "completed"
         and completed.returncode == 0
         and actual_size == request.size
     )
+    conversion_error = ""
+    if read_succeeded and output_format == ".hex":
+        try:
+            _write_intel_hex(raw_output, output, request.address)
+            raw_output.unlink()
+        except (OSError, ValueError) as exc:
+            conversion_error = str(exc)
+    success = read_succeeded and not conversion_error
     if completed.outcome != "completed":
         findings.append(_operation_finding(completed.outcome, "flash_read"))
     elif completed.returncode == 0 and actual_size != request.size:
@@ -577,8 +597,18 @@ def run_flash_read(
                 title="Flash readback size does not match the requested range",
                 message=(
                     f"Requested {request.size} bytes from 0x{request.address:08X}, "
-                    f"but the output contains {actual_size} bytes: {output}"
+                    f"but the raw output contains {actual_size} bytes: {raw_output}"
                 ),
+            )
+        )
+    if conversion_error:
+        findings.append(
+            DoctorFinding(
+                stage="flash",
+                severity="fail",
+                code="INTEL_HEX_CONVERSION_FAILED",
+                title="Flash readback could not be converted to Intel HEX",
+                message=f"{conversion_error}; verified raw evidence: {raw_output}",
             )
         )
     return FlashReadResult(
@@ -597,6 +627,44 @@ def run_flash_read(
         sha256=digest,
         outcome="succeeded" if success else completed.outcome if completed.outcome != "completed" else "failed",
     )
+
+
+def _write_intel_hex(binary: Path, output: Path, base_address: int) -> None:
+    temporary = output.with_name(f".{output.name}.tmp")
+    current_upper: int | None = None
+    absolute = base_address
+    try:
+        with binary.open("rb") as source, temporary.open(
+            "w", encoding="ascii", newline="\n"
+        ) as destination:
+            while True:
+                low = absolute & 0xFFFF
+                chunk = source.read(min(16, 0x10000 - low))
+                if not chunk:
+                    break
+                upper = absolute >> 16
+                if upper != current_upper:
+                    destination.write(_intel_hex_record(0, 0x04, upper.to_bytes(2, "big")) + "\n")
+                    current_upper = upper
+                destination.write(_intel_hex_record(low, 0x00, chunk) + "\n")
+                absolute += len(chunk)
+            destination.write(_intel_hex_record(0, 0x01, b"") + "\n")
+        temporary.replace(output)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _intel_hex_record(address: int, record_type: int, data: bytes) -> str:
+    body = bytes(
+        (
+            len(data),
+            (address >> 8) & 0xFF,
+            address & 0xFF,
+            record_type,
+        )
+    ) + data
+    checksum = (-sum(body)) & 0xFF
+    return ":" + (body + bytes((checksum,))).hex().upper()
 
 
 def _run_with_logs(

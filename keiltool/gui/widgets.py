@@ -50,6 +50,7 @@ class WorkbenchVariables(Protocol):
     resolution_var: tk.StringVar
     firmware_var: tk.StringVar
     bin_address_var: tk.StringVar
+    flash_read_format_var: tk.StringVar
     rtt_manual_var: tk.BooleanVar
     rtt_address_var: tk.StringVar
     rtt_channel_var: tk.StringVar
@@ -451,8 +452,26 @@ class ConfigurationPane(ttk.Frame):
         self.bin_address_entry = ttk.Entry(section, textvariable=variables.bin_address_var, width=34)
         self.bin_address_entry.grid(row=10, column=1, columnspan=2, sticky="ew", pady=3)
 
+        ttk.Label(section, text="Flash 读取格式").grid(row=11, column=0, sticky="w", pady=3)
+        read_formats = ttk.Frame(section)
+        read_formats.grid(row=11, column=1, columnspan=2, sticky="w", pady=3)
+        self.flash_read_bin_radio = ttk.Radiobutton(
+            read_formats,
+            text="BIN",
+            variable=variables.flash_read_format_var,
+            value="bin",
+        )
+        self.flash_read_bin_radio.grid(row=0, column=0, sticky="w")
+        self.flash_read_hex_radio = ttk.Radiobutton(
+            read_formats,
+            text="HEX",
+            variable=variables.flash_read_format_var,
+            value="hex",
+        )
+        self.flash_read_hex_radio.grid(row=0, column=1, sticky="w", padx=(12, 0))
+
         actions = ttk.Frame(section)
-        actions.grid(row=11, column=0, columnspan=3, sticky="ew", pady=(7, 0))
+        actions.grid(row=12, column=0, columnspan=3, sticky="ew", pady=(7, 0))
         actions.columnconfigure((0, 1, 2), weight=1)
         self.connect_button = ttk.Button(actions, text="检查连接")
         self.connect_button.grid(row=0, column=0, sticky="ew", padx=(0, 3))
@@ -473,6 +492,8 @@ class ConfigurationPane(ttk.Frame):
         self.editable_widgets.append((self.device_combo, "normal"))
         self.editable_widgets.append((self.device_import_button, "normal"))
         self.editable_widgets.append((self.bin_address_entry, "normal"))
+        self.editable_widgets.append((self.flash_read_bin_radio, "normal"))
+        self.editable_widgets.append((self.flash_read_hex_radio, "normal"))
 
     def _build_rtt_section(self, variables: WorkbenchVariables) -> None:
         section = ttk.LabelFrame(self, text="RTT 采集", padding=6)

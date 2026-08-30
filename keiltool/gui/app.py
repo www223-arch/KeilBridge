@@ -257,6 +257,7 @@ class KeilToolGui:
             else self._device_firmware
         )
         self.bin_address_var = tk.StringVar(value=settings.bin_address)
+        self.flash_read_format_var = tk.StringVar(value=settings.flash_read_format)
         self.rtt_manual_var = tk.BooleanVar(value=bool(settings.rtt_address))
         self.rtt_address_var = tk.StringVar(value=settings.rtt_address)
         self.rtt_channel_var = tk.StringVar(value=str(settings.rtt_channel))
@@ -956,16 +957,25 @@ class KeilToolGui:
                 )
             log_dir = self._log_dir()
             log_dir.mkdir(parents=True, exist_ok=True)
+            output_format = self.flash_read_format_var.get().strip().lower()
+            if output_format not in {"bin", "hex"}:
+                raise ValueError("Flash 读取格式必须是 BIN 或 HEX。")
+            extension = f".{output_format}"
+            filetypes = (
+                [("HEX 镜像", "*.hex"), ("BIN 镜像", "*.bin"), ("所有文件", "*.*")]
+                if output_format == "hex"
+                else [("BIN 镜像", "*.bin"), ("HEX 镜像", "*.hex"), ("所有文件", "*.*")]
+            )
             output = filedialog.asksaveasfilename(
                 parent=self.root,
                 title="保存完整 Flash 镜像",
                 initialdir=str(log_dir),
                 initialfile=(
                     f"{safe_filename(facts.device)}_flash_"
-                    f"0x{facts.flash_origin:08X}_{facts.flash_size}.bin"
+                    f"0x{facts.flash_origin:08X}_{facts.flash_size}{extension}"
                 ),
-                defaultextension=".bin",
-                filetypes=[("BIN 镜像", "*.bin"), ("所有文件", "*.*")],
+                defaultextension=extension,
+                filetypes=filetypes,
             )
             if not output:
                 self.operation_feedback.reset()
@@ -984,6 +994,7 @@ class KeilToolGui:
                     "output": str(request.output.expanduser().resolve()),
                     "address": f"0x{request.address:08X}",
                     "size": request.size,
+                    "format": output_format,
                 },
             )
             operation = OpenOcdOperation(timeout=300.0, background=True)
@@ -1717,6 +1728,7 @@ class KeilToolGui:
         self._render_openocd_result("读取完整 Flash", value)
         self._append_openocd(
             "----- Flash 镜像 -----\n"
+            f"格式: {value.output.suffix.lower().lstrip('.').upper()}\n"
             f"起始地址: 0x{value.address:08X}\n"
             f"请求大小: {value.requested_size:,} 字节\n"
             f"实际大小: {value.actual_size:,} 字节\n"
@@ -2336,6 +2348,7 @@ class KeilToolGui:
             target=self._project_target,
             firmware=self.firmware_var.get().strip(),
             bin_address=self.bin_address_var.get().strip(),
+            flash_read_format=self.flash_read_format_var.get().strip().lower(),
             openocd_path=self.openocd_var.get().strip(),
             scripts_dir=self.scripts_var.get().strip(),
             target_override=self.target_override_var.get().strip(),

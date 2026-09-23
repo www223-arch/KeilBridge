@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import sys
 from pathlib import Path
 
 
@@ -121,7 +122,13 @@ def find_openocd(explicit: str | None = None) -> str:
     MVP 先查显式参数、PATH 和常见独立安装路径。
     """
 
-    return _find_executable(explicit, "openocd", OPENOCD_CANDIDATES)
+    if explicit:
+        return explicit
+    for portable_root in _portable_runtime_roots():
+        bundled = portable_root / "openocd" / "bin" / "openocd.exe"
+        if bundled.is_file():
+            return str(bundled)
+    return _find_executable(None, "openocd", OPENOCD_CANDIDATES)
 
 
 def find_openocd_scripts(openocd_path: str) -> str:
@@ -155,6 +162,22 @@ def _find_executable(explicit: str | None, name: str, candidates: list[Path]) ->
         if candidate.exists():
             return str(candidate)
     return name
+
+
+def _portable_runtime_roots() -> tuple[Path, ...]:
+    override = os.environ.get("KEILTOOL_PORTABLE_ROOT")
+    if override:
+        return (Path(override).expanduser().resolve(),)
+    if getattr(sys, "frozen", False):
+        roots: list[Path] = []
+        extraction_root = getattr(sys, "_MEIPASS", "")
+        if extraction_root:
+            roots.append(Path(extraction_root).resolve())
+        executable_root = Path(sys.executable).resolve().parent
+        if executable_root not in roots:
+            roots.append(executable_root)
+        return tuple(roots)
+    return ()
 
 
 def _normalize_tool_root(explicit_root: str | None) -> Path | None:

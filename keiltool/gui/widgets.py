@@ -51,6 +51,8 @@ class WorkbenchVariables(Protocol):
     firmware_var: tk.StringVar
     bin_address_var: tk.StringVar
     flash_read_format_var: tk.StringVar
+    probe_choice_var: tk.StringVar
+    probe_status_var: tk.StringVar
     rtt_manual_var: tk.BooleanVar
     rtt_address_var: tk.StringVar
     rtt_channel_var: tk.StringVar
@@ -70,6 +72,7 @@ class WorkbenchVariables(Protocol):
     vofa_down_name_var: tk.StringVar
     vofa_expected_float_count_var: tk.StringVar
     vofa_connection_hint_var: tk.StringVar
+    collector_device_status_var: tk.StringVar
 
 
 class OperationStatusPane(ttk.Frame):
@@ -382,15 +385,35 @@ class ConfigurationPane(ttk.Frame):
     def __init__(self, parent: ttk.Frame, variables: WorkbenchVariables) -> None:
         super().__init__(parent)
         self.columnconfigure(0, weight=1)
+        self.rowconfigure(0, weight=1)
         self.editable_widgets: list[tuple[tk.Widget, str]] = []
-        self._build_project_section(variables)
-        self._build_rtt_section(variables)
-        self._build_advanced_section(variables)
+        background = ttk.Style(self).lookup("Background.TFrame", "background")
+        self.canvas = tk.Canvas(
+            self,
+            background=background,
+            borderwidth=0,
+            highlightthickness=0,
+            width=420,
+        )
+        self.scrollbar = ttk.Scrollbar(self, orient="vertical", command=self.canvas.yview)
+        self.canvas.configure(yscrollcommand=self.scrollbar.set)
+        self.canvas.grid(row=0, column=0, sticky="nsew")
+        self.scrollbar.grid(row=0, column=1, sticky="ns")
+        self.content = ttk.Frame(self.canvas, style="Background.TFrame")
+        self.content.columnconfigure(0, weight=1)
+        self._content_window = self.canvas.create_window((0, 0), window=self.content, anchor="nw")
+        self.content.bind("<Configure>", self._sync_scroll_region)
+        self.canvas.bind("<Configure>", self._sync_content_width)
+        self.canvas.bind("<MouseWheel>", self._on_mousewheel)
+        self._build_project_section(self.content, variables)
+        self._build_rtt_section(self.content, variables)
+        self._build_advanced_section(self.content, variables)
 
-    def _build_project_section(self, variables: WorkbenchVariables) -> None:
-        section = ttk.LabelFrame(self, text="工程与烧录", padding=6)
+    def _build_project_section(self, parent: ttk.Frame, variables: WorkbenchVariables) -> None:
+        section = ttk.LabelFrame(parent, text="工程与烧录", padding=6)
         section.grid(row=0, column=0, sticky="ew")
         section.columnconfigure(1, weight=1)
+        self.project_section = section
 
         self.project_entry, self.project_button = path_row(
             section,
@@ -407,9 +430,36 @@ class ConfigurationPane(ttk.Frame):
         )
         self.target_combo.grid(row=1, column=1, columnspan=2, sticky="ew", pady=3)
 
-        ttk.Label(section, text="配置来源").grid(row=2, column=0, sticky="w", pady=3)
+        ttk.Label(section, text="使用的 ST-Link").grid(row=2, column=0, sticky="w", pady=3)
+        probe_row = ttk.Frame(section)
+        probe_row.grid(row=2, column=1, columnspan=2, sticky="ew", pady=3)
+        probe_row.columnconfigure(0, weight=1)
+        self.probe_combo = ttk.Combobox(
+            probe_row,
+            textvariable=variables.probe_choice_var,
+            state="readonly",
+            width=22,
+        )
+        self.probe_combo.grid(row=0, column=0, sticky="ew")
+        self.probe_refresh_button = ttk.Button(probe_row, text="刷新", width=5)
+        self.probe_refresh_button.grid(row=0, column=1, padx=(5, 0))
+        self.probe_rename_button = ttk.Button(probe_row, text="命名", width=5)
+        self.probe_rename_button.grid(row=0, column=2, padx=(5, 0))
+        self.probe_driver_button = ttk.Button(probe_row, text="安装驱动", width=8)
+        self.collector_device_status = ttk.Label(
+            section,
+            textvariable=variables.collector_device_status_var,
+            style="Accent.TLabel",
+        )
+        ttk.Label(
+            probe_row,
+            textvariable=variables.probe_status_var,
+            style="Muted.TLabel",
+        ).grid(row=1, column=0, columnspan=3, sticky="w", pady=(2, 0))
+
+        ttk.Label(section, text="配置来源").grid(row=3, column=0, sticky="w", pady=3)
         source_modes = ttk.Frame(section)
-        source_modes.grid(row=2, column=1, columnspan=2, sticky="w", pady=3)
+        source_modes.grid(row=3, column=1, columnspan=2, sticky="w", pady=3)
         self.project_source_radio = ttk.Radiobutton(
             source_modes,
             text="Keil 工程",
@@ -426,35 +476,35 @@ class ConfigurationPane(ttk.Frame):
         self.device_source_radio.grid(row=0, column=1, sticky="w", padx=(12, 0))
 
         self.device_label = ttk.Label(section, text="Device")
-        self.device_label.grid(row=3, column=0, sticky="w", pady=3)
+        self.device_label.grid(row=4, column=0, sticky="w", pady=3)
         self.device_combo = ttk.Combobox(
             section,
             textvariable=variables.device_choice_var,
             state="normal",
             width=34,
         )
-        self.device_combo.grid(row=3, column=1, sticky="ew", pady=3)
+        self.device_combo.grid(row=4, column=1, sticky="ew", pady=3)
         self.device_import_button = ttk.Button(section, text="导入", width=6)
-        self.device_import_button.grid(row=3, column=2, sticky="e", padx=(6, 0), pady=3)
-        readonly_row(section, 4, "来源", variables.device_source_var)
-        readonly_row(section, 5, "Flash", variables.flash_summary_var)
-        readonly_row(section, 6, "RAM", variables.ram_summary_var)
-        readonly_row(section, 7, "Target cfg", variables.target_cfg_var)
-        readonly_row(section, 8, "解析", variables.resolution_var)
+        self.device_import_button.grid(row=4, column=2, sticky="e", padx=(6, 0), pady=3)
+        readonly_row(section, 5, "来源", variables.device_source_var)
+        readonly_row(section, 6, "Flash", variables.flash_summary_var)
+        readonly_row(section, 7, "RAM", variables.ram_summary_var)
+        readonly_row(section, 8, "Target cfg", variables.target_cfg_var)
+        readonly_row(section, 9, "解析", variables.resolution_var)
 
         self.firmware_entry, self.firmware_button = path_row(
             section,
-            9,
+            10,
             "固件",
             variables.firmware_var,
         )
-        ttk.Label(section, text="BIN 地址").grid(row=10, column=0, sticky="w", pady=3)
+        ttk.Label(section, text="BIN 地址").grid(row=11, column=0, sticky="w", pady=3)
         self.bin_address_entry = ttk.Entry(section, textvariable=variables.bin_address_var, width=34)
-        self.bin_address_entry.grid(row=10, column=1, columnspan=2, sticky="ew", pady=3)
+        self.bin_address_entry.grid(row=11, column=1, columnspan=2, sticky="ew", pady=3)
 
-        ttk.Label(section, text="Flash 读取格式").grid(row=11, column=0, sticky="w", pady=3)
+        ttk.Label(section, text="Flash 读取格式").grid(row=12, column=0, sticky="w", pady=3)
         read_formats = ttk.Frame(section)
-        read_formats.grid(row=11, column=1, columnspan=2, sticky="w", pady=3)
+        read_formats.grid(row=12, column=1, columnspan=2, sticky="w", pady=3)
         self.flash_read_bin_radio = ttk.Radiobutton(
             read_formats,
             text="BIN",
@@ -471,7 +521,7 @@ class ConfigurationPane(ttk.Frame):
         self.flash_read_hex_radio.grid(row=0, column=1, sticky="w", padx=(12, 0))
 
         actions = ttk.Frame(section)
-        actions.grid(row=12, column=0, columnspan=3, sticky="ew", pady=(7, 0))
+        actions.grid(row=13, column=0, columnspan=3, sticky="ew", pady=(7, 0))
         actions.columnconfigure((0, 1, 2), weight=1)
         self.connect_button = ttk.Button(actions, text="检查连接")
         self.connect_button.grid(row=0, column=0, sticky="ew", padx=(0, 3))
@@ -494,11 +544,15 @@ class ConfigurationPane(ttk.Frame):
         self.editable_widgets.append((self.bin_address_entry, "normal"))
         self.editable_widgets.append((self.flash_read_bin_radio, "normal"))
         self.editable_widgets.append((self.flash_read_hex_radio, "normal"))
+        self.editable_widgets.append((self.probe_combo, "readonly"))
+        self.editable_widgets.append((self.probe_refresh_button, "normal"))
+        self.editable_widgets.append((self.probe_rename_button, "normal"))
 
-    def _build_rtt_section(self, variables: WorkbenchVariables) -> None:
-        section = ttk.LabelFrame(self, text="RTT 采集", padding=6)
+    def _build_rtt_section(self, parent: ttk.Frame, variables: WorkbenchVariables) -> None:
+        section = ttk.LabelFrame(parent, text="RTT 采集", padding=6)
         section.grid(row=1, column=0, sticky="ew", pady=(4, 0))
         section.columnconfigure(1, weight=1)
+        self.rtt_section = section
 
         ttk.Label(section, text="扫描").grid(row=0, column=0, sticky="w", pady=3)
         modes = ttk.Frame(section)
@@ -542,6 +596,7 @@ class ConfigurationPane(ttk.Frame):
         actions = ttk.Frame(section)
         actions.grid(row=4, column=0, columnspan=3, sticky="ew", pady=(7, 0))
         actions.columnconfigure((0, 1, 2), weight=1)
+        self.rtt_actions = actions
         self.rtt_start_button = ttk.Button(actions, text="开始采集", style="Primary.TButton")
         self.rtt_start_button.grid(row=0, column=0, sticky="ew", padx=(0, 3))
         self.vofa_start_button = ttk.Button(actions, text="VOFA+ 曲线")
@@ -574,9 +629,9 @@ class ConfigurationPane(ttk.Frame):
             self.logs_button,
         )
 
-    def _build_advanced_section(self, variables: WorkbenchVariables) -> None:
+    def _build_advanced_section(self, parent: ttk.Frame, variables: WorkbenchVariables) -> None:
         self.advanced_button = ttk.Button(
-            self,
+            parent,
             text="高级设置...",
         )
         self.advanced_button.grid(row=2, column=0, sticky="ew", pady=(4, 0))
@@ -627,6 +682,56 @@ class ConfigurationPane(ttk.Frame):
             self.vofa_guide_button,
         )
         self.editable_widgets.append((self.advanced_button, "normal"))
+
+    def enable_rtt_collector_layout(self) -> None:
+        self.project_section.configure(text="采集设备")
+        for row in (0, 1, 3, 5, 6, 7, 8, 9, 10, 11, 12, 13):
+            for widget in self.project_section.grid_slaves(row=row):
+                widget.grid_remove()
+
+        for widget in self.project_section.grid_slaves(row=4):
+            widget.grid_configure(row=0)
+        self.device_import_button.grid_remove()
+        self.device_combo.grid_configure(columnspan=2)
+        for widget in self.project_section.grid_slaves(row=2):
+            widget.grid_configure(row=1)
+        self.collector_device_status.grid(row=2, column=0, columnspan=3, sticky="w", pady=(5, 0))
+        self.probe_rename_button.grid_remove()
+        self.probe_driver_button.grid(row=0, column=2, padx=(5, 0))
+
+        for row in (0, 1, 2, 5):
+            for widget in self.rtt_section.grid_slaves(row=row):
+                widget.grid_remove()
+        self.vofa_start_button.grid_remove()
+        self.rtt_start_button.grid_configure(row=0, column=0, padx=(0, 3))
+        self.rtt_stop_button.grid_configure(row=0, column=1, padx=(3, 0))
+        self.rtt_actions.columnconfigure(2, weight=0)
+        self.advanced_button.grid_remove()
+
+    def ensure_visible(self, widget: tk.Widget) -> None:
+        self.update_idletasks()
+        region = self.canvas.bbox("all")
+        if region is None or region[3] <= region[1]:
+            return
+        top = widget.winfo_rooty() - self.content.winfo_rooty()
+        bottom = top + widget.winfo_height()
+        visible_top = self.canvas.canvasy(0)
+        visible_height = self.canvas.winfo_height()
+        total_height = region[3] - region[1]
+        if top < visible_top:
+            self.canvas.yview_moveto(max(0.0, top / total_height))
+        elif bottom > visible_top + visible_height:
+            self.canvas.yview_moveto(min(1.0, (bottom - visible_height) / total_height))
+
+    def _sync_scroll_region(self, _event: tk.Event | None = None) -> None:
+        self.canvas.configure(scrollregion=self.canvas.bbox("all"))
+
+    def _sync_content_width(self, event: tk.Event) -> None:
+        self.canvas.itemconfigure(self._content_window, width=event.width)
+
+    def _on_mousewheel(self, event: tk.Event) -> str:
+        self.canvas.yview_scroll(-1 if event.delta > 0 else 1, "units")
+        return "break"
 
     def _remember_editable(self, *widgets: tk.Widget) -> None:
         self.editable_widgets.extend((widget, "normal") for widget in widgets)

@@ -10,8 +10,9 @@ import threading
 import time
 import traceback
 import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, messagebox, simpledialog, ttk
 from typing import Callable, cast
+import webbrowser
 
 from keiltool.core.device_catalog import CatalogDevice, DeviceCatalog, load_embedded_catalog
 from keiltool.core.device_import import import_device_file, load_user_catalog
@@ -26,7 +27,7 @@ from keiltool.core.openocd_backend import (
     run_flash,
     run_flash_read,
 )
-from keiltool.core.rtt import RttEvent, RttSession
+from keiltool.core.rtt import AutoRecoveringRttSession, RttEvent
 from keiltool.core.rtt_vofa import (
     VofaRttConfig,
     render_vofa_session_guide,
@@ -35,6 +36,12 @@ from keiltool.core.rtt_vofa import (
 from keiltool.core.rtt_log import RttLevel, RttLogRecord
 from keiltool.core.process_launch import background_process_kwargs
 from keiltool.core.session_logs import SessionLogContext, create_session_logs
+from keiltool.core.stlink_probe import (
+    StLinkDiscovery,
+    StLinkProbe,
+    discover_stlink_probes,
+)
+from keiltool.core.tool_finder import find_openocd, find_openocd_scripts
 from keiltool.core.vofa_bridge import (
     VofaTcpBridge,
     discover_vofa_executable,
@@ -55,12 +62,14 @@ from keiltool.gui.operation_feedback import (
     OperationVisualState,
     ProgressMode,
 )
+from keiltool.gui.probe_preferences import ProbePreferenceStore
 from keiltool.gui.rtt_display import RttDisplayBuffer, build_rtt_view, parse_rtt_level
 from keiltool.gui.settings import (
     GuiSettings,
     SettingsDiagnostic,
     SettingsStore,
     default_devices_path,
+    default_settings_path,
 )
 from keiltool.gui.state import BusySessionError, SessionState, TaskGate
 from keiltool.gui.theme import configure_theme
@@ -93,6 +102,10 @@ from keiltool.gui.workbench_model import (
 )
 
 
+# Kept as a module-level construction seam for GUI tests and embedders.
+RttSession = AutoRecoveringRttSession
+
+
 _BUSY_STATES = frozenset(
     {
         SessionState.CONNECT,
@@ -106,6 +119,8 @@ _BUSY_STATES = frozenset(
 
 _PROJECT_SOURCE = "project"
 _DEVICE_SOURCE = "device"
+_AUTO_PROBE_LABEL = "自动选择（只连接一支时推荐）"
+_COLLECTOR_RTT_TIMEOUT_MS = 30_000
 
 _STATE_TEXT = {
     SessionState.IDLE: "空闲",
@@ -128,9 +143,26 @@ class _UiEvent:
 class KeilToolGui:
     """Tkinter workbench for independent ST-Link flash and RTT operations."""
 
-    def __init__(self, root: tk.Tk, *, settings_store: SettingsStore | None = None) -> None:
+    def __init__(
+        self,
+        root: tk.Tk,
+        *,
+        settings_store: SettingsStore | None = None,
+        probe_preferences: ProbePreferenceStore | None = None,
+        probe_discovery: Callable[[str | Path], StLinkDiscovery] | None = None,
+        mode: str = "workbench",
+    ) -> None:
+        if mode not in {"workbench", "rtt_collector"}:
+            raise ValueError(f"Unsupported GUI mode: {mode}")
         self.root = root
+        self.mode = mode
         self.settings_store = settings_store or SettingsStore()
+        self.probe_preferences = probe_preferences or ProbePreferenceStore()
+        self._probe_discovery = probe_discovery or discover_stlink_probes
+        self._stlink_probes: tuple[StLinkProbe, ...] = ()
+        self._probe_by_label: dict[str, StLinkProbe | None] = {}
+        self._probe_label_by_identity: dict[str, str] = {}
+        self._selected_probe_identity = ""
         self.gate = TaskGate()
         self._freshness = FreshnessController()
         self.operation_feedback = OperationFeedback()
@@ -145,7 +177,7 @@ class KeilToolGui:
         self._event_poller = BoundedEventPoller()
         self._events: queue.Queue[_UiEvent] = queue.Queue()
         self._facts: ProjectTargetFacts | None = None
-        self._rtt_session: RttSession | None = None
+        self._rtt_session: AutoRecoveringRttSession | None = None
         self._rtt_log_paths: RttLogPaths | None = None
         self._rtt_log_context: SessionLogContext | None = None
         self._rtt_started_at: float | None = None
@@ -173,6 +205,20 @@ class KeilToolGui:
         self._device_by_label: dict[str, CatalogDevice] = {}
         self._reload_device_catalog()
         self._create_variables(settings)
+        if self.mode == "rtt_collector":
+            bundled_openocd = find_openocd()
+            bundled_scripts = find_openocd_scripts(bundled_openocd)
+            self.openocd_var.set(bundled_openocd)
+            self.scripts_var.set(bundled_scripts)
+            self.device_source_mode_var.set(_DEVICE_SOURCE)
+            self.project_var.set("")
+            self.target_var.set("")
+            self.firmware_var.set("")
+            self.rtt_manual_var.set(False)
+            self.rtt_channel_var.set("0")
+            self.rtt_timeout_var.set(
+                str(max(int_or_default(self.rtt_timeout_var.get(), 0), _COLLECTOR_RTT_TIMEOUT_MS))
+            )
         self._configure_window()
         self._build_layout()
         if settings_result.diagnostic is not None:
@@ -186,6 +232,7 @@ class KeilToolGui:
         self.root.bind("<FocusOut>", self._on_window_focus_out, add="+")
         self.root.bind("<FocusIn>", self._on_window_focus_in, add="+")
         self.root.after(50, self._poll_events)
+        self.root.after_idle(self._refresh_stlink_probes)
         self.root.after_idle(self._initialize_firmware_baseline)
         if settings.project and self.device_source_mode_var.get() == _PROJECT_SOURCE:
             self.root.after_idle(lambda: self._load_project(Path(settings.project), restored=True))
@@ -258,6 +305,9 @@ class KeilToolGui:
         )
         self.bin_address_var = tk.StringVar(value=settings.bin_address)
         self.flash_read_format_var = tk.StringVar(value=settings.flash_read_format)
+        self.probe_choice_var = tk.StringVar(value=_AUTO_PROBE_LABEL)
+        self.probe_status_var = tk.StringVar(value="正在查找 ST-Link…")
+        self.collector_device_status_var = tk.StringVar(value="请选择芯片型号")
         self.rtt_manual_var = tk.BooleanVar(value=bool(settings.rtt_address))
         self.rtt_address_var = tk.StringVar(value=settings.rtt_address)
         self.rtt_channel_var = tk.StringVar(value=str(settings.rtt_channel))
@@ -287,10 +337,14 @@ class KeilToolGui:
         self.rtt_visible_counts_var = tk.StringVar(value="0 可见 / 0 缓存")
 
     def _configure_window(self) -> None:
-        self.root.title("KeilTool ST-Link 工作台")
-        self.root.geometry("1280x800")
-        self.root.minsize(1024, 720)
-        self.root.columnconfigure(0, minsize=420, weight=0)
+        collector = self.mode == "rtt_collector"
+        self.root.title("KeilTool RTT 日志采集器" if collector else "KeilTool ST-Link 工作台")
+        self.root.geometry("1080x720" if collector else "1280x800")
+        if collector:
+            self.root.minsize(860, 600)
+        else:
+            self.root.minsize(1024, 720)
+        self.root.columnconfigure(0, minsize=360 if collector else 420, weight=0)
         self.root.columnconfigure(1, weight=1)
         self.root.rowconfigure(0, weight=1)
         configure_theme(self.root)
@@ -309,6 +363,8 @@ class KeilToolGui:
         self.controls = ConfigurationPane(left, self)
         self.controls.grid(row=0, column=0, sticky="nsew")
         self.controls.device_combo.configure(values=tuple(self._device_by_label))
+        if self.mode == "rtt_collector":
+            self.controls.enable_rtt_collector_layout()
 
         self.operation_status = OperationStatusPane(right)
         self.operation_status.grid(row=0, column=0, sticky="ew", pady=(0, 6))
@@ -358,6 +414,9 @@ class KeilToolGui:
         controls.vofa_button.configure(command=self._choose_vofa)
         controls.vofa_guide_button.configure(command=self._open_vofa_guide)
         controls.copy_vofa_connection_button.configure(command=self._copy_vofa_connection)
+        controls.probe_refresh_button.configure(command=self._refresh_stlink_probes)
+        controls.probe_rename_button.configure(command=self._rename_stlink_probe)
+        controls.probe_driver_button.configure(command=self._open_stlink_driver_page)
         controls.auto_radio.configure(command=self._refresh_controls)
         controls.manual_radio.configure(command=self._refresh_controls)
         controls.project_source_radio.configure(command=self._change_device_source)
@@ -366,6 +425,7 @@ class KeilToolGui:
         controls.device_combo.bind("<<ComboboxSelected>>", lambda _event: self._select_catalog_device())
         controls.device_combo.bind("<KeyRelease>", self._filter_device_choices)
         controls.device_combo.bind("<Return>", lambda _event: self._select_catalog_device())
+        controls.probe_combo.bind("<<ComboboxSelected>>", lambda _event: self._select_stlink_probe())
         self.firmware_var.trace_add("write", lambda *_args: self._refresh_controls())
         self.vofa_listen_var.trace_add("write", lambda *_args: self._update_vofa_connection_hint())
         self.vofa_up_channel_var.trace_add(
@@ -390,6 +450,159 @@ class KeilToolGui:
         for entry in (controls.openocd_entry, controls.scripts_entry, controls.override_entry):
             entry.bind("<FocusOut>", lambda _event: self._resolve_selected_target())
             entry.bind("<Return>", lambda _event: self._resolve_selected_target())
+
+    def _probe_context_key(self) -> str:
+        if self.device_source_mode_var.get() == _PROJECT_SOURCE:
+            project = self.project_var.get().strip()
+            target = self.target_var.get().strip()
+            if not project or not target:
+                return ""
+            normalized = Path(project).expanduser().resolve().as_posix().lower()
+            return f"project:{normalized}::{target}"
+        selected = self._selected_catalog_device()
+        if selected is None:
+            return ""
+        return f"device:{selected.vendor.lower()}::{selected.device.lower()}"
+
+    def _refresh_stlink_probes(self) -> None:
+        if self._hardware_busy():
+            self.status_var.set("当前任务结束后才能刷新 ST-Link")
+            return
+        executable = self.openocd_var.get().strip()
+        if not executable:
+            executable = find_openocd()
+        discovery = self._probe_discovery(executable)
+        self._stlink_probes = discovery.probes
+        self._probe_by_label = {_AUTO_PROBE_LABEL: None}
+        self._probe_label_by_identity = {}
+        labels = [_AUTO_PROBE_LABEL]
+        for index, probe in enumerate(self._stlink_probes, start=1):
+            alias = self.probe_preferences.alias_for(probe.identity)
+            base_label = alias or f"调试器 {index}"
+            label = base_label
+            if label in self._probe_by_label:
+                label = f"{base_label} ({index})"
+            labels.append(label)
+            self._probe_by_label[label] = probe
+            self._probe_label_by_identity[probe.identity] = label
+        self.controls.probe_combo.configure(values=tuple(labels))
+        self.probe_status_var.set(
+            f"已找到 {len(self._stlink_probes)} 支 ST-Link"
+            if not discovery.diagnostic
+            else discovery.diagnostic
+        )
+        if self.mode == "rtt_collector" and not self._stlink_probes:
+            self.probe_status_var.set("未找到 ST-Link；连接后刷新，首次使用请安装驱动")
+            self.controls.probe_driver_button.grid()
+        elif self.mode == "rtt_collector":
+            self.controls.probe_driver_button.grid_remove()
+        if discovery.diagnostic:
+            self._append_openocd(f"[ST-Link] {discovery.diagnostic}\n")
+        self._restore_probe_binding()
+        self._refresh_controls()
+
+    def _restore_probe_binding(self) -> None:
+        if self.mode == "rtt_collector" and len(self._stlink_probes) <= 1:
+            self._selected_probe_identity = ""
+            self.probe_choice_var.set(_AUTO_PROBE_LABEL)
+            self._update_window_title()
+            return
+        context = self._probe_context_key()
+        desired = self.probe_preferences.binding_for(context) if context else ""
+        if not desired and len(self._stlink_probes) == 1:
+            desired = self._stlink_probes[0].identity
+            if context:
+                self.probe_preferences.set_binding(context, desired)
+        if desired:
+            label = self._probe_label_by_identity.get(desired)
+            if label is None:
+                alias = self.probe_preferences.alias_for(desired) or "上次使用的调试器"
+                label = f"{alias}（未连接）"
+                values = tuple(self.controls.probe_combo.cget("values"))
+                self.controls.probe_combo.configure(values=(*values, label))
+                self._probe_by_label[label] = None
+                self.probe_status_var.set("上次使用的 ST-Link 未连接，可刷新或改选")
+            self._selected_probe_identity = desired
+            self.probe_choice_var.set(label)
+        else:
+            self._selected_probe_identity = ""
+            self.probe_choice_var.set(_AUTO_PROBE_LABEL)
+        self._update_window_title()
+
+    def _select_stlink_probe(self) -> None:
+        label = self.probe_choice_var.get().strip()
+        if label == _AUTO_PROBE_LABEL:
+            self._selected_probe_identity = ""
+        else:
+            probe = self._probe_by_label.get(label)
+            if probe is None:
+                return
+            self._selected_probe_identity = probe.identity
+        context = self._probe_context_key()
+        if context:
+            self.probe_preferences.set_binding(context, self._selected_probe_identity)
+        self._update_window_title()
+
+    def _rename_stlink_probe(self) -> None:
+        probe = self._selected_stlink_probe()
+        if probe is None:
+            messagebox.showinfo(
+                "给 ST-Link 命名",
+                "请先在“使用的 ST-Link”中选择一支已连接的调试器。",
+                parent=self.root,
+            )
+            return
+        current = self.probe_preferences.alias_for(probe.identity)
+        alias = simpledialog.askstring(
+            "给 ST-Link 命名",
+            "输入容易辨认的名字，例如“Dragon 主板”或“右侧样机”：",
+            initialvalue=current,
+            parent=self.root,
+        )
+        if alias is None:
+            return
+        self.probe_preferences.set_alias(probe.identity, alias)
+        self._refresh_stlink_probes()
+
+    def _selected_stlink_probe(self) -> StLinkProbe | None:
+        return next(
+            (
+                probe
+                for probe in self._stlink_probes
+                if probe.identity == self._selected_probe_identity
+            ),
+            None,
+        )
+
+    def _update_window_title(self) -> None:
+        selected = self.probe_choice_var.get().strip()
+        suffix = "" if selected == _AUTO_PROBE_LABEL else f" · {selected}"
+        title = "KeilTool RTT 日志采集器" if self.mode == "rtt_collector" else "KeilTool ST-Link 工作台"
+        self.root.title(f"{title}{suffix}")
+
+    def _open_stlink_driver_page(self) -> None:
+        opened = webbrowser.open("https://www.st.com/en/development-tools/stsw-link009.html")
+        if not opened:
+            messagebox.showerror(
+                "无法打开驱动页面",
+                "请访问 STMicroelectronics 官网并搜索 STSW-LINK009。",
+                parent=self.root,
+            )
+
+    def _probe_metadata(self) -> dict[str, str]:
+        return {
+            "probe": self.probe_choice_var.get().strip() or _AUTO_PROBE_LABEL,
+            "probe_selector": self._selected_probe_identity or "automatic",
+        }
+
+    def _automatic_probe_flash_warning(self) -> str:
+        if self._selected_probe_identity or len(self._stlink_probes) <= 1:
+            return ""
+        return (
+            f"\n\n注意：当前检测到 {len(self._stlink_probes)} 支 ST-Link，"
+            "但仍在使用自动选择。建议取消后先选择对应的调试器；"
+            "也可以确认继续。"
+        )
 
     def _selected_catalog_device(self) -> CatalogDevice | None:
         value = self.device_choice_var.get().strip()
@@ -417,6 +630,8 @@ class KeilToolGui:
             return
         device = self._selected_catalog_device()
         if device is None:
+            if self.mode == "rtt_collector":
+                self.collector_device_status_var.set("未找到该芯片型号")
             self.device_source_var.set("未找到精确型号")
             self._facts = None
             self._clear_facts("请选择设备目录中的精确型号")
@@ -430,6 +645,8 @@ class KeilToolGui:
             self._firmware_freshness[_DEVICE_SOURCE].clear()
             self.firmware_var.set("")
         self._independent_device = device
+        if self.mode == "rtt_collector":
+            self.collector_device_status_var.set("正在准备芯片配置…")
         self.device_choice_var.set(self._device_label(device))
         self.device_source_var.set(f"独立 Device · {self._device_source_text(device)}")
         self.controls.device_combo.configure(values=tuple(self._device_by_label))
@@ -720,6 +937,7 @@ class KeilToolGui:
         if path:
             self.openocd_var.set(path)
             self._resolve_selected_target()
+            self._refresh_stlink_probes()
 
     def _choose_vofa(self) -> Path | None:
         path = filedialog.askopenfilename(
@@ -824,11 +1042,16 @@ class KeilToolGui:
         try:
             self._obtain_fresh_snapshot()
         except Exception as exc:
+            if self.mode == "rtt_collector":
+                self.collector_device_status_var.set("该芯片暂不能自动配置，请联系开发人员")
             self._facts = None
             self._freshness.observe(self._visible_fact_inputs())
             self._clear_facts(f"Target 解析失败: {exc}")
             self._refresh_controls()
             return
+        if self.mode == "rtt_collector":
+            self.collector_device_status_var.set("芯片配置已就绪")
+        self._restore_probe_binding()
         self._refresh_controls()
 
     def _obtain_fresh_snapshot(self) -> VerifiedSnapshot:
@@ -868,17 +1091,24 @@ class KeilToolGui:
         self.target_cfg_var.set(display.target_cfg)
         self.resolution_var.set(display.resolution)
 
-    @staticmethod
-    def _build_openocd_config(snapshot: VerifiedSnapshot) -> OpenOcdConfig:
+    def _build_openocd_config(self, snapshot: VerifiedSnapshot) -> OpenOcdConfig:
         facts = cast(ProjectTargetFacts, snapshot.facts)
         if not is_target_ready(facts):
             reason = facts.resolution_reason if facts else "请先选择并解析 Keil Target。"
             raise ValueError(reason)
+        probe = self._selected_stlink_probe()
+        if self._selected_probe_identity and probe is None:
+            raise ValueError(
+                "这个窗口上次使用的 ST-Link 当前未连接。请刷新列表、改选其他调试器，"
+                "或明确选择“自动选择”。"
+            )
         return OpenOcdConfig(
             executable=Path(facts.openocd_executable),
             scripts_dir=Path(facts.openocd_scripts) if facts.openocd_scripts else None,
             interface_cfg=facts.interface_cfg,
             target_cfg=facts.target_cfg,
+            adapter_serial=probe.adapter_serial if probe else "",
+            adapter_usb_location=probe.adapter_usb_location if probe else "",
         )
 
     def _log_dir(self) -> Path:
@@ -906,7 +1136,7 @@ class KeilToolGui:
                 device=facts.device,
                 task="CONNECT",
                 metadata={
-                    "probe": "ST-Link",
+                    **self._probe_metadata(),
                     "target_cfg": config.target_cfg,
                     "interface_cfg": config.interface_cfg,
                 },
@@ -988,7 +1218,7 @@ class KeilToolGui:
                 device=facts.device,
                 task="FLASH_READ",
                 metadata={
-                    "probe": "ST-Link",
+                    **self._probe_metadata(),
                     "target_cfg": config.target_cfg,
                     "interface_cfg": config.interface_cfg,
                     "output": str(request.output.expanduser().resolve()),
@@ -1054,15 +1284,19 @@ class KeilToolGui:
             else ""
         )
         size = request.firmware.stat().st_size
+        probe_name = self.probe_choice_var.get().strip() or _AUTO_PROBE_LABEL
+        automatic_warning = self._automatic_probe_flash_warning()
         confirmed = messagebox.askokcancel(
             "确认烧录",
             (
                 f"Device: {facts.device if facts else '—'}\n"
+                f"ST-Link: {probe_name}\n"
                 f"Target cfg: {config.target_cfg}\n"
                 f"固件: {request.firmware.resolve()}\n"
                 f"大小: {size:,} 字节"
                 f"{address_line}\n\n"
                 "将执行烧录、校验和复位。"
+                f"{automatic_warning}"
             ),
             parent=self.root,
         )
@@ -1076,7 +1310,7 @@ class KeilToolGui:
                 device=facts.device,
                 task="FLASH",
                 metadata={
-                    "probe": "ST-Link",
+                    **self._probe_metadata(),
                     "target_cfg": config.target_cfg,
                     "interface_cfg": config.interface_cfg,
                     "firmware": str(request.firmware.resolve()),
@@ -1185,7 +1419,7 @@ class KeilToolGui:
                 device=facts.device,
                 task="RTT_VOFA" if vofa else "RTT",
                 metadata={
-                    "probe": "ST-Link",
+                    **self._probe_metadata(),
                     "target_cfg": config.target_cfg,
                     "interface_cfg": config.interface_cfg,
                     "scan_address": f"0x{request.scan_address:08X}",
@@ -1510,7 +1744,7 @@ class KeilToolGui:
             self.status_var.set("RTT 启动完成后停止")
             self._refresh_controls()
 
-    def _dispatch_rtt_stop(self, session: RttSession) -> None:
+    def _dispatch_rtt_stop(self, session: AutoRecoveringRttSession) -> None:
         if session is not self._rtt_session:
             return
         if self.gate.state in {SessionState.RTT_SCAN, SessionState.RTT}:
@@ -1591,7 +1825,7 @@ class KeilToolGui:
             session, _value = event.value
             action = self._rtt_lifecycle.start_settled(session)
             if action is LifecycleAction.STOP_SESSION:
-                self._dispatch_rtt_stop(cast(RttSession, session))
+                self._dispatch_rtt_stop(cast(AutoRecoveringRttSession, session))
             self._finish_close_if_ready()
         elif event.kind == "rtt-stop-settled":
             self._finish_close_if_ready()
@@ -1774,7 +2008,7 @@ class KeilToolGui:
             operation_name = "start" if operation == "rtt-start-settled" else "stop"
             action = self._rtt_lifecycle.worker_failed(owner, operation_name)
             if action is LifecycleAction.STOP_SESSION:
-                self._dispatch_rtt_stop(cast(RttSession, owner))
+                self._dispatch_rtt_stop(cast(AutoRecoveringRttSession, owner))
         else:
             self.gate.fail()
         self.status_var.set(f"失败: {message}")
@@ -1836,18 +2070,43 @@ class KeilToolGui:
             self._append_openocd(f"[RTT] {event.message}\n")
             self.status_var.set(event.message)
             self._set_feedback_stage("Scope 通道已确认，正在连接数据流", ProgressMode.INDETERMINATE)
+        elif event.kind == "reconnecting":
+            attempt = max(1, event.reconnect_count)
+            stage = f"ST-Link 与 MCU 连接中断，正在自动重连（第 {attempt} 次）"
+            self._append_openocd(
+                f"[RTT 自动重连] {stage}\n"
+                f"原因: {event.message}\n"
+                "当前会话和日志文件保持不变；重新接好 MCU 调试线后会自动恢复。\n"
+            )
+            self.status_var.set(stage)
+            self._set_feedback_stage(stage, ProgressMode.INDETERMINATE)
+            self._refresh_controls()
         elif event.kind == "connected":
             if self.gate.state is SessionState.RTT_SCAN:
                 self.gate.finish()
                 self.gate.begin(SessionState.RTT)
             self._rtt_started_at = time.monotonic()
+            recovered = event.reconnect_count > 0
             if self._vofa_bridge is not None:
-                self.status_var.set("RTT → VOFA+ 运行中")
+                self.status_var.set(
+                    f"RTT → VOFA+ 自动恢复成功（第 {event.reconnect_count} 次）"
+                    if recovered
+                    else "RTT → VOFA+ 运行中"
+                )
                 self._set_feedback_stage("正在转发 JustFloat 曲线", ProgressMode.INDETERMINATE)
                 self._update_vofa_summary()
             else:
-                self.status_var.set("RTT 采集中")
+                self.status_var.set(
+                    f"RTT 自动恢复成功（第 {event.reconnect_count} 次），继续采集"
+                    if recovered
+                    else "RTT 采集中"
+                )
                 self._set_feedback_stage("正在采集 RTT 日志", ProgressMode.INDETERMINATE)
+            if recovered:
+                self._append_openocd(
+                    f"[RTT 自动恢复成功] 第 {event.reconnect_count} 次重连；"
+                    "继续写入原会话日志。\n"
+                )
             self._append_openocd(f"{event.message}\n")
             self._refresh_controls()
         elif event.kind in {"error", "eof"}:
@@ -2071,7 +2330,11 @@ class KeilToolGui:
         firmware_is_hex = Path(self.firmware_var.get().strip()).suffix.lower() == ".hex"
         project_mode = self.device_source_mode_var.get() == _PROJECT_SOURCE
         controls.device_label.configure(
-            text="Device（来自工程）" if project_mode else "Device"
+            text=(
+                "芯片型号"
+                if self.mode == "rtt_collector"
+                else ("Device（来自工程）" if project_mode else "Device")
+            )
         )
         controls.project_source_radio.configure(
             state=(
@@ -2349,8 +2612,12 @@ class KeilToolGui:
             firmware=self.firmware_var.get().strip(),
             bin_address=self.bin_address_var.get().strip(),
             flash_read_format=self.flash_read_format_var.get().strip().lower(),
-            openocd_path=self.openocd_var.get().strip(),
-            scripts_dir=self.scripts_var.get().strip(),
+            openocd_path=(
+                "" if self.mode == "rtt_collector" else self.openocd_var.get().strip()
+            ),
+            scripts_dir=(
+                "" if self.mode == "rtt_collector" else self.scripts_var.get().strip()
+            ),
             target_override=self.target_override_var.get().strip(),
             rtt_address=self.rtt_address_var.get().strip() if self.rtt_manual_var.get() else "",
             rtt_channel=int_or_default(self.rtt_channel_var.get(), 0),
@@ -2383,7 +2650,26 @@ def launch_gui() -> None:
     root.mainloop()
 
 
+def launch_rtt_collector(
+    *,
+    settings_store: SettingsStore | None = None,
+    probe_discovery: Callable[[str | Path], StLinkDiscovery] | None = None,
+) -> None:
+    root = tk.Tk()
+    collector_store = settings_store or SettingsStore(
+        default_settings_path().with_name("rtt-collector-settings.json")
+    )
+    KeilToolGui(
+        root,
+        settings_store=collector_store,
+        probe_discovery=probe_discovery,
+        mode="rtt_collector",
+    )
+    root.mainloop()
+
+
 __all__ = [
     "KeilToolGui",
     "launch_gui",
+    "launch_rtt_collector",
 ]

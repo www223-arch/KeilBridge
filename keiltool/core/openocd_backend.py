@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from datetime import datetime
 import hashlib
 from pathlib import Path
+import re
 import subprocess
 import threading
 import time
@@ -43,10 +44,21 @@ class OpenOcdConfig:
     scripts_dir: Path | None
     interface_cfg: str | None
     target_cfg: str
+    adapter_serial: str = ""
+    adapter_usb_location: str = ""
 
     def __post_init__(self) -> None:
         if not self.target_cfg.strip():
             raise ValueError("An OpenOCD target cfg is required.")
+        if self.adapter_serial and self.adapter_usb_location:
+            raise ValueError("Specify only one OpenOCD adapter selector.")
+        if self.adapter_usb_location and not re.fullmatch(
+            r"[0-9]+-[0-9]+(?:\.[0-9]+)*",
+            self.adapter_usb_location,
+        ):
+            raise ValueError("OpenOCD adapter USB location is invalid.")
+        if any(character in "\r\n" for character in self.adapter_serial):
+            raise ValueError("OpenOCD adapter serial must be a single line.")
 
     def base_command(self) -> list[str]:
         command = [self.executable.as_posix()]
@@ -54,6 +66,14 @@ class OpenOcdConfig:
             command.extend(["-s", self.scripts_dir.resolve().as_posix()])
         if self.interface_cfg:
             command.extend(["-f", self.interface_cfg])
+        if self.adapter_serial:
+            command.extend(
+                ["-c", f"adapter serial {quote_tcl_word(self.adapter_serial)}"]
+            )
+        elif self.adapter_usb_location:
+            command.extend(
+                ["-c", f"adapter usb location {self.adapter_usb_location}"]
+            )
         command.extend(["-f", self.target_cfg])
         return command
 

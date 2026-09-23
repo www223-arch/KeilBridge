@@ -215,6 +215,8 @@ Windows 下由 GUI 启动的 OpenOCD 使用隐藏控制台窗口模式，因此�
 
 如果找不到 RTT 控制块，确认当前固件已经包含并初始化 SEGGER RTT，检查所选设备或 Target 的 RAM 解析结果，或填写明确的控制块地址。RTT 文本会自动以 UTF-8 写入日志；有工程时默认根目录为 `<keil-project-root>\.keilbridge\logs\`，无工程时为 `%APPDATA%\KeilTool\logs\`，也可在 GUI 中修改并记忆。
 
+RTT 已经开始采集后，如果 ST-Link 到 MCU 的 SWD 调试线松脱，GUI 会根据 OpenOCD 明确报告的目标读取失败进入自动重连。重新接好后无需先点“停止采集”，恢复的数据继续追加到本次会话的同一个 `rtt.log`；界面和 OpenOCD 输出会显示重连次数、失败原因及恢复结果。自动重连不会复位或暂停 MCU，也不能补回断线期间未读取的数据。单纯长时间没有 RTT 文本不会触发重连。
+
 RTT 页的“显示等级”使用固件现有的 EasyLogger/SEGGER RTT 等级语义。默认 `VERBOSE` 显示全部；选择 `INFO` 会显示 `ASSERT`、`ERROR`、`WARN` 和 `INFO`。筛选和“清空显示”只处理最近 20,000 行 GUI 缓存，完整 UTF-8 日志仍持续记录所有等级。
 
 ## 9B. VOFA+ 能通过 RTT 向 MCU 发送命令吗？
@@ -250,7 +252,9 @@ GUI 只会在 OpenOCD target cfg 已验证时启用“检查连接”“烧录�
 
 先停止 GUI 内的 RTT 或烧录任务，并等待状态回到空闲。随后关闭 Keil、STM32CubeProgrammer、VS Code/Cortex-Debug、串口监视器，以及可能持有探针的其他 OpenOCD/GDB 会话。必要时在任务管理器结束确认不再使用的 `openocd.exe` 和 `arm-none-eabi-gdb.exe`，重新插拔 ST-Link，再使用 GUI 的“检查连接”。
 
-不要在 RTT 采集期间手工启动第二个 OpenOCD，也不要用多个 GUI 实例连接同一支 ST-Link。连接或烧录失败时，先查看 GUI 输出中的命令和日志路径。每个任务都保存在 `时间_芯片_任务` 独立目录中，`session.json` 可用于确认 target、开始/结束时间和执行结果。
+不要在 RTT 采集期间手工启动第二个 OpenOCD，也不要让多个 GUI 实例选择同一支 ST-Link。连接不同板卡时可以打开多个工作台窗口：分别在“使用的 ST-Link”中选择并命名调试器，工具会按工程与 Target 记住选择，并把底层选择器写入每条 OpenOCD 命令。连接或烧录失败时，先查看 GUI 输出中的命令和日志路径。每个任务都保存在 `时间_芯片_任务` 独立目录中，`session.json` 可用于确认所选 ST-Link、target、开始/结束时间和执行结果。
+
+如果多支 ST-Link 都没有可用或唯一的序列号，KeilTool 会自动使用 USB 接口位置区分。用户不需要理解该位置；主界面仍显示自定义名称。将调试器换到另一个 USB 接口后，重新点击“刷新”并改选即可。为了保留原有灵活性，“自动选择”不会被禁用；同时连接多支探针时使用它进行烧录，确认页会提示可能选错板卡。
 
 ## 12. `CMSIS-DAP command mismatch` 怎么办？
 

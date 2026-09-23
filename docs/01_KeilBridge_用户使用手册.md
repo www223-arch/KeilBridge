@@ -270,6 +270,10 @@ python -m keiltool.cli gui
 
 Keil 工程在图形工作台中是可选的。“配置来源”明确区分 `Keil 工程` 和 `独立 Device`，两种来源不会混用。工程模式中的 Device、Target、Flash/RAM 和固件属于当前工程上下文；切到独立 Device 后，工程 Target 和工程固件立即退出活动配置，再从目录选择精确芯片和对应固件。切回工程模式时重新解析并恢复此前的工程 Target。两种模式及各自固件、芯片选择、OpenOCD 路径和自定义日志根目录都会在关闭时记住。
 
+“使用的 ST-Link”用于多探针、多窗口场景。点击“刷新”会列出当前连接的调试器，界面只显示“调试器 1”“调试器 2”或用户通过“命名”设置的名称，不要求辨认序列号。首次只有一支时会自动精确选中；选择后会按当前 Keil 工程与 Target（或独立 Device）记忆，下次自动恢复。底层使用 OpenOCD 的探针序列号或 USB 接口位置锁定本次连接，烧录、Flash 读取、连接检查、普通 RTT 和 VOFA RTT 都使用同一选择。换 USB 接口后旧选择会显示“未连接”，可刷新后重新选择或明确改用“自动选择”，不会永久锁死。
+
+连接多支 ST-Link 时仍允许使用“自动选择”，但烧录确认页会明确提示存在选错风险；推荐先选择容易辨认的别名。可以先使用无下载、无复位的“检查连接”确认对应板卡，再点击“命名”设置为“Dragon 主板”“右侧样机”等。多个工作台窗口可以分别选择不同的 ST-Link；同一支 ST-Link 仍不能被两个 OpenOCD 会话同时占用。
+
 内置设备目录由仓库中的官方 GigaDevice、STMicroelectronics CMSIS-Pack/PDSC 快照生成，记录来源、版本、core、FPU、Flash/RAM 和 flash algorithm。点击 Device 旁的“导入”可添加 `.pdsc`、`.pack` 或自定义 JSON；用户文件保存在 `%APPDATA%\KeilTool\devices\`，同厂商同型号的用户条目优先于内置条目。PACK 只读取其中的 PDSC，不解压到磁盘。损坏或不安全的导入会被拒绝，不影响已有目录。
 
 CMSIS-Pack 本身不提供 OpenOCD target cfg。KeilBridge 只为已明确维护的兼容系列填写 target；没有映射的芯片仍可查看信息，但硬件按钮保持禁用。可在高级设置中指定 OpenOCD、scripts 目录和 target override。override 必须是实际存在的 `.cfg` 文件：相对路径必须位于 scripts 目录内，绝对路径必须指向现有文件。任何无法验证、文件缺失或越出 scripts 目录的配置都会阻止“检查连接”“读取完整 Flash”“烧录并校验”和 RTT，而不是猜测芯片类型继续执行。
@@ -299,6 +303,8 @@ RTT 区域的“VOFA+ 曲线”按钮提供一键双向 JustFloat 桥接。默�
 
 工作台按 JustFloat 帧尾切分完整帧，在独立线程中转发，VOFA+ 未连接或绘制变慢不会阻塞 RTT 接收。转发队列满时只丢弃用于实时显示的完整帧，并显示文字、曲线、下行、丢弃和无效帧计数；文字日志写入本次会话的 RTT 日志，曲线上行原始字节写入 `rtt-justfloat.bin`。VOFA+ 发来的每个原始字节都不经 UTF-8 解码、不添加换行、不做命令封包地写入用户选择的 RTT down-channel，并保存到 `vofa-to-mcu.bin`。KeilTool 不定义命令、CRC、TTL 或 ACK；这些都由 MCU 与使用者自己的协议决定。停止采集会关闭 OpenOCD 和本地 TCP bridge，但不会强制关闭 VOFA+。每次会话的 `rtt-vofa-session.txt` 会记录实际通道、端口、名称校验和帧长设置。
 
+GUI 在 RTT 已成功连接后会监视 OpenOCD 报告的目标读失败。如果 ST-Link 的 USB 仍在，但连接 MCU 的 SWD 调试线松脱，界面会切换为“正在自动重连”，停止失效的 OpenOCD 并每秒重新建立一次连接；重新接好后自动继续采集。整个过程沿用原会话目录及同一个 `rtt.log`，不会因每次重试创建新目录，也不会发送 reset、halt 或 resume。断线期间没有从 MCU 读到的数据无法补回；工具不会把“暂时没有新日志”本身当作掉线。
+
 默认日志目录为：
 
 ```text
@@ -311,7 +317,7 @@ RTT 区域的“VOFA+ 曲线”按钮提供一键双向 JustFloat 桥接。默�
 YYYYMMDD-HHMMSS-fff_<device>_<CONNECT|FLASH_READ|FLASH|RTT|RTT_VOFA>\
 ```
 
-目录中包含任务日志、`openocd.stdout.log`、`openocd.stderr.log` 和 `session.json`；元数据写明开始/结束时间、芯片、任务、target cfg 和结果。RTT 通道完整内容保存在 `rtt.log`。等级过滤和“清空显示”只影响 GUI，不删除或截断完整日志。RTT 和 OpenOCD 文本区支持 `Ctrl+C`、右键复制/全选/复制全部，工具栏也可直接复制全部可见文本。
+目录中包含任务日志、`openocd.stdout.log`、`openocd.stderr.log` 和 `session.json`；元数据写明开始/结束时间、芯片、任务、所选 ST-Link、底层选择器、target cfg 和结果。RTT 通道完整内容保存在 `rtt.log`。等级过滤和“清空显示”只影响 GUI，不删除或截断完整日志。RTT 和 OpenOCD 文本区支持 `Ctrl+C`、右键复制/全选/复制全部，工具栏也可直接复制全部可见文本。
 
 ### 4.5 面向自动化的硬件 CLI
 

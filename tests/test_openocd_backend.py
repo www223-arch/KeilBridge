@@ -55,6 +55,50 @@ def test_build_hex_flash_command_uses_embedded_addresses(tmp_path):
     assert command[-2:] == ["-c", f"program {(tmp_path / 'full.hex').as_posix()} verify reset exit"]
 
 
+def test_openocd_config_selects_one_stlink_by_usb_location():
+    config = OpenOcdConfig(
+        executable=Path("openocd"),
+        scripts_dir=Path("scripts"),
+        interface_cfg="interface/stlink.cfg",
+        target_cfg="target/stm32f3x.cfg",
+        adapter_usb_location="3-2.2.1",
+    )
+
+    command = config.base_command()
+
+    assert command == [
+        "openocd",
+        "-s",
+        Path("scripts").resolve().as_posix(),
+        "-f",
+        "interface/stlink.cfg",
+        "-c",
+        "adapter usb location 3-2.2.1",
+        "-f",
+        "target/stm32f3x.cfg",
+    ]
+
+
+def test_openocd_config_rejects_ambiguous_or_invalid_adapter_selectors():
+    with pytest.raises(ValueError, match="only one"):
+        OpenOcdConfig(
+            Path("openocd"),
+            None,
+            "interface/stlink.cfg",
+            "target/stm32f3x.cfg",
+            adapter_serial="ABC123",
+            adapter_usb_location="3-2",
+        )
+    with pytest.raises(ValueError, match="USB location"):
+        OpenOcdConfig(
+            Path("openocd"),
+            None,
+            "interface/stlink.cfg",
+            "target/stm32f3x.cfg",
+            adapter_usb_location="not-a-location",
+        )
+
+
 def test_build_bin_flash_command_includes_base_address(tmp_path):
     request = FlashRequest(tmp_path / "full.bin", base_address=0x08004000)
 

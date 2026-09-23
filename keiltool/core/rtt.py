@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 import queue
 import re
@@ -118,6 +118,7 @@ class RttEvent:
     level: RttLevel | None = None
     terminal: int | None = None
     channel: int | None = None
+    reconnect_count: int = 0
 
 
 class RttProcess(Protocol):
@@ -140,6 +141,21 @@ LogFactory = Callable[[Path], TextIO]
 
 def _open_rtt_log(path: Path) -> TextIO:
     return path.open("a", encoding="utf-8", newline="")
+
+
+_TARGET_TRANSPORT_LOSS_MARKERS = (
+    "rtt: failed to read from up-channel",
+    "rtt: failed to read channel",
+    "rtt: failed to read up-channel",
+    "rtt: control block not available",
+    "failed to read memory at",
+    "previous state query failed, trying to reconnect",
+)
+
+
+def _is_target_transport_loss(line: str) -> bool:
+    normalized = line.casefold()
+    return any(marker in normalized for marker in _TARGET_TRANSPORT_LOSS_MARKERS)
 
 
 class RttSession:
@@ -172,6 +188,8 @@ class RttSession:
         self.command = build_rtt_command(config, request)
         self.events: queue.Queue[RttEvent] = queue.Queue()
         self.log_path = Path(log_path)
+        self._scan_address = request.scan_address
+        self._scan_size = request.scan_size
         self._popen_factory = popen_factory
         self._socket_factory = socket_factory
         self._log_factory = log_factory
@@ -212,6 +230,10 @@ class RttSession:
         self._lifecycle = threading.Condition(threading.RLock())
         self._stop_requested = threading.Event()
         self._control_block_found = threading.Event()
+        self._adapter_identified = threading.Event()
+        self._rtt_search_started = threading.Event()
+        self._connected_once = threading.Event()
+        self._transport_loss_reported = threading.Event()
         self._channel_verified = threading.Event()
         self._channel_validation_failed = threading.Event()
         self._channel_parse_lock = threading.Lock()
@@ -373,8 +395,23 @@ class RttSession:
                     self._expected_channel_names or self._expected_down_channel_names
                 ):
                     message = "Timed out waiting for the OpenOCD RTT channel list."
+                elif not self._rtt_search_started.is_set():
+                    if self._adapter_identified.is_set():
+                        message = (
+                            "Timed out before OpenOCD started the RTT scan; "
+                            "target initialization did not complete."
+                        )
+                    else:
+                        message = (
+                            "Timed out before OpenOCD finished connecting to ST-Link; "
+                            "RTT scan did not start."
+                        )
                 else:
-                    message = "Timed out waiting for the OpenOCD RTT control block."
+                    scan_end = self._scan_address + self._scan_size - 1
+                    message = (
+                        "Timed out waiting for the OpenOCD RTT control block in "
+                        f"0x{self._scan_address:08X}-0x{scan_end:08X}."
+                    )
                 self._emit("error", message=message)
                 return
             self._sleep(self._retry_interval)
@@ -423,6 +460,7 @@ class RttSession:
                 self._sockets[item.channel] = connection
                 if item.channel == self._channel:
                     self._socket = connection
+            self._connected_once.set()
             self._emit(
                 "connected",
                 message=f"Connected to RTT channel {item.channel} on {self._host}:{item.port}.",
@@ -444,6 +482,20 @@ class RttSession:
                 return
             self._emit("openocd", text=line, stream=stream_name)
             normalized = line.casefold()
+            if "stlink " in normalized and "vid:pid" in normalized:
+                self._adapter_identified.set()
+            if "rtt:" in normalized and "searching for control block" in normalized:
+                self._rtt_search_started.set()
+            if (
+                self._connected_once.is_set()
+                and not self._transport_loss_reported.is_set()
+                and _is_target_transport_loss(line)
+            ):
+                self._transport_loss_reported.set()
+                self._emit(
+                    "transport_lost",
+                    message=line.strip(),
+                )
             if "rtt" in normalized and "control block" in normalized and "found" in normalized:
                 self._control_block_found.set()
             self._parse_channel_listing(line)
@@ -715,3 +767,201 @@ class RttSession:
                 channel=channel,
             )
         )
+
+
+class AutoRecoveringRttSession:
+    """Keep one logical RTT capture alive across ST-Link disconnects."""
+
+    def __init__(
+        self,
+        config: OpenOcdConfig,
+        request: RttRequest,
+        log_path: Path,
+        *,
+        reconnect_interval: float = 1.0,
+        session_factory: Callable[..., RttSession] = RttSession,
+        **session_kwargs: object,
+    ) -> None:
+        if reconnect_interval <= 0:
+            raise ValueError("RTT reconnect interval must be positive.")
+        self.command = build_rtt_command(config, request)
+        self.events: queue.Queue[RttEvent] = queue.Queue()
+        self.log_path = Path(log_path)
+        self._config = config
+        self._request = request
+        self._reconnect_interval = reconnect_interval
+        self._session_factory = session_factory
+        self._session_kwargs = session_kwargs
+        self._stop_requested = threading.Event()
+        self._lifecycle = threading.Condition(threading.RLock())
+        self._current: RttSession | None = None
+        self._worker: threading.Thread | None = None
+        self._state = "new"
+        self._cleanup_emitted = False
+
+    def start(self) -> None:
+        with self._lifecycle:
+            if self._state == "stopped":
+                raise RuntimeError("RTT session has been stopped and cannot be started.")
+            if self._state != "new":
+                raise RuntimeError("RTT session has already been started.")
+            self._state = "running"
+            self._worker = threading.Thread(
+                name="rtt-auto-reconnect",
+                target=self._run,
+                daemon=True,
+            )
+            self._worker.start()
+
+    def stop(self) -> None:
+        with self._lifecycle:
+            if self._state == "stopped":
+                return
+            if self._state == "stopping":
+                while self._state == "stopping":
+                    self._lifecycle.wait()
+                return
+            self._state = "stopping"
+
+        self._stop_requested.set()
+        current = self._get_current()
+        if current is not None:
+            current.stop()
+        worker = self._worker
+        if worker is not None and worker is not threading.current_thread():
+            worker.join()
+
+        with self._lifecycle:
+            self._state = "stopped"
+            self._lifecycle.notify_all()
+        if not self._cleanup_emitted:
+            self._cleanup_emitted = True
+            self.events.put(
+                RttEvent(
+                    "stopped",
+                    message="RTT session stopped cleanly.",
+                    outcome="clean",
+                )
+            )
+
+    def wait(self, timeout: float | None = None) -> bool:
+        worker = self._worker
+        if worker is None:
+            return True
+        worker.join(timeout)
+        return not worker.is_alive()
+
+    def send_bytes(
+        self,
+        data: bytes | bytearray | memoryview,
+        *,
+        channel: int | None = None,
+    ) -> int:
+        current = self._get_current()
+        if current is None:
+            raise RuntimeError("RTT is waiting for ST-Link reconnection.")
+        return current.send_bytes(data, channel=channel)
+
+    def _run(self) -> None:
+        ever_connected = False
+        reconnect_count = 0
+        while not self._stop_requested.is_set():
+            try:
+                attempt = self._session_factory(
+                    self._config,
+                    self._request,
+                    self.log_path,
+                    **self._session_kwargs,
+                )
+                self._set_current(attempt)
+                attempt.start()
+            except Exception as exc:
+                if not ever_connected:
+                    self.events.put(
+                        RttEvent("error", message=f"Unable to start RTT session: {exc}")
+                    )
+                    return
+                reconnect_count += 1
+                self._emit_reconnecting(str(exc), reconnect_count)
+                if self._stop_requested.wait(self._reconnect_interval):
+                    return
+                continue
+
+            reconnect_reason = ""
+            while not self._stop_requested.is_set():
+                try:
+                    event = attempt.events.get(timeout=0.1)
+                except queue.Empty:
+                    continue
+                if event.kind == "connected":
+                    ever_connected = True
+                    self.events.put(replace(event, reconnect_count=reconnect_count))
+                    continue
+                if event.kind == "transport_lost":
+                    if ever_connected:
+                        reconnect_reason = event.message
+                        break
+                    continue
+                if event.kind in {"error", "eof"}:
+                    if ever_connected and self._is_recoverable(event):
+                        reconnect_reason = event.message
+                        break
+                    self.events.put(event)
+                    return
+                if event.kind == "stopped":
+                    if self._stop_requested.is_set():
+                        return
+                    if ever_connected:
+                        reconnect_reason = event.message
+                        break
+                    self.events.put(event)
+                    return
+                self.events.put(event)
+
+            if self._stop_requested.is_set():
+                return
+            reconnect_count += 1
+            self._emit_reconnecting(reconnect_reason, reconnect_count)
+            attempt.stop()
+            self._set_current(None, expected=attempt)
+            if self._stop_requested.wait(self._reconnect_interval):
+                return
+
+    @staticmethod
+    def _is_recoverable(event: RttEvent) -> bool:
+        if event.kind == "eof":
+            return True
+        message = event.message.casefold()
+        permanent_markers = (
+            "channel name mismatch",
+            "is not active; expected name",
+            "log write failed",
+            "unable to create rtt log directory",
+            "unable to open rtt log",
+            "unable to start openocd",
+        )
+        return not any(marker in message for marker in permanent_markers)
+
+    def _emit_reconnecting(self, reason: str, reconnect_count: int) -> None:
+        detail = reason or "RTT connection ended unexpectedly."
+        self.events.put(
+            RttEvent(
+                "reconnecting",
+                message=detail,
+                reconnect_count=reconnect_count,
+            )
+        )
+
+    def _get_current(self) -> RttSession | None:
+        with self._lifecycle:
+            return self._current
+
+    def _set_current(
+        self,
+        session: RttSession | None,
+        *,
+        expected: RttSession | None = None,
+    ) -> None:
+        with self._lifecycle:
+            if expected is None or self._current is expected:
+                self._current = session

@@ -10,7 +10,14 @@ import time
 import pytest
 
 from keiltool.core.openocd_backend import OpenOcdConfig
-from keiltool.core.rtt import RttChannelConfig, RttRequest, RttSession, build_rtt_command
+from keiltool.core.rtt import (
+    AutoRecoveringRttSession,
+    RttChannelConfig,
+    RttEvent,
+    RttRequest,
+    RttSession,
+    build_rtt_command,
+)
 from keiltool.core.rtt_log import RttLevel
 
 
@@ -20,6 +27,142 @@ CONFIG = OpenOcdConfig(
     interface_cfg="interface/stlink.cfg",
     target_cfg="target/stm32f3x.cfg",
 )
+
+
+class _ScriptedRttAttempt:
+    def __init__(self, events: tuple[RttEvent, ...]) -> None:
+        self.command = ["openocd"]
+        self.events: queue.Queue[RttEvent] = queue.Queue()
+        self._events = events
+        self.stop_calls = 0
+        self.sent: list[tuple[bytes, int | None]] = []
+
+    def start(self) -> None:
+        for event in self._events:
+            self.events.put(event)
+
+    def stop(self) -> None:
+        self.stop_calls += 1
+
+    def send_bytes(self, data, *, channel=None) -> int:
+        payload = bytes(data)
+        self.sent.append((payload, channel))
+        return len(payload)
+
+
+def test_auto_recovering_session_restarts_after_live_disconnect_and_keeps_log_path(tmp_path):
+    attempts = [
+        _ScriptedRttAttempt(
+            (
+                RttEvent("connected", message="first connected", channel=0),
+                RttEvent("data", text="before\n", channel=0),
+                RttEvent(
+                    "transport_lost",
+                    message="rtt: Failed to read from up-channel 0",
+                    channel=0,
+                ),
+            )
+        ),
+        _ScriptedRttAttempt(
+            (
+                RttEvent("connected", message="second connected", channel=0),
+                RttEvent("data", text="after\n", channel=0),
+            )
+        ),
+    ]
+    created_paths: list[Path] = []
+
+    def create_attempt(_config, _request, log_path, **_kwargs):
+        created_paths.append(Path(log_path))
+        return attempts[len(created_paths) - 1]
+
+    log_path = tmp_path / "one-session" / "rtt.log"
+    session = AutoRecoveringRttSession(
+        CONFIG,
+        RttRequest(scan_address=0x20000000, scan_size=0x10000),
+        log_path,
+        session_factory=create_attempt,
+        reconnect_interval=0.01,
+    )
+
+    session.start()
+    events = [_next_event(session, kind) for kind in ("connected", "data", "reconnecting", "connected", "data")]
+    session.stop()
+
+    assert [event.kind for event in events] == [
+        "connected",
+        "data",
+        "reconnecting",
+        "connected",
+        "data",
+    ]
+    assert events[2].reconnect_count == 1
+    assert events[3].reconnect_count == 1
+    assert created_paths == [log_path, log_path]
+    assert attempts[0].stop_calls == 1
+    assert attempts[1].stop_calls == 1
+
+
+def test_live_rtt_read_failure_emits_target_transport_loss(tmp_path):
+    session = RttSession(
+        CONFIG,
+        RttRequest(scan_address=0x20000000, scan_size=0x10000),
+        tmp_path / "rtt.log",
+    )
+    session._connected_once.set()
+
+    session._read_openocd_stream(
+        _LineStream(("Error: rtt: Failed to read from up-channel 0\n",)),
+        "stderr",
+    )
+
+    assert _next_event(session, "openocd").text.endswith("up-channel 0\n")
+    event = _next_event(session, "transport_lost")
+    assert "Failed to read" in event.message
+
+
+def test_rtt_read_failure_before_first_connection_does_not_emit_transport_loss(tmp_path):
+    session = RttSession(
+        CONFIG,
+        RttRequest(scan_address=0x20000000, scan_size=0x10000),
+        tmp_path / "rtt.log",
+    )
+
+    session._read_openocd_stream(
+        _LineStream(("Error: rtt: Control block not available\n",)),
+        "stderr",
+    )
+
+    events = _drain_events(session)
+    assert [event.kind for event in events] == ["openocd"]
+
+
+def test_auto_recovering_session_does_not_retry_initial_configuration_failure(tmp_path):
+    attempt = _ScriptedRttAttempt(
+        (RttEvent("error", message="RTT channel name mismatch"),)
+    )
+    create_calls = 0
+
+    def create_attempt(_config, _request, _log_path, **_kwargs):
+        nonlocal create_calls
+        create_calls += 1
+        return attempt
+
+    session = AutoRecoveringRttSession(
+        CONFIG,
+        RttRequest(scan_address=0x20000000, scan_size=0x10000),
+        tmp_path / "rtt.log",
+        session_factory=create_attempt,
+        reconnect_interval=0.01,
+    )
+
+    session.start()
+    event = _next_event(session, "error")
+    time.sleep(0.03)
+    session.stop()
+
+    assert event.message == "RTT channel name mismatch"
+    assert create_calls == 1
 
 
 def test_auto_scan_uses_full_ram_range():
@@ -517,7 +660,7 @@ class FakeClock:
         self.value += duration
 
 
-def test_session_reports_error_when_control_block_is_not_found_before_timeout(tmp_path):
+def test_session_reports_openocd_startup_timeout_before_rtt_scan_begins(tmp_path):
     clock = FakeClock()
     process = FakeProcess()
     session = RttSession(
@@ -535,7 +678,36 @@ def test_session_reports_error_when_control_block_is_not_found_before_timeout(tm
     event = _next_event(session, "error")
     session.stop()
 
+    assert "ST-Link" in event.message
+    assert "RTT scan did not start" in event.message
+    assert session.wait(timeout=1)
+
+
+def test_session_reports_control_block_timeout_after_rtt_scan_begins(tmp_path):
+    clock = FakeClock()
+    process = FakeProcess(
+        stderr_lines=(
+            "Info : STLINK V2J37S7 (API v2) VID:PID 0483:3748\n",
+            "Info : rtt: Searching for control block 'SEGGER RTT'\n",
+        )
+    )
+    session = RttSession(
+        CONFIG,
+        RttRequest(scan_address=0x20000000, scan_size=0x10000),
+        tmp_path / "rtt.log",
+        popen_factory=lambda *args, **kwargs: process,
+        monotonic=clock.monotonic,
+        sleep=clock.sleep,
+        connect_timeout=0.1,
+        retry_interval=0.05,
+    )
+
+    session.start()
+    event = _next_event(session, "error")
+    session.stop()
+
     assert "control block" in event.message.lower()
+    assert "0x20000000-0x2000FFFF" in event.message
     assert session.wait(timeout=1)
 
 

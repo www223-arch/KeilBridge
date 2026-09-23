@@ -781,6 +781,20 @@ def test_gui_applies_theme_and_filters_structured_rtt_records(tmp_path, monkeypa
         gui._handle_rtt_event(RttEvent("data", text="I/live\n", level=RttLevel.INFO, terminal=0))
         assert "字节" in gui.operation_feedback.summary
         assert "行" in gui.operation_feedback.summary
+        gui._handle_rtt_event(
+            RttEvent(
+                "reconnecting",
+                message="ST-Link disconnected; waiting to reconnect.",
+                reconnect_count=1,
+            )
+        )
+        assert gui.operation_feedback.state.value == "running"
+        assert gui.operation_feedback.stage == "ST-Link 与 MCU 连接中断，正在自动重连（第 1 次）"
+        assert "自动重连" in gui.status_var.get()
+        gui._handle_rtt_event(
+            RttEvent("connected", message="RTT reconnected", reconnect_count=1)
+        )
+        assert "自动恢复成功" in gui.status_var.get()
         gui.gate.finish()
 
         stopped_sessions = []
@@ -920,3 +934,115 @@ def test_gui_applies_theme_and_filters_structured_rtt_records(tmp_path, monkeypa
     finally:
         if not gui._destroyed:
             gui._on_close()
+
+
+def test_gui_uses_human_probe_names_and_remembers_the_project_choice(tmp_path, monkeypatch):
+    import tkinter as tk
+
+    from keiltool.core.stlink_probe import StLinkDiscovery, StLinkProbe
+    from keiltool.gui.app import KeilToolGui
+    from keiltool.gui.probe_preferences import ProbePreferenceStore
+    from keiltool.gui.settings import SettingsStore
+
+    discovery = StLinkDiscovery(
+        (
+            StLinkProbe("usb:2-2", 0x3748, adapter_usb_location="2-2"),
+            StLinkProbe("usb:3-2.2.1", 0x3748, adapter_usb_location="3-2.2.1"),
+        )
+    )
+    preferences = ProbePreferenceStore(tmp_path / "stlink-probes.json")
+    root = tk.Tk()
+    root.withdraw()
+    gui = KeilToolGui(
+        root,
+        settings_store=SettingsStore(tmp_path / "settings.json"),
+        probe_preferences=preferences,
+        probe_discovery=lambda _openocd: discovery,
+    )
+    try:
+        root.update()
+        choices = tuple(gui.controls.probe_combo.cget("values"))
+        assert choices == (
+            "自动选择（只连接一支时推荐）",
+            "调试器 1",
+            "调试器 2",
+        )
+        assert gui.probe_status_var.get() == "已找到 2 支 ST-Link"
+
+        gui.device_source_mode_var.set("project")
+        gui.project_var.set("D:/fw/dragon.uvprojx")
+        gui.target_var.set("Debug")
+        gui.probe_choice_var.set("调试器 2")
+        gui._select_stlink_probe()
+
+        context = gui._probe_context_key()
+        assert preferences.binding_for(context) == "usb:3-2.2.1"
+
+        monkeypatch.setattr(
+            "keiltool.gui.app.simpledialog.askstring",
+            lambda *args, **kwargs: "Dragon 主板",
+        )
+        gui._rename_stlink_probe()
+        assert gui.probe_choice_var.get() == "Dragon 主板"
+        assert preferences.alias_for("usb:3-2.2.1") == "Dragon 主板"
+
+        facts = SimpleNamespace(
+            ready=True,
+            resolution_reason="",
+            openocd_executable="openocd",
+            openocd_scripts="",
+            interface_cfg="interface/stlink.cfg",
+            target_cfg="target/stm32f3x.cfg",
+        )
+        config = gui._build_openocd_config(SimpleNamespace(facts=facts))
+        assert config.adapter_usb_location == "3-2.2.1"
+    finally:
+        root.destroy()
+
+
+def test_gui_warns_in_plain_language_only_when_flash_uses_automatic_probe_with_multiple_connected():
+    from keiltool.core.stlink_probe import StLinkProbe
+    from keiltool.gui.app import KeilToolGui
+
+    gui = object.__new__(KeilToolGui)
+    gui._selected_probe_identity = ""
+    gui._stlink_probes = (
+        StLinkProbe("usb:2-2", 0x3748, adapter_usb_location="2-2"),
+        StLinkProbe("usb:3-2", 0x3748, adapter_usb_location="3-2"),
+    )
+
+    warning = gui._automatic_probe_flash_warning()
+
+    assert "检测到 2 支 ST-Link" in warning
+    assert "建议取消后先选择对应的调试器" in warning
+    gui._selected_probe_identity = "usb:2-2"
+    assert gui._automatic_probe_flash_warning() == ""
+
+
+def test_configuration_pane_can_scroll_to_every_control_at_minimum_window_height(tmp_path):
+    import tkinter as tk
+
+    from keiltool.gui.app import KeilToolGui
+    from keiltool.gui.probe_preferences import ProbePreferenceStore
+    from keiltool.gui.settings import SettingsStore
+
+    root = tk.Tk()
+    gui = KeilToolGui(
+        root,
+        settings_store=SettingsStore(tmp_path / "settings.json"),
+        probe_preferences=ProbePreferenceStore(tmp_path / "probes.json"),
+        probe_discovery=lambda _openocd: __import__(
+            "keiltool.core.stlink_probe", fromlist=["StLinkDiscovery"]
+        ).StLinkDiscovery(()),
+    )
+    try:
+        root.geometry("1024x720")
+        root.update()
+        assert gui.controls.canvas.bbox("all")[3] > gui.controls.canvas.winfo_height()
+
+        gui.controls.ensure_visible(gui.controls.advanced_button)
+        root.update_idletasks()
+
+        assert gui.controls.canvas.yview()[1] == pytest.approx(1.0)
+    finally:
+        root.destroy()
